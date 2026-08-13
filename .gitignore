@@ -1,0 +1,14 @@
+# colcon / ament 빌드 산출물
+build/
+install/
+log/
+
+# 편집기
+.vscode/
+.idea/
+*.swp
+*~
+
+# 파이썬
+__pycache__/
+*.pyc

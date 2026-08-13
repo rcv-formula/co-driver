@@ -1,0 +1,129 @@
+// co_driver 토픽 목록 — 계속 늘어나는 것만 여기 있습니다.
+//
+//   inputs[] : 판단 재료. 원소 하나 = 채점기(src/scorers/) 인스턴스 하나
+//   drives[] : /drive 후보 토픽
+//   influence: 입력 i 가 드라이브 j 의 점수에 얼마나, 어떤 모양으로 영향을 주는가
+//
+// 기본 설정(output / context / vehicle / scoring / selection / postprocess /
+// defaults.influence)은 config/co_driver.yaml 에 있습니다.
+//
+// ── 추가하기 ─────────────────────────────────────────────────────────
+//   드라이브 추가: "drives" 에 {"name": ..., "topic": ...} 한 덩어리
+//   입력 추가    : "inputs" 에 {"name": ..., "type": ..., "hold_ms": ...} 한 덩어리
+//                  hold_ms = 비동기 채점기가 pending(계산 중)을 낼 때 직전 점수를
+//                            얼마나 더 쓸지. 넘기면 그 입력은 점수에서 빠집니다.
+//                            매 주기 값을 내는 동기 채점기에는 영향 없음(기본 500ms)
+//                  — type 은 src/scorers/ 에 있는 채점기 이름입니다.
+//                    새 판단 로직이 필요하면 src/scorers/ 에 .cpp 하나를 추가하세요
+//                    (external_score.cpp 를 복사해서 시작하면 됩니다).
+//
+// ── influence 값이 채워지는 순서 (뒤로 갈수록 우선) ──────────────────
+//   1. yaml 의 defaults.influence
+//   2. inputs[].influence          ← 그 입력의 드라이브 공통 기본값
+//   3. drives[].influence[입력명]  ← 그 한 칸만
+//
+// ── influence 필드 ───────────────────────────────────────────────────
+//   weight     : 선형 레이어의 W[j][i]. 음수 가능(감점 항).
+//                0 이면 점수 미반영 — 단 veto 는 그대로 작동
+//   exp_mix    : 선형↔지수 배합비. 0=순수 선형, 1=순수 지수, 0.7=지수 7 : 선형 3
+//   exp_k      : 지수 곡률. >0 볼록("아주 좋아야 점수"), <0 오목("조금만 나빠도 급락")
+//   in_min/max : 관심 구간 재정규화. 예) in_min 0.6 = 0.6 이하는 전부 0점
+//   invert     : 작을수록 좋은 지표를 뒤집음
+//   veto_below : 성형 후 정규화값이 이 값 미만이면 그 드라이브 실격 (음수면 끔)
+//   required   : true 면 이 입력이 판단 불가일 때 드라이브 실격
+//
+//   숫자 하나만 쓰면 weight 만 지정한 축약형입니다 (linear=1, exp=0).
+//     "localization": 1.0   ≡   {"weight": 1.0, "exp_mix": 0.0}
+//
+// ── 단위 ─────────────────────────────────────────────────────────────
+//   시간 값은 전부 **ms** 이고 키 이름이 _ms 로 끝납니다.
+{
+  "inputs": [
+    {
+      // localization_pf 의 /localization_confidence.
+      // data = [stamp_sec, stamp_nanosec, confidence] 이라 index 2, stamp 는 [0,1].
+      "name": "localization",
+      "type": "external_score",
+      "params": {
+        "topic": "/localization_confidence",
+        "mode": "scalar",
+        "index": 2,
+        "stamp_indices": [0, 1],
+        "timeout_ms": 500,
+        "input_min": 0.0,
+        "input_max": 1.0,
+        "invert": false,
+        "on_missing": "unavailable"
+      },
+      // confidence 0.6 이하는 사실상 못 믿으므로 in_min 으로 잘라내고,
+      // 지수 볼록(exp_k>0)으로 낮은 구간을 더 깎습니다.
+      "influence": {"weight": 1.0, "exp_mix": 0.7, "exp_k": 2.5, "in_min": 0.6}
+    },
+
+    {
+      // 외부 노드가 드라이브별로 매기는 점수.
+      // scripts/example_python_scorer.py 가 이 형식으로 쏩니다.
+      "name": "external",
+      "type": "external_score",
+      "params": {
+        "topic": "/co_driver/external_scores",
+        "mode": "per_candidate",
+        // layout.dim[i].label 이 있으면 그쪽이 우선이고, 없을 때 이 순서를 씁니다.
+        "order": ["pp_main", "pp_left", "pp_right"],
+        "timeout_ms": 500,
+        "input_min": 0.0,
+        "input_max": 1.0,
+        "on_missing": "unavailable"
+      },
+      "influence": {"weight": 1.0, "exp_mix": 0.7, "exp_k": -3.0}
+    }
+
+    // 무거운 계산을 평가 주기와 분리하는 비동기 채점기 예시.
+    // src/scorers/example_async.cpp 를 복사해 실제 로직을 넣으세요.
+    // ,{
+    //   "name": "heavy",
+    //   "type": "example_async",
+    //   "hold_ms": 800,                                // 직전 점수를 800ms 까지 재사용
+    //   "params": {"rate_hz": 5.0, "work_ms": 30.0},
+    //   "influence": {"weight": 1.0}
+    // }
+  ],
+
+  // ── hold_ms — 마지막 명령을 언제까지 붙들고 있을 것인가 ────────────────
+  // 드라이브의 시간 설정은 이것 하나뿐입니다. 이 시간을 넘기면 **비활성**이 되어
+  // 점수는 계속 계산되지만(진단용) softmax·순위·선택에서는 빠집니다.
+  // 살아 있는 토픽끼리만 경쟁합니다.
+  //
+  // 토픽마다 Hz 가 달라도 각자 값을 적으면 됩니다. 보통 그 토픽 주기의 3~5배:
+  //   100Hz(10ms) -> 30~50 / 20Hz(50ms) -> 150~250 / 5Hz(200ms) -> 600~1000
+  // 실측 Hz 는 status 의 hz 에 찍히니 그걸 보고 정하세요.
+  "drives": [
+    {
+      "name": "pp_main",
+      "topic": "/drive_main",
+      "hold_ms": 300,
+      "bias": 0.02,                 // 선형 레이어의 b_j. 동점일 때 기본 주행선을 선호
+      "enabled": true,
+      "influence": {
+        // 기본 주행선은 로컬라이제이션 신뢰도에 특히 민감하게 (지수 성분 강화)
+        "localization": {"weight": 1.2, "exp_mix": 0.7, "exp_k": -3.0, "in_min": 0.6}
+      }
+    },
+
+    {
+      "name": "pp_left",
+      "topic": "/drive_left",
+      "hold_ms": 300,
+      "bias": 0.0,
+      "enabled": true
+    },
+
+    {
+      "name": "pp_right",
+      "topic": "/drive_right",
+      "hold_ms": 300,
+      "bias": 0.0,
+      "enabled": true
+    }
+  ]
+}
