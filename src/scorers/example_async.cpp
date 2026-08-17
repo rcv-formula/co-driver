@@ -46,7 +46,7 @@ public:
       [this]() {compute();}, group());
 
     RCLCPP_INFO(
-      node->get_logger(), "비동기 채점기 '%s' (%.1fHz, 계산 %.0fms)",
+      node->get_logger(), "async scorer '%s' (%.1fHz, work %.0fms)",
       name.c_str(), rate, work_ * 1e3);
     return true;
   }
@@ -57,11 +57,11 @@ public:
     std::lock_guard<std::mutex> lock(mtx_);
     if (!has_result_) {
       // 아직 첫 결과가 없다 -> 프레임워크가 직전 점수를 찾아보고, 없으면 제외합니다.
-      return ScoreResult::pending("첫 계산 대기 중");
+      return ScoreResult::pending("waiting for first result");
     }
     if (consumed_) {
       // 새 결과가 아직 안 나왔다 -> 직전 점수를 hold_ms 동안 계속 쓰게 둡니다.
-      return ScoreResult::pending("계산 중");
+      return ScoreResult::pending("computing");
     }
     consumed_ = true;
     return ScoreResult::ok(value_);

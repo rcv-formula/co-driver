@@ -134,20 +134,20 @@ private:
           if (d.valid) {return commit(d.name, "fallback", now);}
         }
       }
-      r.reason = "유효한 드라이브 없음";
+      r.reason = "no valid drive";
       current_.clear();
       return r;
     }
 
     if (!incumbent_ok) {
       // 현재 것이 죽었으면 히스테리시스 없이 즉시 갈아탑니다.
-      return commit(best->name, current_.empty() ? "초기 선택" : "현재 드라이브 무효 -> 즉시 전환", now);
+      return commit(best->name, current_.empty() ? "initial selection" : "incumbent invalid -> immediate switch", now);
     }
 
     r.has_selection = true;
     if (best->name == current_) {
       r.name = current_;
-      r.reason = "유지";
+      r.reason = "hold";
       return r;
     }
 
@@ -155,15 +155,15 @@ private:
       (now - last_switch_).seconds() : spec_.switch_cooldown + 1.0;
     if (spec_.switch_cooldown > 0.0 && held < spec_.switch_cooldown) {
       r.name = current_;
-      r.reason = "switch_cooldown 대기 중";
+      r.reason = "waiting on switch_cooldown";
       return r;
     }
     if (best->score < incumbent->score + spec_.switch_margin) {
       r.name = current_;
-      r.reason = "switch_margin 미달";
+      r.reason = "switch_margin not met";
       return r;
     }
-    return commit(best->name, "점수 우위로 전환", now);
+    return commit(best->name, "switched on score margin", now);
   }
 
   Result commit(const std::string & name, const std::string & reason, const rclcpp::Time & now)
@@ -208,7 +208,7 @@ public:
     node_ = node;
     stages_.clear();
     if (specs.empty()) {
-      RCLCPP_WARN(log, "postprocess 가 비어 있습니다. 후처리 없이 그대로 내보냅니다.");
+      RCLCPP_WARN(log, "postprocess is empty. Publishing the command unmodified.");
       return true;
     }
     for (const auto & spec : specs) {
@@ -226,7 +226,7 @@ public:
         st.curve = jstr(p, "curve", "smooth");
         st.ema_alpha = std::clamp(jnum(p, "ema_alpha", 0.2), 0.0, 1.0);
         if (st.curve != "linear" && st.curve != "smooth" && st.curve != "ema") {
-          RCLCPP_WARN(log, "switch_blend.curve '%s' 알 수 없음 -> smooth", st.curve.c_str());
+          RCLCPP_WARN(log, "unknown switch_blend.curve '%s' -> smooth", st.curve.c_str());
           st.curve = "smooth";
         }
       } else if (spec.type == "rate_limit") {
@@ -255,7 +255,7 @@ public:
         st.min_speed = jnum(p, "min_speed", 0.0);
       } else {
         RCLCPP_ERROR(
-          log, "후처리 '%s' 의 type '%s' 을(를) 모릅니다. 사용 가능: "
+          log, "postprocess '%s' has unknown type '%s'. Available: "
           "timeout_stop switch_blend rate_limit speed_scale deadband clamp",
           spec.name.c_str(), spec.type.c_str());
         return false;
@@ -464,7 +464,7 @@ public:
           drives_[i].noteReceived(now());
         });
       RCLCPP_INFO(
-        get_logger(), "드라이브 [%zu] %s <- %s (hold %.0fms)",
+        get_logger(), "drive [%zu] %s <- %s (hold %.0fms)",
         i, d.name.c_str(), d.topic.c_str(), d.hold * 1e3);
     }
 
@@ -497,7 +497,7 @@ public:
       [this]() {outputTick();}, output_group_);
 
     RCLCPP_INFO(
-      get_logger(), "co_driver 기동: 채점기 %zu개 × 드라이브 %zu개 -> %s (평가 %.0fHz / 출력 %.0fHz)",
+      get_logger(), "co_driver up: %zu scorers x %zu drives -> %s (eval %.0fHz / output %.0fHz)",
       scorers_.size(), drives_.size(), cfg_.output.drive_topic.c_str(),
       cfg_.evaluation_rate_hz, cfg_.output.rate_hz);
   }
@@ -511,20 +511,20 @@ private:
     scorers_.clear();
     for (const auto & in : cfg_.inputs) {
       if (!in.enabled) {
-        RCLCPP_INFO(get_logger(), "입력 '%s' 는 enabled=false 라 건너뜁니다.", in.name.c_str());
+        RCLCPP_INFO(get_logger(), "input '%s' is enabled=false, skipping.", in.name.c_str());
         continue;
       }
       auto s = ScorerRegistry::instance().create(in.type);
       if (!s) {
         std::string known;
         for (const auto & t : ScorerRegistry::instance().types()) {known += t + " ";}
-        *error = "입력 '" + in.name + "': type '" + in.type + "' 을(를) 모릅니다. 사용 가능: " + known;
+        *error = "input '" + in.name + "': unknown type '" + in.type + "'. Available: " + known;
         return false;
       }
       s->setContext(in.name, in.type, scorer_group_);
       // 채점기가 여기서 자기 구독자를 만듭니다.
       if (!s->configure(this, in.name, in.params)) {
-        *error = "입력 '" + in.name + "' 설정 실패";
+        *error = "input '" + in.name + "' failed to configure";
         return false;
       }
       scorers_.push_back({s, in.hold});
@@ -545,7 +545,7 @@ private:
 
     selector_.configure(cfg_.selection);
     if (!post_.configure(this, cfg_.pipeline, get_logger())) {
-      *error = "후처리 파이프라인 설정 실패";
+      *error = "postprocess pipeline failed to configure";
       return false;
     }
     return true;
@@ -557,13 +557,13 @@ private:
     Config fresh;
     std::string err;
     if (!Config::load(this, topics_path_, &fresh, &err)) {
-      *message = "리로드 실패: " + err;
+      *message = "reload failed: " + err;
       return false;
     }
     if (!fresh.sameTopology(cfg_)) {
       *message =
-        "리로드 실패: inputs/drives 구성이 바뀌었습니다(이름·타입·토픽). "
-        "구독을 다시 만들어야 하므로 노드를 재시작하세요.";
+        "reload failed: inputs/drives topology changed (name/type/topic). "
+        "Subscriptions must be rebuilt, so restart the node.";
       return false;
     }
 
@@ -581,11 +581,11 @@ private:
     cfg_ = fresh;   // 토픽·주기는 구독/타이머에 묶여 있어 반영되지 않습니다
     selector_.configure(cfg_.selection);
     if (!post_.configure(this, cfg_.pipeline, get_logger())) {
-      *message = "리로드 실패: 후처리 파이프라인 설정 오류";
+      *message = "reload failed: postprocess pipeline configuration error";
       return false;
     }
     post_.reset();
-    *message = "리로드 완료 (yaml 파라미터 + " + topics_path_ + ")";
+    *message = "reload complete (yaml parameters + " + topics_path_ + ")";
     return true;
   }
 
@@ -851,8 +851,8 @@ int main(int argc, char ** argv)
     if (what.find("No parameter value set") != std::string::npos) {
       RCLCPP_FATAL(
         rclcpp::get_logger("co_driver"),
-        "yaml 에 빈 리스트(`[]`)나 값 없는 키가 있으면 ROS 파라미터로 올라오지 못합니다. "
-        "해당 항목을 지우거나 값을 채우세요 (예: 후처리를 끄려면 postprocess 블록 전체 삭제).");
+        "An empty list (`[]`) or a valueless key in the yaml never reaches ROS as a parameter. "
+        "Delete the entry or give it a value (e.g. to disable postprocessing, remove the whole postprocess block).");
     }
     rclcpp::shutdown();
     return 1;

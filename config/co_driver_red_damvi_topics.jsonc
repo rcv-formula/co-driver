@@ -1,0 +1,113 @@
+// red_damvi topic list - PPcontroller (/drive_main) vs gap_follow (/drive_gf)
+//
+// One line: **when localization collapses, hand over to gap_follow.**
+//
+// Why the weights look like this
+//   pp_main    follows a map and a raceline, so localization *is* its competence.
+//              -> large positive weight on `localization`. Its score collapses with
+//                 the confidence.
+//   gap_follow only reads /scan. It is exactly as good with or without localization.
+//              -> a constant floor score via `bias`, plus a small negative weight so
+//                 it steps aside on its own once confidence is healthy again.
+//
+// Base settings (scoring / selection / postprocess) live in
+// config/co_driver_red_damvi.yaml.
+{
+  "inputs": [
+    {
+      // /localization_confidence, published by both localization_pf and slam_ours
+      // (absolute name in both, no prefix).
+      //   type   std_msgs/Float64MultiArray, RELIABLE, measured 100 Hz
+      //   data   [stamp_sec, stamp_nanosec, confidence], confidence in [0,1]
+      //
+      // on_missing is the crux of this configuration.
+      //   The default "unavailable" means "cannot judge", so missing:mask drops the
+      //   input entirely and the two drives end up competing on bias alone. But a
+      //   dead localization topic *is* localization being impossible. "value" with
+      //   default_score 0.0 makes a dead topic identical to confidence 0, which is
+      //   what brings gap_follow up.
+      //
+      // timeout_ms 200: the publisher runs at 100 Hz, so this is 20 periods.
+      "name": "localization",
+      "type": "external_score",
+      "params": {
+        "topic": "/localization_confidence",
+        "mode": "scalar",
+        "index": 2,
+        "stamp_indices": [0, 1],
+        "timeout_ms": 200,
+        "input_min": 0.0,
+        "input_max": 1.0,
+        "invert": false,
+        "on_missing": "value",
+        "default_score": 0.0
+      },
+      // Shared shaping default; the per-drive blocks below override it.
+      //
+      // in_min / in_max are set from measured confidence distributions rather than
+      // guessed. Across four replayed scenes (51k samples) the 5th percentile of
+      // confidence *while tracking normally* was:
+      //
+      //     icra 0.877 | 0522-2 0.867 | 0526-1 0.530 | busan2 0.361
+      //
+      // busan2 spends 13.5% of healthy tracking below 0.5, so any threshold near 0.5
+      // would hand the car to gap_follow during perfectly good driving. Real failures,
+      // on the other hand, drive the confidence to 0.0. So the interesting range is
+      // the bottom of the scale:
+      //
+      //   in_min 0.02 : at or below this, score 0 (localization is gone)
+      //   in_max 0.35 : at or above this, full marks - below busan2's healthy p05,
+      //                 so normal driving never enters the shaped region at all
+      //   exp_k 3.0   : convex, so the little that is left between 0.02 and 0.35
+      //                 still falls away steeply
+      "influence": {"weight": 0.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+    }
+
+    // Possible extension, not enabled here.
+    //
+    // slam_ours computes confidence as (state multiplier) x min(5 terms), where the
+    // state multiplier is Lost 0.0 / Converging 0.5 / Tracking 1.0. That makes a
+    // middling value ambiguous: 0.45 can be a healthy Converging (raw 0.9) or a
+    // broken Tracking. Subscribing to the state topic separately would disambiguate
+    // it (/slam_ours/state, std_msgs/UInt8, transient_local).
+    //
+    // This configuration deliberately does not depend on that: the thresholds above
+    // sit low enough that only a genuine collapse (confidence -> 0, which is what
+    // both Lost and a broken Tracking produce) triggers a handover. Adding the state
+    // would need a new scorer in src/scorers/, and would tie the config to slam_ours.
+  ],
+
+  // hold_ms - how long the last command stays trusted. Past it the drive goes
+  // inactive: its score is still computed (for diagnostics) but it drops out of the
+  // softmax, the ranking and the selection. Rule of thumb: 3-5 times its period.
+  "drives": [
+    {
+      // PPcontroller. Map and raceline based.
+      "name": "pp_main",
+      "topic": "/drive_main",
+      "hold_ms": 300,
+      "bias": 0.0,
+      "enabled": true,
+      "influence": {
+        // W = +3.0. Full confidence gives z = 3.0, zero confidence gives z = 0.0.
+        "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+      }
+    },
+
+    {
+      // gap_follow. Reads only /scan, so it keeps working when localization does not.
+      // bias 1.0 is its floor score, i.e. what it is worth when localization is gone.
+      // W = -1.5 makes it step aside once confidence recovers (z = -0.5).
+      "name": "gap_follow",
+      "topic": "/drive_gf",
+      // gap_follow publishes once per scan. Measured /scan rate on the replay rig is
+      // 37 Hz (~27 ms), so 200 ms is about 7 periods.
+      "hold_ms": 200,
+      "bias": 1.0,
+      "enabled": true,
+      "influence": {
+        "localization": {"weight": -1.5, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+      }
+    }
+  ]
+}

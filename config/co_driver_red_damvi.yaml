@@ -1,0 +1,123 @@
+# co_driver base settings - red_damvi (PPcontroller + gap_follow, two candidates)
+#
+#   /drive_main  PPcontroller  map / raceline based; only meaningful while localization works
+#   /drive_gf    gap_follow    reactive on /scan alone; unaffected by localization
+#
+# One line: **when localization collapses, hand over to gap_follow.**
+# The confidence -> score mapping lives in config/co_driver_red_damvi_topics.jsonc.
+#
+# The stock config (co_driver.yaml) is untouched; this file is red_damvi only.
+#
+# All time values are in **ms** and the keys end in _ms (rates end in _hz).
+/**:
+  ros__parameters:
+    use_sim_time: false
+
+    # Topic list JSON. The launch file fills this in.
+    topics_file: ""
+
+    # =====================================================================
+    # Output - the navigation input of ackermann_mux.
+    #
+    # gap_follow's own default drive_topic is also /drive, so it **must** be
+    # overridden to /drive_gf (the launch file does this). Otherwise two nodes
+    # publish to the same topic and the mux sees interleaved commands.
+    # drive_monitor logs an ERROR if it ever sees two publishers here.
+    # =====================================================================
+    output:
+      drive_topic: "/drive"
+      frame_id: "base_link"
+      rate_hz: 100.0
+      publish_status: True
+
+    evaluation:
+      rate_hz: 50.0
+
+    # =====================================================================
+    # Score combination = one linear layer + softmax
+    #   z_j = sum_i W[j][i] * phi_ji(x_i) + b_j
+    #   p   = softmax(z / temperature)
+    #
+    # ema_alpha is a low pass on z, before the softmax. It is the first line of
+    # defence against flapping, and it is what turns "confidence is below the
+    # threshold" into "confidence has been below the threshold for a while".
+    #
+    # At evaluation 50 Hz, alpha 0.08 is a time constant of ~250 ms, which gives:
+    #   confidence 0.99 -> 0.00 sustained : hands over after 0.46 s
+    #   confidence 0.00 -> 0.99 sustained : hands back after 0.10 s (+ cooldown)
+    #   a glitch to 0.0 lasting <= 400 ms : rejected, no switch at all
+    # =====================================================================
+    scoring:
+      combine: "softmax"
+      temperature: 1.0
+      missing: "mask"
+      ema_alpha: 0.08
+      min_valid_score: 0.0
+
+    # =====================================================================
+    # Selection policy - second and third lines of defence against flapping.
+    #
+    #   switch_margin      a challenger must beat the incumbent's probability by
+    #                      this much. That is the hysteresis. At 0.15 the actual
+    #                      thresholds, in confidence terms, are:
+    #                        pp_main -> gap_follow  when confidence falls below 0.171
+    #                        gap_follow -> pp_main  when confidence rises above 0.226
+    #                      0.171 .. 0.226 is a deadband where whatever is already
+    #                      driving keeps driving.
+    #   switch_cooldown_ms no second switch within this window, so gap_follow keeps
+    #                      the car for at least this long once it has it.
+    #
+    #                      Note this gate is symmetric: it delays the handover *to*
+    #                      gap_follow as much as the handover back. Raising it much
+    #                      past 1.5 s therefore buys smoother behaviour at the cost of
+    #                      reacting slower to a collapse, which is the wrong trade.
+    #                      On the 0526-1 replay, 1.5 s delayed no handover at all
+    #                      (the shortest gap between a recovery and the next collapse
+    #                      was 2.42 s) while lifting the shortest dwell from 1.00 s to
+    #                      1.52 s. 4.0 s would cut 13 switches to 9, but would also
+    #                      have kept the car on a broken localization for 1.6 s longer
+    #                      at t=63.5 s.
+    #
+    # fallback is gap_follow. "everything is disqualified" usually means localization
+    # went with it, and the controller that only needs /scan is the last one worth
+    # trusting.
+    # =====================================================================
+    selection:
+      switch_margin: 0.15
+      switch_cooldown_ms: 1500
+      fallback: "gap_follow"
+
+    # =====================================================================
+    # Post-processing - the pipeline list is the order of application.
+    # =====================================================================
+    postprocess:
+      pipeline: ["timeout_stop", "switch_blend", "rate_limit", "speed_scale", "deadband", "clamp"]
+
+      timeout_stop:
+        decel: 12.0
+        hold_steer: True
+
+      # PPcontroller and gap_follow can disagree sharply on steering, so blend for
+      # longer than the stock 250 ms.
+      switch_blend:
+        duration_ms: 300.0
+        curve: "smooth"
+        ema_alpha: 0.2
+
+      # Kept consistent with gap_follow's own max_acceleration 6.0 / max_deceleration 6.0.
+      rate_limit:
+        max_steer_rate_deg: 400.0
+        max_accel: 6.0
+        max_decel: 12.0
+
+      speed_scale:
+        scale: 1.0
+
+      deadband:
+        speed: 0.05
+        steer_deg: 0.3
+
+      clamp:
+        max_steering_deg: 50.0
+        max_speed: 8.0
+        min_speed: 0.0

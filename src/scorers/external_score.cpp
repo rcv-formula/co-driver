@@ -49,13 +49,13 @@ public:
     node_ = node;
     topic_ = jstr(p, "topic", "");
     if (topic_.empty()) {
-      RCLCPP_ERROR(node->get_logger(), "'%s': params.topic 이 필요합니다.", name.c_str());
+      RCLCPP_ERROR(node->get_logger(), "'%s': params.topic is required.", name.c_str());
       return false;
     }
     mode_ = jstr(p, "mode", "scalar");
     if (mode_ != "scalar" && mode_ != "per_candidate") {
       RCLCPP_ERROR(
-        node->get_logger(), "'%s': mode 는 scalar 또는 per_candidate 여야 합니다 (받은 값: %s)",
+        node->get_logger(), "'%s': mode must be scalar or per_candidate (got: %s)",
         name.c_str(), mode_.c_str());
       return false;
     }
@@ -69,7 +69,7 @@ public:
     on_missing_ = jstr(p, "on_missing", "unavailable");   // unavailable | value | veto
     default_score_ = jnum(p, "default_score", 0.5);
     if (std::abs(input_max_ - input_min_) < 1e-9) {
-      RCLCPP_ERROR(node->get_logger(), "'%s': input_min 과 input_max 가 같습니다.", name.c_str());
+      RCLCPP_ERROR(node->get_logger(), "'%s': input_min and input_max are equal.", name.c_str());
       return false;
     }
 
@@ -82,7 +82,7 @@ public:
       [this](const std_msgs::msg::Float64MultiArray::ConstSharedPtr msg) {onMsg(msg);}, opts);
 
     RCLCPP_INFO(
-      node->get_logger(), "채점기 '%s' <- %s (mode=%s, index=%d, timeout=%.0fms)",
+      node->get_logger(), "scorer '%s' <- %s (mode=%s, index=%d, timeout=%.0fms)",
       name.c_str(), topic_.c_str(), mode_.c_str(), index_, timeout_ * 1e3);
     return true;
   }

@@ -191,15 +191,15 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
   s.ema_alpha = pnum(n, "scoring.ema_alpha", s.ema_alpha);
   s.min_valid_score = pnum(n, "scoring.min_valid_score", s.min_valid_score);
   if (s.combine != "softmax" && s.combine != "weighted_sum") {
-    *error = "scoring.combine 은 softmax 또는 weighted_sum 이어야 합니다: " + s.combine;
+    *error = "scoring.combine must be softmax or weighted_sum: " + s.combine;
     return false;
   }
   if (s.missing != "mask" && s.missing != "zero") {
-    *error = "scoring.missing 은 mask 또는 zero 여야 합니다: " + s.missing;
+    *error = "scoring.missing must be mask or zero: " + s.missing;
     return false;
   }
   if (s.temperature <= 0.0) {
-    *error = "scoring.temperature 는 0보다 커야 합니다.";
+    *error = "scoring.temperature must be greater than 0.";
     return false;
   }
 
@@ -228,7 +228,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
 {
   std::ifstream in(path);
   if (!in) {
-    *error = "토픽 목록 파일을 열 수 없습니다: " + path;
+    *error = "cannot open topics file: " + path;
     return false;
   }
   Json root;
@@ -236,17 +236,17 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
     // 주석(//, /* */)을 허용해 설정 파일에 설명을 달 수 있게 합니다.
     root = Json::parse(in, nullptr, true, /*ignore_comments=*/ true);
   } catch (const std::exception & e) {
-    *error = std::string("JSON 파싱 실패 (") + path + "): " + e.what();
+    *error = std::string("JSON parse failed (") + path + "): " + e.what();
     return false;
   }
   if (!root.is_object()) {
-    *error = "토픽 목록 파일의 최상위가 JSON 객체가 아닙니다.";
+    *error = "top level of the topics file is not a JSON object.";
     return false;
   }
 
   // --- inputs ---
   if (!root.contains("inputs") || !root["inputs"].is_array() || root["inputs"].empty()) {
-    *error = "`inputs` 배열이 필요합니다(최소 1개).";
+    *error = "an `inputs` array is required (at least one entry).";
     return false;
   }
   std::set<std::string> input_names;
@@ -254,11 +254,11 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
     InputSpec s;
     s.name = jstr(e, "name", "");
     if (s.name.empty()) {
-      *error = "`inputs` 원소에 name 이 없습니다.";
+      *error = "an `inputs` entry has no name.";
       return false;
     }
     if (!input_names.insert(s.name).second) {
-      *error = "입력 이름이 중복됩니다: " + s.name;
+      *error = "duplicate input name: " + s.name;
       return false;
     }
     s.type = jstr(e, "type", s.name);
@@ -272,7 +272,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
 
   // --- drives ---
   if (!root.contains("drives") || !root["drives"].is_array() || root["drives"].empty()) {
-    *error = "`drives` 배열이 필요합니다(최소 1개).";
+    *error = "a `drives` array is required (at least one entry).";
     return false;
   }
   std::set<std::string> drive_names;
@@ -280,23 +280,23 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
     DriveSpec d;
     d.name = jstr(e, "name", "");
     if (d.name.empty()) {
-      *error = "`drives` 원소에 name 이 없습니다.";
+      *error = "a `drives` entry has no name.";
       return false;
     }
     if (!drive_names.insert(d.name).second) {
-      *error = "드라이브 이름이 중복됩니다: " + d.name;
+      *error = "duplicate drive name: " + d.name;
       return false;
     }
     d.topic = jstr(e, "topic", "");
     if (d.topic.empty()) {
-      *error = "드라이브 '" + d.name + "' 에 topic 이 없습니다.";
+      *error = "drive '" + d.name + "' has no topic.";
       return false;
     }
     d.enabled = jbool(e, "enabled", true);
     d.hold = jms(e, "hold_ms", 300.0);
     d.bias = jnum(e, "bias", 0.0);
     if (d.hold <= 0.0) {
-      *error = "드라이브 '" + d.name + "': hold_ms 는 0보다 커야 합니다.";
+      *error = "drive '" + d.name + "': hold_ms must be greater than 0.";
       return false;
     }
 
@@ -312,7 +312,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
     // 없는 입력을 가리키는 항목은 오타일 확률이 높아 오류로 잡습니다.
     for (auto it = per_drive.begin(); it != per_drive.end(); ++it) {
       if (input_names.find(it.key()) == input_names.end()) {
-        *error = "드라이브 '" + d.name + "' 의 influence 에 없는 입력 '" + it.key() + "' 이(가) 있습니다.";
+        *error = "drive '" + d.name + "': influence refers to unknown input '" + it.key() + "'.";
         return false;
       }
     }
@@ -322,7 +322,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
   if (!c->selection.fallback.empty() &&
     drive_names.find(c->selection.fallback) == drive_names.end())
   {
-    *error = "selection.fallback '" + c->selection.fallback + "' 은 드라이브 목록에 없습니다.";
+    *error = "selection.fallback '" + c->selection.fallback + "' is not in the drives list.";
     return false;
   }
   return true;
@@ -340,7 +340,7 @@ bool Config::load(
     return false;
   }
   if (topics_path.empty()) {
-    *error = "`topics_file` 파라미터에 토픽 목록 JSON 경로를 지정하세요.";
+    *error = "set the `topics_file` parameter to the path of the topics JSON.";
     return false;
   }
   if (!loadTopics(topics_path, &c, &err)) {

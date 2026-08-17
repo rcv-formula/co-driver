@@ -1,206 +1,214 @@
 # co_driver
 
-여러 개의 `/drive` 후보 중 하나를 **점수로 골라** 후처리한 뒤 VESC 스택으로 내보내는 중재 노드.
+An arbitration node that **scores** several `/drive` candidates, picks one,
+post-processes it, and sends the result to the VESC stack.
 
 ```
-PPcontroller #1 ──▶ /drive_main  ┐
-PPcontroller #2 ──▶ /drive_left  ├─▶ co_driver ──▶ /drive ──▶ ackermann_mux ──▶ ackermann_to_vesc ──▶ VESC
-PPcontroller #3 ──▶ /drive_right ┘      ▲
-                                        │
-                              채점기들이 각자 필요한 토픽을 직접 구독
-                              (/localization_confidence, /scan, /map, ...)
+PPcontroller #1 --> /drive_main  ┐
+PPcontroller #2 --> /drive_left  ├--> co_driver --> /drive --> ackermann_mux --> ackermann_to_vesc --> VESC
+PPcontroller #3 --> /drive_right ┘        ^
+                                          │
+                             each scorer subscribes to whatever it needs
+                             (/localization_confidence, /scan, /map, ...)
 ```
 
-출력은 `ackermann_mux` 의 **navigation 입력**(`f1tenth_stack/config/mux.yaml` 의 `drive`)으로
-갑니다. 이렇게 해야 조이스틱(priority 100) 오버라이드와 mux 의 timeout 안전장치가 그대로
-살아 있습니다. mux 를 우회하려면 `output.drive_topic` 을 `/ackermann_drive` 로 바꾸세요.
+The output goes to the **navigation input** of `ackermann_mux` (the `drive` entry in
+`f1tenth_stack/config/mux.yaml`). Keeping it there preserves the joystick override
+(priority 100) and the mux's own timeout safety net. To bypass the mux, point
+`output.drive_topic` at `/ackermann_drive`.
 
 ---
 
-## 구조
+## Structure
 
-파일은 넷뿐이고 역할이 겹치지 않습니다.
+Four files, with no overlap in responsibility.
 
-| 파일 | 하는 일 |
+| File | Does |
 |---|---|
-| [src/co_driver_node.cpp](src/co_driver_node.cpp) | 메인 노드 — `/drive_*` 구독, 선택, 후처리, 발행, 핫리로드 |
-| [src/config.cpp](src/config.cpp) | 설정 읽기 — yaml(ROS 파라미터) + 토픽 목록 JSON |
-| [src/compute.cpp](src/compute.cpp) | **점수 연산만** — 응답 곡선 φ, 선형층, softmax |
-| [src/scorers/](src/scorers/) | **채점기** — 하나에 .cpp 하나. 각자 필요한 토픽을 스스로 구독, 동기·비동기 모두 가능 |
+| [src/co_driver_node.cpp](src/co_driver_node.cpp) | Main node - subscribes `/drive_*`, selects, post-processes, publishes, hot-reloads |
+| [src/config.cpp](src/config.cpp) | Configuration - yaml (ROS parameters) + the topic list JSON |
+| [src/compute.cpp](src/compute.cpp) | **Scoring only** - response curve phi, linear layer, softmax |
+| [src/scorers/](src/scorers/) | **Scorers** - one .cpp each, each subscribing to its own topics; sync or async |
 
 ```
-/drive_* ──▶ 채점기들 ──▶ 점수 연산 ──▶ 선택 ──▶ 후처리 ──▶ /drive
-             (scorers)    (compute)     (node)   (node)     100Hz
-                 ▲
-        각 채점기가 자기 구독자로
-        scan / map / imu / 외부 점수 토픽을 직접 받음
+/drive_* --> scorers --> scoring --> selection --> post-process --> /drive
+             (scorers)  (compute)     (node)         (node)         100 Hz
+                 ^
+        each scorer subscribes for itself:
+        scan / map / imu / external score topics
 ```
 
-**노드는 센서를 구독하지 않습니다.** `/scan` 을 보고 판단하고 싶으면 노드가 아니라
-`src/scorers/` 에 파일 하나를 추가합니다. 그래서 판단 로직이 늘어나도 노드·설정 로더·
-점수 연산은 그대로입니다.
+**The node subscribes to no sensors.** If you want to judge on `/scan`, you add a file
+to `src/scorers/` rather than touching the node. Judgement logic can grow without the
+node, the config loader or the scoring code changing at all.
 
-평가(느려도 됨)와 출력(100Hz 고정)은 **별도 타이머 + 별도 콜백 그룹**이라, 무거운
-채점기를 붙여도 출력 주기가 흔들리지 않습니다.
+Evaluation (allowed to be slow) and output (fixed 100 Hz) run on **separate timers in
+separate callback groups**, so a heavy scorer does not disturb the output rate.
 
 ---
 
-## 설정 파일 두 개
+## Two configuration files
 
-| 파일 | 내용 |
+| File | Contents |
 |---|---|
-| [config/co_driver.yaml](config/co_driver.yaml) | `output` · `evaluation` · `defaults.influence` · `scoring` · `selection` · `postprocess` — 개수가 고정된 기본 설정 |
-| [config/co_driver_topics.jsonc](config/co_driver_topics.jsonc) | `inputs[]` · `drives[]` — 계속 늘어나는 토픽 목록과 영향 행렬 |
+| [config/co_driver.yaml](config/co_driver.yaml) | `output`, `evaluation`, `defaults.influence`, `scoring`, `selection`, `postprocess` - the settings with a fixed shape |
+| [config/co_driver_topics.jsonc](config/co_driver_topics.jsonc) | `inputs[]`, `drives[]` - the lists that keep growing, plus the influence matrix |
 
-ROS 파라미터는 yaml 로 들어가고(런타임 `ros2 param set` 가능), `topics_file` 하나가
-JSON 경로를 가리킵니다.
+ROS parameters come from the yaml (so `ros2 param set` works at runtime), and a single
+`topics_file` parameter points at the JSON.
 
 ```
-inputs[]   — 채점기 인스턴스. 원소를 넣으면 늘어남 (params 에 구독할 토픽 이름)
-drives[]   — /drive 후보. 원소를 넣으면 늘어남 (+ hold_ms)
-influence  — 입력 i 가 드라이브 j 의 점수에 얼마나, 어떤 모양으로 영향을 주는가
+inputs[]   scorer instances; add an element to add one (params carries topic names)
+drives[]   /drive candidates; add an element to add one (plus hold_ms)
+influence  how much, and in what shape, input i affects the score of drive j
 ```
 
-> **yaml 주의**: 빈 리스트(`pipeline: []`)나 값 없는 키는 ROS 파라미터에 타입이 없어
-> 노드가 기동하지 못합니다. 후처리를 전부 끄려면 `postprocess` 블록을 통째로 지우세요.
+> **yaml caveat**: an empty list (`pipeline: []`) or a valueless key has no type as a
+> ROS parameter and the node will not start. To turn off post-processing, delete the
+> whole `postprocess` block.
 
 ---
 
-## 점수 = 1층 선형 MLP + softmax
+## Scoring = one linear MLP layer + softmax
 
 ```
-        x₁ ─┐   ← 채점기 1이 낸 점수
-        x₂ ─┼─▶  φ (응답 곡선: 선형 + 지수)
-         ⋮  │            │
-        xₙ ─┘            ▼
-                 z_j = Σᵢ W[j][i]·φ_ji(xᵢ) + b_j        ← 1층 선형 레이어
+        x1 --┐   <- score from scorer 1
+        x2 --┼-->  phi (response curve: linear + exponential)
+         :   │            │
+        xn --┘            v
+                 z_j = sum_i W[j][i] * phi_ji(x_i) + b_j     <- one linear layer
                          │
-                         ▼
-                 p = softmax(z / T)                      ← 드라이브별 확률
+                         v
+                 p = softmax(z / T)                          <- probability per drive
 ```
 
-| MLP 용어 | co_driver 설정 |
+| MLP term | co_driver setting |
 |---|---|
-| 입력 벡터 `x` | 각 채점기의 출력 (항상 [0,1]) |
-| 특징 변환 `φ` | `influence` 의 `exp_mix`/`exp_k`/`in_min`/`in_max`/`invert` |
-| 가중치 행렬 `W[j][i]` | `drives[j].influence[입력 i].weight` — **음수 허용**(감점 항) |
-| 편향 `b_j` | `drives[j].bias` |
-| 온도 `T` | `scoring.temperature` |
-| 출력 `p_j` | `/co_driver_node/scores`, status 의 `score` |
+| input vector `x` | each scorer's output (always in [0,1]) |
+| feature transform `phi` | `influence`'s `exp_mix` / `exp_k` / `in_min` / `in_max` / `invert` |
+| weight matrix `W[j][i]` | `drives[j].influence[input i].weight` - **negatives allowed** (penalty term) |
+| bias `b_j` | `drives[j].bias` |
+| temperature `T` | `scoring.temperature` |
+| output `p_j` | `/co_driver_node/scores`, the `score` field in status |
 
-- `temperature` ↓ = 승자독식(전환 민감), ↑ = 평탄(둔감).
-- **실격 드라이브는 softmax 분모에서 제외**됩니다. 살아남은 것들의 확률 합은 항상 1.
-- EMA(`scoring.ema_alpha`)는 **softmax 이전 logit `z`** 에 걸립니다.
-- `scoring.missing` — 채점기가 "판단 불가"를 냈을 때. `"mask"`(기본)는 그 항을 빼고
-  남은 `Σ|W|` 비율로 `z` 를 되스케일해 스케일을 보존합니다(센서 하나가 죽어도 그
-  드라이브만 밀려나지 않음). `"zero"` 는 `φ=0` 으로 그대로 더하는 순수 MLP 의미입니다.
+- `temperature` down = winner-take-all (switches readily), up = flat (insensitive).
+- **Disqualified drives are excluded from the softmax denominator.** The survivors'
+  probabilities always sum to 1.
+- The EMA (`scoring.ema_alpha`) is applied to the logit `z`, **before** the softmax.
+- `scoring.missing` - what to do when a scorer reports "cannot judge". `"mask"` (default)
+  drops the term and rescales `z` by the remaining `sum|W|` ratio, preserving the scale
+  so one dead sensor does not push that drive down on its own. `"zero"` adds `phi = 0`,
+  which is the literal MLP reading.
 
-> **`switch_margin` 의 단위**: `combine: softmax` 에서 `score` 는 확률이므로
-> `selection.switch_margin` 도 "확률 차이"입니다. 드라이브 N개면 균등이 1/N 이라는
-> 점을 기준으로 잡으세요(기본값 0.10).
+> **Units of `switch_margin`**: with `combine: softmax` the `score` is a probability, so
+> `selection.switch_margin` is a difference of probabilities. With N drives, uniform is
+> 1/N - calibrate against that (default 0.10).
 
-### 활성(active) — 살아 있는 토픽끼리만 경쟁
+### active - only live topics compete
 
-`/drive` 후보들은 발행 시점도 Hz 도 제각각이고, 언제든 끊길 수 있습니다. 그래서
-**"지금 살아 있는가"(active)** 를 먼저 판정하고, **활성인 것들끼리만** softmax·순위·선택을
-돌립니다.
+`/drive` candidates publish at different times and different rates, and any of them can
+stop. So co_driver first decides **"is this alive right now"** (active), and runs the
+softmax, the ranking and the selection **over the active ones only**.
 
-| active 를 끄는 조건 | |
+| What clears active | |
 |---|---|
-| 메시지를 한 번도 못 받음 | 점수도 못 냄 |
-| **`hold_ms` 초과 (stale)** | 점수는 계속 계산 |
-| 명령이 NaN/inf | 점수도 못 냄 |
-| 채점기가 `vetoed()` 반환 | 점수는 계속 계산 |
-| `influence.veto_below` 미만 / `required` 인데 판단 불가 | 점수는 계속 계산 |
-| `enabled: false` | 점수는 계속 계산 |
+| never received a message | no score either |
+| **older than `hold_ms` (stale)** | score still computed |
+| command is NaN/inf | no score either |
+| a scorer returned `vetoed()` | score still computed |
+| below `influence.veto_below`, or a `required` input cannot judge | score still computed |
+| `enabled: false` | score still computed |
 
-비활성이어도 **점수(logit)는 계속 계산**됩니다. "왜 안 뽑혔는지"를 봐야 하기 때문입니다.
-다만 `score`(확률)는 0 이고 `rank` 는 `null` 이며, 활성 드라이브들의 확률 합만 1 이 됩니다.
+Even when inactive, **the logit keeps being computed** - you need to see *why* something
+was not picked. Its `score` (probability) is 0 and its `rank` is `null`, and only the
+active drives' probabilities sum to 1.
 
-### hold — 마지막 명령을 언제까지 붙들고 있을 것인가
+### hold - how long to keep trusting the last command
 
-드라이브의 시간 설정은 **`hold_ms` 하나뿐**입니다.
+A drive has exactly **one** time setting, `hold_ms`.
 
 ```jsonc
 {"name": "pp_main", "topic": "/drive_main", "hold_ms": 300}
 ```
 
-토픽마다 Hz 가 달라도 각자 값을 적으면 됩니다. **그 토픽 주기의 3~5배**가 무난합니다:
+Topics can run at different rates; give each its own value. **Three to five times its
+period** is a reasonable starting point:
 
-| 발행 Hz | 주기 | 권장 `hold_ms` |
+| publish rate | period | suggested `hold_ms` |
 |---|---|---|
-| 100 Hz | 10 ms | 30 ~ 50 |
-| 20 Hz | 50 ms | 150 ~ 250 |
-| 5 Hz | 200 ms | 600 ~ 1000 |
+| 100 Hz | 10 ms | 30 - 50 |
+| 20 Hz | 50 ms | 150 - 250 |
+| 5 Hz | 200 ms | 600 - 1000 |
 
-짧게 잡을수록 두절을 빨리 잡아내지만 지터·드롭에 예민해집니다. 실측 Hz 는 `status` 의
-`hz` 에 찍히니(설정과 무관하게 항상 측정됩니다) 그 값을 보고 정하세요.
+Shorter catches a dropout sooner but is more sensitive to jitter and drops. The measured
+rate is reported as `hz` in `status` (always measured, independent of the config) - use
+that to decide.
 
-> **단위**: 설정의 시간 값은 전부 **ms** 이고 키 이름이 `_ms` 로 끝납니다
-> (`hold_ms`, `switch_cooldown_ms`, `duration_ms`, 채점기의 `params.timeout_ms`).
-> 주파수는 `_hz` 입니다.
+> **Units**: every time value in the configuration is in **ms** and its key ends in `_ms`
+> (`hold_ms`, `switch_cooldown_ms`, `duration_ms`, a scorer's `params.timeout_ms`).
+> Rates end in `_hz`.
 
 ---
 
-## 응답 곡선 φ
+## The response curve phi
 
-채점기는 항상 `x ∈ [0,1]` 을 냅니다. 그 `x` 가 (드라이브, 입력) 쌍마다 지정된 곡선을
-거쳐 선형 레이어의 입력이 됩니다.
+A scorer always emits `x` in [0,1]. That `x` passes through a curve specified per
+(drive, input) pair before it reaches the linear layer.
 
 ```
 u = invert ? 1-x : x
-u = clamp((u - in_min) / (in_max - in_min), 0, 1)      ← 관심 구간만 잘라 확대
-e = (e^(k·u) - 1) / (e^k - 1)                          ← 지수 성분 ([0,1] 정규화형)
-s = (1 - exp_mix)·u + exp_mix·e                        ← 선형 ↔ 지수 배합
-기여도 = weight · s
+u = clamp((u - in_min) / (in_max - in_min), 0, 1)      <- crop and stretch the range of interest
+e = (e^(k*u) - 1) / (e^k - 1)                          <- exponential component, normalised to [0,1]
+s = (1 - exp_mix)*u + exp_mix*e                        <- blend linear and exponential
+contribution = weight * s
 ```
 
-선형항 `u` 와 지수항 `e` 가 둘 다 `[0,1]` 이라 **배합비를 바꿔도 `s` 는 항상 `[0,1]`** 입니다.
+Since the linear term `u` and the exponential term `e` are both in [0,1], **`s` stays in
+[0,1] whatever the blend**.
 
-| 필드 | 뜻 |
+| Field | Meaning |
 |---|---|
-| `weight` | 선형 레이어의 `W[j][i]`. **음수 가능**(감점 항), **0이면 점수 미반영(veto 는 유효)** |
-| `exp_mix` | 선형↔지수 배합비. `0`=순수 선형, `1`=순수 지수, `0.7`=지수 7 : 선형 3 |
-| `exp_k` | 지수 곡률. **k>0 볼록**("아주 좋아야 점수를 준다"), **k<0 오목**("조금만 나빠도 크게 깎인다") |
-| `invert` | 작을수록 좋은 지표를 뒤집음 |
-| `in_min` / `in_max` | 관심 구간 재정규화. 예: `in_min: 0.6` = 0.6 이하는 전부 0점 |
-| `veto_below` | 성형 후 정규화값이 이 값 미만이면 **그 드라이브 실격** (음수면 끔) |
-| `required` | true 면 이 입력이 "판단 불가"일 때 드라이브 실격 |
+| `weight` | `W[j][i]` of the linear layer. **May be negative** (penalty term). **0 means it does not affect the score, but veto still applies** |
+| `exp_mix` | linear/exponential blend. `0` = pure linear, `1` = pure exponential, `0.7` = 7 parts exponential to 3 linear |
+| `exp_k` | exponential curvature. **k > 0 convex** ("only a very good value earns points"), **k < 0 concave** ("a small drop already costs a lot") |
+| `invert` | flips a metric where smaller is better |
+| `in_min` / `in_max` | renormalise the range of interest. e.g. `in_min: 0.6` scores everything at or below 0.6 as zero |
+| `veto_below` | if the shaped value is below this, **that drive is disqualified** (negative disables) |
+| `required` | if true, the drive is disqualified whenever this input cannot judge |
 
 ```
- k = +4  (볼록)          k = 0 (선형)         k = -4  (오목)
+ k = +4  (convex)        k = 0 (linear)       k = -4  (concave)
  1 ┤            ╭        1 ┤        ╭─        1 ┤    ╭────────
    │          ╭─╯          │      ╭─╯           │  ╭─╯
    │        ╭─╯            │    ╭─╯             │ ╭╯
    │  ╭──╌──╯              │  ╭─╯               │╭╯
  0 ┼──────────────       0 ┼──────────        0 ┼──────────────
    0            1          0        1          0            1
- "아주 좋아야 점수"       비례                "조금만 나빠도 급락"
+ "must be very good"      proportional        "punishes small drops"
 ```
 
-숫자 하나만 쓰면 `weight` 만 지정한 축약형입니다:
+A bare number is shorthand for `weight` alone:
 
 ```jsonc
-"localization": 1.0   ≡   {"weight": 1.0, "exp_mix": 0.0}
+"localization": 1.0   ==   {"weight": 1.0, "exp_mix": 0.0}
 ```
 
-### 값을 채우는 순서 (뒤로 갈수록 우선)
+### Order in which values are filled (later wins)
 
-1. 내장 기본값
-2. `defaults.influence` (**yaml**) — 모든 (드라이브 × 입력) 쌍의 출발점
-3. `inputs[].influence` (**json**) — 그 입력의 드라이브 공통 기본값
-4. `drives[].influence["입력이름"]` (**json**) — 그 한 칸만
+1. built-in defaults
+2. `defaults.influence` (**yaml**) - the starting point for every (drive x input) pair
+3. `inputs[].influence` (**json**) - that input's default across all drives
+4. `drives[].influence["input name"]` (**json**) - that one cell
 
-덕분에 입력을 새로 넣을 때 `inputs[].influence` 한 줄만 적으면 모든 드라이브에 적용되고,
-특정 드라이브만 다르게 반응시키고 싶을 때만 그 드라이브에 덮어씁니다.
+So adding an input needs one line in `inputs[].influence` to apply everywhere, and you
+only override per drive when you want that drive to react differently.
 
 ---
 
-## 채점기 만들기
+## Writing a scorer
 
-**`src/scorers/` 에 .cpp 파일 하나만 추가하면 끝입니다.** 헤더도, 노드 수정도 필요
-없습니다. [src/scorers/external_score.cpp](src/scorers/external_score.cpp) 를 복사해서
-시작하세요.
+**Add one .cpp to `src/scorers/` and you are done.** No header, no changes to the node.
+Copy [src/scorers/external_score.cpp](src/scorers/external_score.cpp) to start.
 
 ```cpp
 #include "co_driver/scorer.hpp"
@@ -212,14 +220,14 @@ class ScanClearanceScorer : public Scorer
 public:
   bool configure(rclcpp::Node * node, const std::string &, const Json & p) override
   {
-    // 필요한 토픽을 여기서 직접 구독합니다.
+    // Subscribe to whatever you need, right here.
     sub_ = node->create_subscription<sensor_msgs::msg::LaserScan>(
       jstr(p, "topic", "/scan"), rclcpp::SensorDataQoS(),
       [this](sensor_msgs::msg::LaserScan::ConstSharedPtr m) {
         std::lock_guard<std::mutex> lock(mtx_);
         scan_ = m;
       });
-    min_clearance_ = jnum(p, "min_clearance", 0.15);   // params 가 그대로 옵니다
+    min_clearance_ = jnum(p, "min_clearance", 0.15);   // params arrives verbatim
     return true;
   }
 
@@ -227,9 +235,9 @@ public:
   {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!scan_) {return ScoreResult::unavailable("no scan");}
-    // d.cmd.drive.speed / steering_angle 를 보고 판단
-    if (충돌_임박) {return ScoreResult::vetoed("여유거리 부족");}
-    return ScoreResult::ok(점수);   // [0,1], 1이 좋음
+    // judge using d.cmd.drive.speed / steering_angle
+    if (collision_imminent) {return ScoreResult::vetoed("not enough clearance");}
+    return ScoreResult::ok(value);   // [0,1], 1 is good
   }
 
 private:
@@ -243,18 +251,18 @@ CO_DRIVER_REGISTER_SCORER(ScanClearanceScorer, "scan_clearance")
 }  // namespace co_driver
 ```
 
-그 다음 두 곳에 한 줄씩:
+Then one line in each of two places:
 
 ```cmake
 # CMakeLists.txt
 set(scorer_sources
   src/scorers/external_score.cpp
-  src/scorers/scan_clearance.cpp    # <- 추가
+  src/scorers/scan_clearance.cpp    # <- added
 )
 ```
 
 ```jsonc
-// config/co_driver_topics.jsonc 의 inputs 에
+// in the inputs list of config/co_driver_topics.jsonc
 {
   "name": "clearance", "type": "scan_clearance",
   "params": {"topic": "/scan", "min_clearance": 0.15},
@@ -262,25 +270,25 @@ set(scorer_sources
 }
 ```
 
-### 계약
+### The contract
 
-| 반환 | 뜻 |
+| Return | Meaning |
 |---|---|
-| `ScoreResult::ok(v)` | `v ∈ [0,1]`, 1이 좋음. 이 값이 응답 곡선의 `x`. 캐시에 저장됩니다 |
-| `ScoreResult::pending(why)` | **아직 계산 중**(비동기). 프레임워크가 직전 점수를 대신 씁니다 |
-| `ScoreResult::unavailable(why)` | 판단 불가. **가중치째 결합에서 제외** — 데이터 없는 채점기가 점수를 끌어내리지 않습니다 |
-| `ScoreResult::vetoed(why)` | 점수와 무관하게 드라이브 실격. hard constraint 전용 |
+| `ScoreResult::ok(v)` | `v` in [0,1], 1 is good. This is the `x` of the response curve. Cached |
+| `ScoreResult::pending(why)` | **still computing** (async). The framework substitutes the previous score |
+| `ScoreResult::unavailable(why)` | cannot judge. **Excluded from the combination, weight and all** - a scorer with no data does not drag the score down |
+| `ScoreResult::vetoed(why)` | disqualifies the drive regardless of score. For hard constraints only |
 
-### 비동기 채점기
+### Async scorers
 
-`score()` 는 평가 주기(기본 50Hz)마다 호출되므로 오래 걸리면 안 됩니다. 무거운 계산은
-**자기 타이머·콜백에서** 하고, `score()` 에서는 결과만 꺼내 주세요.
+`score()` is called every evaluation tick (50 Hz by default), so it must not be slow. Do
+heavy work **in your own timer or callback** and have `score()` only hand back the result.
 
 ```cpp
 bool configure(rclcpp::Node * node, const std::string &, const Json & p) override
 {
-  // 반드시 group() 에 넣으세요 — 기본 콜백 그룹은 MutuallyExclusive 라
-  // 평가·출력 타이머까지 막습니다.
+  // Must go in group(). The default callback group is MutuallyExclusive and would
+  // block the evaluation and output timers.
   timer_ = node->create_wall_timer(200ms, [this]{ compute(); }, group());
   return true;
 }
@@ -288,57 +296,60 @@ bool configure(rclcpp::Node * node, const std::string &, const Json & p) overrid
 ScoreResult score(const Drive & d, const Context &) override
 {
   std::lock_guard<std::mutex> lk(mtx_);
-  if (!fresh_) {return ScoreResult::pending("계산 중");}   // 직전 점수를 대신 씀
+  if (!fresh_) {return ScoreResult::pending("computing");}   // previous score is used
   fresh_ = false;
   return ScoreResult::ok(value_);
 }
 ```
 
-`pending` 이면 프레임워크가 **직전 점수를 대신 쓰고**, 그 점수가 `inputs[].hold_ms` 를
-넘기면 자동으로 `unavailable` 이 되어 결합에서 빠집니다. 캐시와 만료는 프레임워크가
-처리하므로 채점기는 `pending` 만 내면 됩니다.
+On `pending` the framework **substitutes the previous score**, and once that score is
+older than `inputs[].hold_ms` it automatically becomes `unavailable` and drops out of the
+combination. Caching and expiry are the framework's job; a scorer only has to say
+`pending`.
 
 ```jsonc
 {"name": "heavy", "type": "example_async", "hold_ms": 800,
  "params": {"rate_hz": 5.0}, "influence": {"weight": 1.0}}
 ```
 
-> **콜백 그룹**: 노드는 평가 타이머 / 출력 타이머 / 채점기(Reentrant)를 **서로 다른
-> 콜백 그룹**에 둡니다. 그래서 MultiThreadedExecutor 위에서 실제로 병렬로 돕니다.
-> 채점기가 만든 구독·타이머를 `group()` 에 넣지 않으면 기본 그룹(MutuallyExclusive)에
-> 들어가 출력 주기까지 흔들립니다.
+> **Callback groups**: the node puts the evaluation timer, the output timer and the
+> scorers (Reentrant) in **separate callback groups**, so they genuinely run in parallel
+> on a MultiThreadedExecutor. A subscription or timer a scorer creates without passing
+> `group()` lands in the default (MutuallyExclusive) group and will disturb the output
+> rate.
 >
-> 실측: 40ms 계산을 2Hz 로 도는 채점기를 붙였을 때 —
-> 그룹을 안 나누면 `/drive` p99 **48.7ms**, 나누면 **10.1ms**.
+> Measured: with a scorer doing 40 ms of work at 2 Hz - without separate groups `/drive`
+> p99 was **48.7 ms**, with them **10.1 ms**.
 
-동작하는 예시: [src/scorers/example_async.cpp](src/scorers/example_async.cpp)
+Working example: [src/scorers/example_async.cpp](src/scorers/example_async.cpp)
 
-`Context` 에는 센서가 없습니다. 노드만 알 수 있는 것(`now`, `dt`, 드라이브 목록,
-직전 발행 명령, 직전 선택)만 들어 있고, 나머지는 채점기가 스스로 구독합니다.
-드라이브 간 상대 비교가 필요하면 `prepare()` 를 오버라이드해 `ctx.drives` 를 훑으세요.
+`Context` has no sensors in it. Only what the node alone knows (`now`, `dt`, the drive
+list, the last published command, the last selection); everything else a scorer
+subscribes to itself. If you need to compare drives against each other, override
+`prepare()` and walk `ctx.drives`.
 
-### Python 으로 실험하기 (C++ 빌드 불필요)
+### Experimenting from Python (no C++ build)
 
-`std_msgs/Float64MultiArray` 로 점수를 쏘면 기본 제공되는 `external_score` 채점기가
-받아 줍니다. 동작하는 예제:
+Publish scores as `std_msgs/Float64MultiArray` and the built-in `external_score` scorer
+picks them up. Working example:
 
 ```bash
 ros2 run co_driver example_python_scorer.py
 ```
 
-배포 설정에 `"external"` 이라는 이름으로 이미 들어 있으므로, 이 노드를 띄우기만 하면
-반영됩니다.
+The shipped configuration already includes it under the name `"external"`, so just
+starting the node is enough.
 
 ---
 
-## 기본 제공 채점기: `external_score`
+## The built-in scorer: `external_score`
 
-외부 노드가 쏘는 점수를 받는 채점기 하나만 들어 있습니다(스켈레톤 겸용).
-`std_msgs/Float64MultiArray` 로 두 계약을 지원합니다.
+The one bundled scorer receives scores published by another node, and doubles as the
+skeleton. It supports two contracts over `std_msgs/Float64MultiArray`.
 
-### mode: `scalar` — 차량 전체 점수
+### mode: `scalar` - one score for the whole vehicle
 
-`localization_pf` 의 `/localization_confidence` 가 이 형태입니다
+`localization_pf`'s `/localization_confidence` has this shape
 (`data = [stamp_sec, stamp_nanosec, confidence]`):
 
 ```jsonc
@@ -347,8 +358,8 @@ ros2 run co_driver example_python_scorer.py
   "params": {
     "topic": "/localization_confidence",
     "mode": "scalar",
-    "index": 2,                 // confidence 가 들어있는 칸
-    "stamp_indices": [0, 1],    // std_msgs 엔 header 가 없어 앞 두 칸이 stamp
+    "index": 2,                 // the slot holding the confidence
+    "stamp_indices": [0, 1],    // std_msgs has no header, so the first two slots are the stamp
     "timeout_ms": 500,
     "input_min": 0.0, "input_max": 1.0,
     "on_missing": "unavailable" // unavailable | value | veto
@@ -357,17 +368,18 @@ ros2 run co_driver example_python_scorer.py
 }
 ```
 
-### mode: `per_candidate` — 드라이브별 점수
+### mode: `per_candidate` - one score per drive
 
-짝짓기는 **`layout.dim[i].label` 이 드라이브 이름과 같은 칸**이 1순위, 없으면
-`params.order` 순서로 `data[i]`. 값이 `NaN` 이면 그 드라이브만 "판단 불가"가 됩니다.
+Matching prefers **the slot whose `layout.dim[i].label` equals the drive name**, and falls
+back to the order in `params.order` for `data[i]`. A `NaN` makes that one drive
+"cannot judge".
 
-`params.input_min/input_max/invert` 는 **원 단위 → [0,1]** 변환이고, `influence` 의
-`in_min/in_max/invert` 는 그 뒤의 **응답 곡선 성형**입니다.
+`params.input_min/input_max/invert` convert raw units to [0,1]; `influence`'s
+`in_min/in_max/invert` are the response-curve shaping that happens afterwards.
 
 ---
 
-## 선택과 후처리 (yaml)
+## Selection and post-processing (yaml)
 
 ```yaml
 scoring:
@@ -378,80 +390,83 @@ scoring:
   min_valid_score: 0.0
 
 selection:
-  switch_margin: 0.10       # 확률 차이
-  switch_cooldown_ms: 500   # 전환 직후 이 시간 동안은 다시 전환하지 않음
-  fallback: "pp_main"       # 전원 실격일 때 마지막 시도 (이것도 유효해야 씀)
+  switch_margin: 0.10       # difference of probabilities
+  switch_cooldown_ms: 500   # no further switch for this long after one
+  fallback: "pp_main"       # last resort when everything is disqualified (must itself be valid)
 ```
 
-- 현재 드라이브가 **살아 있으면** `switch_margin` + `switch_cooldown_ms` 를 둘 다 만족해야 전환.
-- 현재 드라이브가 **실격되면** 히스테리시스 없이 즉시 전환.
-- 전부 실격이면 `fallback` → 그것도 안 되면 "선택 없음" → `timeout_stop` 이 감속 정지.
-- 쓸 드라이브가 없어도 `/drive` 발행은 계속됩니다(그래야 감속 명령이 차에 닿습니다).
+- While the incumbent is **alive**, a switch needs both `switch_margin` and
+  `switch_cooldown_ms` to be satisfied.
+- When the incumbent is **disqualified**, the switch is immediate, with no hysteresis.
+- If everything is disqualified: `fallback`; if that fails too, "no selection" and
+  `timeout_stop` decelerates to a halt.
+- `/drive` keeps being published even with nothing to drive with - that is how the
+  deceleration command reaches the car.
 
-`postprocess.pipeline` **목록 순서가 곧 적용 순서**입니다.
+The order of `postprocess.pipeline` **is** the order of application.
 
-| type | 하는 일 |
+| type | Does |
 |---|---|
-| `timeout_stop` | 쓸 드라이브가 없을 때 `decel` 로 감속해 정지 |
-| `switch_blend` | A→B 전환 순간의 점프를 `duration_ms` 동안 녹임 (`linear`/`smooth`/`ema`) |
-| `rate_limit` | 조향 각속도[deg/s], 가/감속[m/s²] 제한 |
-| `speed_scale` | 최종 속도 배율. 런타임 `ros2 param set` 가능 |
-| `deadband` | 미세 명령을 0으로 눌러 서보 잔떨림 억제 |
-| `clamp` | 절대 한계. **마지막에 두어** 앞 단계가 한계를 넘기지 못하게 함 |
+| `timeout_stop` | decelerate to a stop at `decel` when there is no drive to use |
+| `switch_blend` | smooth the jump at an A->B switch over `duration_ms` (`linear`/`smooth`/`ema`) |
+| `rate_limit` | limit steering rate [deg/s] and acceleration/deceleration [m/s^2] |
+| `speed_scale` | final speed multiplier; settable at runtime with `ros2 param set` |
+| `deadband` | squash tiny commands to zero to stop servo chatter |
+| `clamp` | absolute limits. **Put it last** so no earlier stage can exceed them |
 
 ```bash
 ros2 param set /co_driver_node postprocess.speed_scale.scale 0.5
 ```
 
-새 단계는 [src/co_driver_node.cpp](src/co_driver_node.cpp) 의 `PostProcess` 에
-enum + 파싱 + apply 각각 한 case 씩 추가하면 됩니다.
+A new stage means one case each in the enum, the parser and the apply of `PostProcess` in
+[src/co_driver_node.cpp](src/co_driver_node.cpp).
 
 ---
 
-## 튜닝 루프 (핫리로드)
+## Tuning loop (hot reload)
 
-계수만 바꿨다면 재시작 없이 다시 읽습니다.
+If only coefficients changed, they are re-read without a restart.
 
 ```bash
-# JSON 을 편집했거나 —
-ros2 param set /co_driver_node scoring.temperature 0.2   # yaml 쪽 값을 바꿨다면
+# after editing the JSON, or -
+ros2 param set /co_driver_node scoring.temperature 0.2   # if you changed a yaml value
 ros2 service call /co_driver_node/reload std_srvs/srv/Trigger
 ```
 
-반영: **influence 행렬, scoring, selection, postprocess, drives 의 timeout/bias/enabled**.
-반영 안 됨: 토픽 이름, 주기, inputs/drives 목록 자체 — 구독을 다시 만들어야 하므로
-서비스가 거부하고 이유를 알려 줍니다.
+Applies to: the influence matrix, `scoring`, `selection`, `postprocess`, and a drive's
+timeout / bias / enabled. Does **not** apply to: topic names, rates, or the inputs/drives
+lists themselves - those need subscriptions rebuilt, so the service refuses and says why.
 
 ---
 
-## 진단 토픽
+## Diagnostic topics
 
-| 토픽 | 타입 | 내용 |
+| Topic | Type | Contents |
 |---|---|---|
-| `/co_driver_node/selected` | `std_msgs/String` | **실제로 쓰는 드라이브** — `/drive` 로 나가는 명령의 주인 |
-| `/co_driver_node/runner_up` | `std_msgs/String` | **합산 점수 2등** |
-| `/co_driver_node/scores` | `std_msgs/Float64MultiArray` | 드라이브별 softmax 확률. `layout.dim[i].label` 에 이름 |
-| `/co_driver_node/status` | `std_msgs/String` | JSON 한 줄. rank / logit / 입력별 기여도까지 |
+| `/co_driver_node/selected` | `std_msgs/String` | **the drive actually in use** - the owner of what goes out on `/drive` |
+| `/co_driver_node/runner_up` | `std_msgs/String` | **second place by summed score** |
+| `/co_driver_node/scores` | `std_msgs/Float64MultiArray` | softmax probability per drive; name in `layout.dim[i].label` |
+| `/co_driver_node/status` | `std_msgs/String` | one line of JSON: rank, logit, per-input contribution |
 
-`runner_up` 은 **순수 점수 순위 2위**입니다. 선택 로직과 무관하므로, 히스테리시스로
-선택이 점수 1등이 아닐 때는 `selected` 와 같은 값이 나올 수 있습니다(정상). 유효
-드라이브가 하나뿐이면 빈 문자열입니다.
+`runner_up` is **pure score rank 2**. It has nothing to do with the selection logic, so
+when hysteresis keeps the selection off rank 1 it can equal `selected` (that is correct).
+With only one valid drive it is an empty string.
 
-점수 3등 이하가 필요하면 `status` 의 `rank` 필드나 `/scores` 를 정렬해 쓰세요.
+For third place and below, read the `rank` field in `status` or sort `/scores`.
 
 ```jsonc
 {"name": "pp_left", "rank": 2, "score": 0.424, "logit": 1.9143, "raw": 1.9143, "bias": 0.0,
  "active": true, "valid": true,
- "age_ms": 26.5,    // 마지막 수신으로부터 경과
- "hold_ms": 300.0,  // 설정된 유효 시간
- "hz": 20.0,        // 실측 수신 주파수 (설정과 무관하게 항상 측정)
+ "age_ms": 26.5,    // since the last message
+ "hold_ms": 300.0,  // configured validity window
+ "hz": 20.0,        // measured receive rate (always measured, independent of config)
  "inputs": {
    "localization": {"x": 0.9, "s": 0.640885, "w": 1.2, "c": 0.769062}
-   //                 x = 채점기 원점수, s = φ 성형 후, w = W[j][i], c = logit 기여분 W·φ
+   //                 x = raw scorer value, s = after phi, w = W[j][i], c = contribution W*phi
  }}
 ```
 
-두절된 드라이브는 이렇게 보입니다 — 점수는 남아 있고 순위에서만 빠집니다:
+A dropped-out drive looks like this - the score survives, only the ranking loses it:
 
 ```
   pp_main   hz= 99.0  hold=300ms  age=    5.5ms  active=True  rank=2  p=0.3989 logit=1.1798
@@ -460,23 +475,221 @@ ros2 service call /co_driver_node/reload std_srvs/srv/Trigger
   pp_right  hz=  5.0  hold=300ms  age=  103.0ms  active=True  rank=1  p=0.6011 logit=1.5898
 ```
 
-`rank` 는 **점수 순위**(유효 드라이브만, 실격이면 `null`)이고 `selected` 는 **실제 선택**
-입니다. 히스테리시스(`switch_margin` / `switch_cooldown_ms`) 때문에 둘이 어긋날 수 있고,
-그 차이가 보이는 것이 목적입니다.
+`rank` is the **score ranking** (valid drives only, `null` when disqualified) and
+`selected` is the **actual choice**. Hysteresis (`switch_margin` / `switch_cooldown_ms`)
+can put them out of step, and seeing that difference is the point.
 
 ```
     /selected = 'pp_left'   /runner_up = 'pp_left'
-      rank 1  pp_right  p=0.4313     <- 점수는 이쪽이 1등인데
-      rank 2  pp_left   p=0.4240     <- switch_margin 미달이라 아직 이쪽을 씀 (= /runner_up)
+      rank 1  pp_right  p=0.4313     <- higher score
+      rank 2  pp_left   p=0.4240     <- but switch_margin not met, so this one still drives (= /runner_up)
       rank 3  pp_main   p=0.1447
 ```
 
-`inputs` 의 `null` 은 판단 불가, `"veto"` 는 실격. 어떤 것이 드라이브를 죽였는지는
-`reject` 필드에 사유가 그대로 찍힙니다.
+In `inputs`, `null` means cannot judge and `"veto"` means disqualified. Whatever killed a
+drive is spelled out in its `reject` field.
 
 ---
 
-## 빌드 · 실행
+## red_damvi: gap_follow as the localization fallback
+
+A second, self-contained configuration that arbitrates two candidates using the
+localization confidence alone:
+
+| Candidate | Topic | Needs |
+|---|---|---|
+| `pp_main` (PPcontroller) | `/drive_main` | a map and a working localization |
+| `gap_follow` | `/drive_gf` | `/scan` only |
+
+**When localization collapses, the car is handed to gap_follow, and taken back when it
+recovers.**
+
+```bash
+ros2 launch co_driver red_damvi.launch.py
+# with a rosbag replay or any BEST_EFFORT scan publisher:
+ros2 launch co_driver red_damvi.launch.py scan_bridge:=true
+```
+
+| Launch argument | Default | Meaning |
+|---|---|---|
+| `gap_follow` | `true` | also start gap_follow, forced onto `/drive_gf` |
+| `monitor` | `true` | also start `drive_monitor` |
+| `csv` | `''` | path for the monitor's per-sample CSV |
+| `scan_bridge` | `false` | relay `/scan` BEST_EFFORT -> `/scan_reliable` RELIABLE |
+| `scan_topic` | `/scan` | source scan topic |
+
+Files: [config/co_driver_red_damvi.yaml](config/co_driver_red_damvi.yaml),
+[config/co_driver_red_damvi_topics.jsonc](config/co_driver_red_damvi_topics.jsonc),
+[launch/red_damvi.launch.py](launch/red_damvi.launch.py).
+
+### How the two are scored
+
+`pp_main` follows a map, so localization *is* its competence: a large positive weight, and
+its logit collapses with the confidence. `gap_follow` is equally good with or without
+localization, so it gets a constant floor from `bias` plus a small negative weight that
+makes it step aside once confidence returns.
+
+```
+z(pp_main)    = 3.0 * phi(confidence)
+z(gap_follow) = 1.0 - 1.5 * phi(confidence)
+phi: in_min 0.02, in_max 0.35, exp_mix 1.0, exp_k 3.0
+```
+
+### Why the thresholds are so low
+
+They come from measured confidence distributions rather than intuition. Over four
+replayed scenes (51k samples), the 5th percentile of confidence **during normal tracking**
+was:
+
+| scene | Tracking p50 | Tracking p05 |
+|---|---|---|
+| icra | 0.983 | 0.877 |
+| 0522-2 | 0.987 | 0.867 |
+| 0526-1 | 0.927 | 0.530 |
+| busan2 | 0.794 | 0.361 |
+
+busan2 spends 13.5% of healthy tracking below 0.5, so a threshold anywhere near 0.5 would
+hand the car to gap_follow during perfectly good driving. Real failures, meanwhile, take
+the confidence to 0.0. So the whole decision lives at the bottom of the scale:
+
+| | |
+|---|---|
+| hand over to gap_follow | confidence falls below **0.171** |
+| hand back to pp_main | confidence rises above **0.226** |
+| deadband 0.171 - 0.226 | whatever is driving keeps driving |
+
+### Three defences against flapping
+
+| Layer | Setting | Effect |
+|---|---|---|
+| EMA on the logits | `scoring.ema_alpha: 0.08` | ~250 ms time constant: a **sustained** collapse switches in **0.46 s**, a dip of **400 ms or less is rejected outright** |
+| Hysteresis | `selection.switch_margin: 0.15` | the 0.171 - 0.226 deadband above |
+| Cooldown | `selection.switch_cooldown_ms: 1500` | gap_follow keeps the car for at least that long once it has it |
+
+`selection.fallback` is `gap_follow`: "everything is disqualified" usually means
+localization went with it, and the controller that only needs `/scan` is the last one
+worth trusting.
+
+### Measured behaviour
+
+Against a live localization replaying the `0526-1` dataset (132 s of confidence at
+100 Hz, `/scan` at 37 Hz driving a real gap_follow, a stand-in publisher on
+`/drive_main`), with `drive_monitor` recording every switch:
+
+| Event in the trace | Switches | Expected |
+|---|---|---|
+| startup convergence, confidence to 0.0 twice | 4 | 2 per collapse |
+| 36-42 s collapse to 0.0 | 2 | 2 |
+| 59-66 s collapse to 0.0, twice | 4 | 2 per collapse |
+| 83-89 s collapse to 0.0 | 2 | 2 |
+| 105-107 s dip, min 0.29, entering the shaped band four times in half a second | **0** | 0 |
+| 121-130 s wobble between 0.58 and 0.60 | **0** | 0 |
+
+227 s observed, 12 switches, **0 flaps**, gap_follow occupancy 5.0%, status 50.0 Hz,
+output 100.0 Hz. The two silent rows are the interesting ones: those are the shapes that
+make a naive threshold chatter, and they produced nothing.
+
+Two behaviours worth knowing about, both confirmed on real data rather than fixtures:
+
+- **A candidate that is not alive never gets the car.** When the replay ended, the
+  confidence went to 0.0 (topic silent, so `on_missing: value` scored it 0) *and*
+  gap_follow went stale from the loss of `/scan`. co_driver kept pp_main rather than
+  handing over to a dead candidate.
+- **Back-to-back dropouts produce short stints on gap_follow.** At 59-66 s the
+  localization genuinely recovered for 2.4 s between two collapses, so the car was handed
+  back and then taken again. The shortest dwell was the cooldown floor exactly. This is
+  the arbitration tracking a real signal, not chatter - but it is the reason
+  `switch_cooldown_ms` is worth thinking about, and why raising it much further is the
+  wrong answer (see the comment in the yaml).
+
+### A note on ambiguous confidence values
+
+slam_ours computes the confidence as `(state multiplier) x min(5 terms)` where the state
+multiplier is Lost 0.0 / Converging 0.5 / Tracking 1.0. A middling value is therefore
+ambiguous - 0.45 can be a healthy Converging (raw 0.9) or a broken Tracking. This
+configuration deliberately does not depend on telling those apart: the thresholds sit low
+enough that only a genuine collapse toward 0 triggers a handover, and both readings of a
+failure produce that. Disambiguating properly would mean subscribing to the state topic
+from a new scorer, which would tie the configuration to one localization implementation.
+
+### gap_follow gotchas
+
+Two things will silently produce no `/drive_gf` at all:
+
+1. **QoS.** gap_follow builds its LaserScan subscription from a plain depth int, which
+   rclcpp turns into a **RELIABLE** subscription, while LiDAR drivers and rosbag replays
+   publish `/scan` **BEST_EFFORT**. Incompatible, so gap_follow receives nothing.
+   `scan_bridge:=true` relays across the mismatch; the real fix is `SensorDataQoS()` in
+   gap_follow.
+2. **Namespace.** gap_follow's config yaml is keyed `gap_follow/gap_follow`, so the node
+   must run in the `gap_follow` namespace or none of its parameters are declared and it
+   aborts on its first `get_parameter()`. The launch file here does that.
+
+Also note gap_follow's own default is `drive_topic: /drive`, which is co_driver's **output**
+topic. The launch file always overrides it to `/drive_gf`; `drive_monitor` logs an ERROR
+if it ever sees two publishers on the output.
+
+---
+
+## drive_monitor - which topic is driving, and is it flapping?
+
+[scripts/drive_monitor.py](scripts/drive_monitor.py) reads `~/status` and the output
+`/drive`, and needs nothing else.
+
+```bash
+ros2 run co_driver drive_monitor.py --ros-args \
+  -p status_topic:=/co_driver_node/status -p output_topic:=/drive \
+  -p csv_path:=/tmp/arbitration.csv
+```
+
+Periodic line - who is selected, and every candidate's probability, rank, measured rate,
+age and command:
+
+```
+[  28.00s] selected=pp_main (held 11.3s)  localization=0.230  switches=2 (last 10s: 0)
+   | gap_follow p=0.514 r1 37Hz age=1ms v=1.25 s=+16.6 | *pp_main p=0.486 r2 50Hz ... | out v=2.59 s=-11.9
+```
+
+That line is worth reading twice: gap_follow holds **rank 1** while pp_main stays
+**selected**. That is `switch_margin` doing its job.
+
+On every switch it logs the transition, how long the previous drive was held, the input
+that caused it, and **how far the output actually jumped**:
+
+```
+SWITCH #1  [  11.05s]  pp_main -> gap_follow   (held 10.85s)   localization=0.000
+           p: pp_main=0.416 gap_follow=0.584   reason: switched on score margin
+   output discontinuity over 150ms: dv=0.48 m/s  dsteer=15.3 deg
+```
+
+| Detection | Parameter | Default |
+|---|---|---|
+| too many switches in a window | `window_s`, `max_switches_per_window` | 10 s, 3 |
+| A->B->A flap | `flap_dwell_s` | 1.5 s |
+| two publishers on the output | - | always on |
+
+Ctrl-C prints a summary: occupancy per drive, switches per minute, dwell min/median/max,
+worst output jump at a switch, flap count, and a PASS/WARN verdict.
+
+### Bench fixtures
+
+For testing the arbitration with no car and no localization stack:
+
+| Script | Does |
+|---|---|
+| [scripts/fake_localization_confidence.py](scripts/fake_localization_confidence.py) | synthetic `/localization_confidence`: a scripted sequence of collapse, glitch, threshold hover and silence, or `const` / `sweep` / `hover` profiles |
+| [scripts/fake_drive.py](scripts/fake_drive.py) | a smooth continuous command on one drive topic, so any discontinuity at a handover is the arbitration's, not the source's |
+| [scripts/scan_qos_bridge.py](scripts/scan_qos_bridge.py) | `/scan` BEST_EFFORT -> RELIABLE relay (see gap_follow gotchas) |
+
+```bash
+ros2 run co_driver fake_drive.py --ros-args -p topic:=/drive_main -p speed:=2.5
+ros2 run co_driver fake_localization_confidence.py --ros-args -p profile:=script
+ros2 launch co_driver red_damvi.launch.py gap_follow:=false csv:=/tmp/bench.csv
+```
+
+---
+
+## Build and run
 
 ```bash
 sudo apt install ros-jazzy-ackermann-msgs nlohmann-json3-dev
@@ -486,34 +699,36 @@ colcon build --packages-select co_driver --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 
 ros2 launch co_driver co_driver.launch.py
-# 다른 설정으로
+# with a different configuration
 ros2 launch co_driver co_driver.launch.py config:=my.yaml topics:=my_topics.jsonc
-# launch 없이
+# without launch
 ros2 run co_driver co_driver_node --ros-args \
     --params-file my.yaml -p topics_file:=my_topics.jsonc
 ```
 
-### PPcontroller 쪽 설정
+### Configuring the PPcontroller side
 
-각 인스턴스가 서로 다른 토픽으로 내보내게 `drive_topic` 을 바꿉니다
+Point each instance at its own topic via `drive_topic`
 (`PPcontroller/config/config.yaml`):
 
 ```yaml
 pure_pursuit:
   ros__parameters:
-    drive_topic: "/drive_main"     # 인스턴스마다 /drive_left, /drive_right ...
+    drive_topic: "/drive_main"     # /drive_left, /drive_right, ... per instance
 ```
 
-`co_driver_topics.jsonc` 의 `drives[].topic` 이 이 이름들과 맞기만 하면 됩니다.
+All that matters is that `drives[].topic` in `co_driver_topics.jsonc` matches these names.
 
 ---
 
-## 안전 관련 메모
+## Safety notes
 
-- 쓸 드라이브가 하나도 없어도 `/drive` 발행은 멈추지 않습니다. 그래야 `timeout_stop` 의
-  감속이 차에 전달됩니다(발행을 멈추면 mux 자체 timeout 0.2s 로 급정지).
-- `clamp.min_speed: 0.0` 이 기본이라 후진 명령은 나가지 않습니다.
-- 조이스틱 e-stop 은 co_driver 를 거치지 않고 mux 에서 처리됩니다. 출력 토픽을
-  `/ackermann_drive` 로 바꿔 mux 를 우회하면 **그 보호가 사라집니다**.
-- `exp_k` 를 크게 음수로 주면 점수가 거의 계단처럼 떨어집니다. 안전 지표에는 유용하지만
-  전환이 잦아질 수 있으니 `switch_margin` / `switch_cooldown_ms` 와 같이 보세요.
+- `/drive` keeps publishing even when there is nothing to drive with, so `timeout_stop`'s
+  deceleration reaches the car. (Stopping the publication instead would trip the mux's own
+  0.2 s timeout and stop hard.)
+- `clamp.min_speed: 0.0` is the default, so no reverse command is ever emitted.
+- The joystick e-stop is handled by the mux, not by co_driver. Pointing the output at
+  `/ackermann_drive` to bypass the mux **removes that protection**.
+- A large negative `exp_k` makes the score fall almost like a step. That is useful for a
+  safety metric but invites frequent switching, so read it together with `switch_margin`
+  and `switch_cooldown_ms`.

@@ -63,9 +63,16 @@ install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-# 외부(Python) 채점기 예제 — /drive 를 직접 보고 점수 토픽을 쏩니다.
+# Python helpers.
+#   example_python_scorer   external scorer example - watches /drive, publishes scores
+#   drive_monitor           arbitration monitor - which topic drives, and is it flapping
+#   fake_*                  bench fixtures, for testing without a car
 install(PROGRAMS
   scripts/example_python_scorer.py
+  scripts/drive_monitor.py
+  scripts/fake_localization_confidence.py
+  scripts/fake_drive.py
+  scripts/scan_qos_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

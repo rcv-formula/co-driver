@@ -51,12 +51,12 @@ ScoreResult resolveScore(
   if (fresh.is_pending) {
     const auto it = d.score_cache.find(input);
     if (it == d.score_cache.end() || !it->second.valid) {
-      return ScoreResult::unavailable("아직 점수 없음");
+      return ScoreResult::unavailable("no score yet");
     }
     const double age = (now - it->second.stamp).seconds();
     if (hold > 0.0 && age > hold) {
       char buf[80];
-      std::snprintf(buf, sizeof(buf), "점수 %.0fms 째 미갱신 (hold %.0fms)", age * 1e3, hold * 1e3);
+      std::snprintf(buf, sizeof(buf), "score not updated for %.0fms (hold %.0fms)", age * 1e3, hold * 1e3);
       return ScoreResult::unavailable(buf);
     }
     if (held_age) {*held_age = age;}
@@ -92,11 +92,11 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
     };
 
   if (!d.has_cmd) {
-    noScore("메시지 수신 이력 없음");
+    noScore("no message ever received");
     return;
   }
   if (!std::isfinite(d.cmd.drive.speed) || !std::isfinite(d.cmd.drive.steering_angle)) {
-    noScore("명령이 NaN/inf");
+    noScore("command is NaN/inf");
     return;
   }
 
@@ -133,7 +133,7 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
 
     if (it == d.results.end() || !it->second.available) {
       if (inf.required) {
-        deactivate("required[" + kv.first + "] 판단 불가");
+        deactivate("required[" + kv.first + "] unavailable");
       }
       // missing: "zero" 면 φ=0 을 더한 셈, "mask" 면 아래에서 되스케일합니다.
       continue;
