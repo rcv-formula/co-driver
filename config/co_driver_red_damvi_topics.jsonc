@@ -60,6 +60,14 @@
       //                 so normal driving never enters the shaped region at all
       //   exp_k 3.0   : convex, so the little that is left between 0.02 and 0.35
       //                 still falls away steeply
+      //
+      // These two numbers describe the **producer**, not co_driver. slam_ours computes
+      // the confidence as (state multiplier) x min(5 terms). If that formula, those
+      // multipliers, or the output scale ever change, in_min/in_max stop meaning what
+      // they meant here and nothing will fail loudly - the arbitration will simply
+      // stop handing over, or start handing over constantly. Re-fit them against fresh
+      // per-scene percentiles: the handover threshold has to sit below the *worst*
+      // scene's 5th percentile of confidence during healthy tracking.
       "influence": {"weight": 0.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
     }
 
