@@ -1,11 +1,17 @@
-// red_damvi wiring - which inputs and drives exist, and where they listen.
+// red_damvi wiring + arbitration parameters.
 //
 // One line: **when localization collapses, hand over to gap_follow; come back
 // only when it is fully healthy again.**
 //
-// Numbers live elsewhere:
-//   thresholds / hold times / weights / curves -> localization_scoring.jsonc
-//   scoring / selection / postprocess          -> co_driver_red_damvi.yaml
+// This file owns everything that belongs to co_driver itself:
+//   - which inputs and drives exist, and where they listen (wiring)
+//   - the arbitration layer: weights W[j][i], bias b_j, response curves,
+//     veto placements, per-drive hold_ms
+//
+// How the localization score itself is computed (timeouts, missing-topic
+// policy, recovery-gate conditions) is the scorer's business and lives in
+// config/localization_scoring.jsonc, merged over this file at load.
+// Base settings (scoring / selection / postprocess) are in co_driver_red_damvi.yaml.
 {
   "inputs": [
     {
@@ -18,9 +24,18 @@
         "topic": "/localization_confidence",
         "mode": "scalar",
         "index": 2,
-        "stamp_indices": [0, 1],
-        "invert": false
-      }
+        "stamp_indices": [0, 1]
+      },
+      // Response curve, shared default for all drives (overridden per drive below).
+      // Fitted to measured confidence distributions (healthy-tracking p05 per
+      // scene: icra .877 / 0522-2 .867 / 0526-1 .530 / busan2 .361 - the
+      // thresholds must sit below the worst of them):
+      //   in_min 0.02 : at or below this, score 0 (localization is gone)
+      //   in_max 0.35 : at or above this, full marks (out of the danger band)
+      // With the weights below and switch_margin 0.15 the handover lands at
+      // confidence 0.171 falling / 0.226 rising. Re-fit if the producer's
+      // confidence formula changes.
+      "influence": {"weight": 0.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
     },
 
     {
@@ -39,7 +54,7 @@
 
     {
       // Return latch - keeps pp_main out until localization has been fully
-      // healthy for a sustained stretch (numbers in the tuning file).
+      // healthy for a sustained stretch (conditions in localization_scoring.jsonc).
       "name": "recovery",
       "type": "recovery_gate",
       "params": {
@@ -50,18 +65,37 @@
     }
   ],
 
+  // hold_ms = how long the last command stays trusted (~3-5x the topic period).
+  // Past it the drive goes inactive and drops out of ranking and selection.
   "drives": [
     {
       // PPcontroller - map and raceline based; needs localization to mean anything
       "name": "pp_main",
       "topic": "/drive_main",
-      "enabled": true
+      "hold_ms": 300,
+      "bias": 0.0,
+      "enabled": true,
+      "influence": {
+        // W = +3.0: full confidence -> z = 3.0, zero confidence -> z = 0.0
+        "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
+        // Lost (or silence) disqualifies pp_main outright; weight 0 = veto only
+        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25},
+        // return latch (see localization_scoring.jsonc); weight 0 = veto only
+        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
+      }
     },
     {
-      // gap_follow - reactive on /scan alone; unaffected by localization
+      // gap_follow - reactive on /scan alone; unaffected by localization.
+      // bias 1.0 is its floor score when localization is gone; W = -1.5 makes
+      // it step aside once confidence recovers (z = 1.0 - 1.5*phi).
       "name": "gap_follow",
       "topic": "/drive_gf",
-      "enabled": true
+      "hold_ms": 200,
+      "bias": 1.0,
+      "enabled": true,
+      "influence": {
+        "localization": {"weight": -1.5, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+      }
     }
   ]
 }

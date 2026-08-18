@@ -1,37 +1,25 @@
-// red_damvi tuning - every number that decides WHEN the arbitration acts.
+// How the localization score is computed - the scorers' own parameters.
 //
-// This file is deep-merged onto co_driver_red_damvi_topics.jsonc (which holds
-// only the wiring: names, types, topic addresses, message contracts). Change
-// behaviour here; change plumbing there. Reload without restarting:
+// Deep-merged over co_driver_red_damvi_topics.jsonc at load (`tuning_file`
+// parameter). Only scorer behaviour lives here; the arbitration layer -
+// weights, bias, response curves, veto placement - is co_driver's and stays
+// in the topics file. Reload without restarting:
 //
 //   ros2 service call /co_driver_node/reload std_srvs/srv/Trigger
-//
-// The three questions this file answers:
-//   1) when has localization collapsed?   inputs.localization + drives influence
-//   2) when may pp_main come back?        inputs.recovery
-//   3) how long is a dead topic trusted?  drives hold_ms
 {
   "inputs": {
     "localization": {
       "params": {
-        // dead topic = confidence 0 (a silent localization IS a failed one)
-        "on_missing": "value",
-        "default_score": 0.0,
-        // publisher runs at 100 Hz -> 20 periods
-        "timeout_ms": 200,
         // raw units -> [0,1]; the producer already emits [0,1]
         "input_min": 0.0,
-        "input_max": 1.0
-      },
-      // Response curve, fitted to measured confidence distributions
-      // (healthy-tracking p05 per scene: icra .877 / 0522-2 .867 /
-      //  0526-1 .530 / busan2 .361 - thresholds must sit below the worst).
-      //   in_min 0.02 : at or below this, score 0 (localization is gone)
-      //   in_max 0.35 : at or above this, full marks (out of the danger band)
-      // With the weights below and switch_margin 0.15 this lands the handover
-      // at confidence 0.171 falling / 0.226 rising. Re-fit if the producer's
-      // confidence formula changes.
-      "influence": {"weight": 0.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+        "input_max": 1.0,
+        "invert": false,
+        // publisher runs at 100 Hz -> 20 periods
+        "timeout_ms": 200,
+        // dead topic = confidence 0 (a silent localization IS a failed one)
+        "on_missing": "value",
+        "default_score": 0.0
+      }
     },
 
     "loc_state": {
@@ -41,41 +29,15 @@
 
     "recovery": {
       // Return latch: once the arbitration has left pp_main, it may come back
-      // only after Tracking + confidence >= min_confidence held hold_ms
-      // continuously. Any dip resets the clock.
-      //   min_confidence 0.35 = in_max above (fully out of the danger band);
-      //   keep the two in step.
+      // only after state == Tracking AND confidence >= min_confidence have
+      // held hold_ms continuously. Any dip resets the clock.
+      //   min_confidence 0.35 matches in_max in the topics file (fully out of
+      //   the danger band); keep the two in step.
       "params": {
         "require_tracking": true,
         "min_confidence": 0.35,
         "hold_ms": 3000,
         "confidence_timeout_ms": 300
-      }
-    }
-  },
-
-  "drives": {
-    "pp_main": {
-      // trust window for the command topic: ~3-5x its period
-      "hold_ms": 300,
-      "bias": 0.0,
-      "influence": {
-        // W = +3.0: full confidence -> z = 3.0, zero confidence -> z = 0.0
-        "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
-        // Lost (or silence) disqualifies pp_main outright; weight 0 = veto only
-        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25},
-        // return latch (see inputs.recovery); weight 0 = veto only
-        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
-      }
-    },
-    "gap_follow": {
-      // gap_follow publishes once per scan (~37 Hz on the replay rig)
-      "hold_ms": 200,
-      // floor score when localization is gone; W = -1.5 makes it step aside
-      // once confidence recovers (z = 1.0 - 1.5*phi)
-      "bias": 1.0,
-      "influence": {
-        "localization": {"weight": -1.5, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
       }
     }
   }

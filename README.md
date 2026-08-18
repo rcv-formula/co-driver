@@ -36,11 +36,11 @@ red_damvi splits its configuration three ways:
 | File | Holds |
 |---|---|
 | `co_driver_red_damvi.yaml` | output / scoring / selection / post-processing |
-| `co_driver_red_damvi_topics.jsonc` | wiring: inputs, drives, topic names |
-| `localization_scoring.jsonc` | every number: thresholds, hold times, weights, curves |
+| `co_driver_red_damvi_topics.jsonc` | co_driver's own: wiring plus the arbitration layer (weights, bias, curves, vetoes, hold_ms) |
+| `localization_scoring.jsonc` | the scorers' own: how confidence becomes a score (timeouts, missing-topic policy, recovery conditions) |
 
-The tuning file is deep-merged over the topics file (`tuning_file` parameter), so
-retuning never touches the wiring.
+The scoring file is deep-merged over the topics file (`tuning_file` parameter), so
+each side can be edited without touching the other.
 Reload coefficients without restarting:
 
 ```bash
