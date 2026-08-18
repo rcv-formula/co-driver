@@ -1,31 +1,33 @@
-// 채점기 예시 겸 스켈레톤 — 외부 노드가 쏘는 점수 토픽을 구독해 점수로 씁니다.
+// Example scorer / skeleton -- subscribes to a score topic published by an
+// external node and uses it as the score.
 //
-// 새 채점기를 만들 때 이 파일을 복사해서 시작하세요. 채점기는 헤더가 필요 없고
-// .cpp 하나로 완결됩니다(레지스트리가 type 문자열로 만들어 주므로).
-// 구조는 딱 세 부분입니다.
+// Copy this file to start a new scorer. A scorer needs no header and is
+// complete in a single .cpp (the registry instantiates it from its type string).
+// The structure has exactly three parts.
 //
-//   1) configure()  설정을 읽고, **필요하면 자기 구독자를 만든다**
-//   2) 콜백          받은 데이터를 멤버에 저장 (다른 스레드이므로 뮤텍스)
-//   3) score()      드라이브 하나에 [0,1] 점수를 준다
+//   1) configure()  read the config and, **if needed, create your own subscription**
+//   2) callback     store the received data in members (different thread, so mutex)
+//   3) score()      return a [0,1] score for one drive
 //
 // ---------------------------------------------------------------------------
-// 이 채점기(type: "external_score")가 지원하는 계약
+// Contract supported by this scorer (type: "external_score")
 //
-//   메시지: std_msgs/Float64MultiArray
+//   Message: std_msgs/Float64MultiArray
 //
-//   mode: "scalar"         배열의 index 한 칸이 "차량 전체" 점수. 모든 드라이브에
-//                          같은 값이 적용됩니다. localization_pf 의
+//   mode: "scalar"         one array slot at `index` is a "whole vehicle" score;
+//                          the same value applies to every drive. localization_pf's
 //                          /localization_confidence (`[stamp_sec, stamp_nanosec,
-//                          confidence]`, index=2) 가 이 형태입니다.
+//                          confidence]`, index=2) has this shape.
 //
-//   mode: "per_candidate"  드라이브별 점수. 짝짓기는 아래 우선순위입니다.
-//                            (a) layout.dim[i].label 이 드라이브 이름과 같은 칸
-//                            (b) params 의 order: ["a","b",...] 순서대로 data[i]
+//   mode: "per_candidate"  per-drive scores. Matching priority:
+//                            (a) the slot whose layout.dim[i].label equals the drive name
+//                            (b) data[i] in the order given by params' order: ["a","b",...]
 //
-//   stamp_indices 를 주면 그 칸들을 [sec, nanosec] 로 읽어 신선도를 판정합니다(timeout_ms)
-//   (std_msgs 에는 header 가 없어 localization_pf 가 쓰는 관례).
-//   값은 [input_min, input_max] -> [0,1] 로 정규화되므로 원 단위 그대로 내도 됩니다.
-//   NaN 이 오면 그 드라이브에서만 "판단 불가"로 처리합니다.
+//   If stamp_indices is given, those slots are read as [sec, nanosec] to judge
+//   freshness (timeout_ms) (std_msgs has no header; this is the convention
+//   localization_pf uses).
+//   Values are normalized [input_min, input_max] -> [0,1], so raw units are fine.
+//   A NaN marks only that drive as "cannot judge".
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cmath>
@@ -43,7 +45,7 @@ namespace co_driver
 class ExternalScoreScorer : public Scorer
 {
 public:
-  // --- 1) 설정 읽기 + 자기 구독자 만들기 -------------------------------------
+  // --- 1) Read config + create our own subscription --------------------------
   bool configure(rclcpp::Node * node, const std::string & name, const Json & p) override
   {
     node_ = node;
@@ -73,8 +75,9 @@ public:
       return false;
     }
 
-    // 점수 토픽은 최신 값만 의미가 있으므로 큐를 짧게 잡습니다.
-    // 콜백 그룹은 채점기 전용(Reentrant)에 넣어 평가·출력 타이머를 막지 않게 합니다.
+    // Only the latest value of a score topic matters, so keep the queue short.
+    // The callback goes in the scorer-only (Reentrant) group so it never blocks
+    // the evaluation/output timers.
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = group();
     sub_ = node->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -87,7 +90,7 @@ public:
     return true;
   }
 
-  // --- 3) 드라이브 하나 채점 -------------------------------------------------
+  // --- 3) Score one drive ----------------------------------------------------
   ScoreResult score(const Drive & drive, const Context & ctx) override
   {
     double raw = 0.0;
@@ -109,7 +112,7 @@ public:
           why = "index out of range";
         }
       } else {
-        // per_candidate: (a) layout label 매칭 우선, (b) order 목록의 순서
+        // per_candidate: (a) layout label match first, (b) position in the order list
         std::size_t slot = 0;
         bool have = false;
         for (std::size_t i = 0; i < labels_.size(); ++i) {
@@ -138,7 +141,7 @@ public:
       }
       return ScoreResult::unavailable(why);
     }
-    // 외부 노드가 죽어가며 NaN 을 뱉는 경우가 실제로 있습니다.
+    // External nodes really do emit NaN while dying.
     if (!std::isfinite(raw)) {return ScoreResult::unavailable("non-finite value");}
 
     double v = std::clamp((raw - input_min_) / (input_max_ - input_min_), 0.0, 1.0);
@@ -146,7 +149,7 @@ public:
   }
 
 private:
-  // --- 2) 콜백: 받은 것을 저장만 합니다 (채점은 score() 에서) -----------------
+  // --- 2) Callback: only stores what arrives (scoring happens in score()) ----
   void onMsg(const std_msgs::msg::Float64MultiArray::ConstSharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -154,7 +157,7 @@ private:
     labels_.clear();
     for (const auto & d : msg->layout.dim) {labels_.push_back(d.label);}
 
-    // std_msgs 에는 header 가 없어, 배열 앞 칸에 실린 stamp 를 씁니다(있으면).
+    // std_msgs has no header, so use the stamp carried in the leading array slots (if present).
     bool stamped = false;
     if (stamp_indices_.size() == 2) {
       const auto si = static_cast<std::size_t>(stamp_indices_[0]);
@@ -192,7 +195,7 @@ private:
   std::vector<std::string> labels_;
 };
 
-// 이 한 줄이 type 문자열과 클래스를 이어 줍니다. 파일을 복사했다면 여기만 바꾸세요.
+// This one line binds the type string to the class. If you copied this file, change only this.
 CO_DRIVER_REGISTER_SCORER(ExternalScoreScorer, "external_score")
 
 }  // namespace co_driver

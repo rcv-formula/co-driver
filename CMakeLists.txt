@@ -36,8 +36,8 @@ set(dependencies
   tf2_geometry_msgs
 )
 
-# 새 채점기를 만들면 이 목록에 파일 한 줄만 추가하면 됩니다.
-# (각 파일이 CO_DRIVER_REGISTER_SCORER 로 스스로 등록합니다)
+# To add a new scorer, just append its file to this list.
+# (Each file registers itself via CO_DRIVER_REGISTER_SCORER.)
 set(scorer_sources
   src/scorers/external_score.cpp       # external score topics (sync skeleton)
   src/scorers/localization_state.cpp   # Lost/Converging/Tracking state gate
@@ -46,10 +46,10 @@ set(scorer_sources
 )
 
 add_executable(co_driver_node
-  src/co_driver_node.cpp   # 메인 노드 — ROS 배선
-  src/config.cpp           # 설정 — yaml + 토픽 목록 JSON
-  src/compute.cpp          # 연산 — 응답곡선 / 점수 / 선택 / 후처리 / 맵·궤적 유틸
-  ${scorer_sources}        # 채점기 — 각자 자기 토픽을 구독
+  src/co_driver_node.cpp   # main node - ROS wiring
+  src/config.cpp           # config - yaml + topic-list JSON
+  src/compute.cpp          # math - response curves / scores / selection / postprocess / map & trajectory utils
+  ${scorer_sources}        # scorers - each subscribes to its own topics
 )
 target_include_directories(co_driver_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

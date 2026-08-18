@@ -9,7 +9,7 @@ namespace co_driver
 {
 
 // ---------------------------------------------------------------------------
-// JSON 헬퍼 (scorer.hpp 에도 선언되어 있어 채점기 구현에서 쓸 수 있습니다)
+// JSON helpers (also declared in scorer.hpp so scorer implementations can use them)
 // ---------------------------------------------------------------------------
 double jnum(const Json & j, const std::string & key, double fallback)
 {
@@ -18,7 +18,7 @@ double jnum(const Json & j, const std::string & key, double fallback)
   return (it == j.end() || !it->is_number()) ? fallback : it->get<double>();
 }
 
-// 설정의 시간 값은 전부 ms 로 적습니다. 내부 계산은 초로 하므로 여기서 변환합니다.
+// All time values in the config are written in ms; internal math uses seconds, so convert here.
 double jms(const Json & j, const std::string & key, double fallback_ms)
 {
   return jnum(j, key, fallback_ms) * 1e-3;
@@ -69,7 +69,7 @@ std::vector<double> jnums(const Json & j, const std::string & key)
 
 void Influence::merge(const Json & j)
 {
-  // 숫자 하나 = 가중치만 지정한 축약형.
+  // A bare number = shorthand that specifies only the weight.
   if (j.is_number()) {
     weight = j.get<double>();
     return;
@@ -86,8 +86,8 @@ void Influence::merge(const Json & j)
 }
 
 // ---------------------------------------------------------------------------
-// yaml (ROS 파라미터) — 노드는 automatically_declare_parameters_from_overrides
-// 로 뜨므로 yaml 에 적힌 키가 그대로 파라미터로 올라옵니다. 없는 키는 기본값.
+// yaml (ROS parameters) -- the node starts with automatically_declare_parameters_from_overrides,
+// so every key written in the yaml shows up as a parameter. Missing keys keep their defaults.
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -110,7 +110,7 @@ bool pbool(rclcpp::Node * n, const std::string & key, bool fb)
   return p.get_type() == rclcpp::ParameterType::PARAMETER_BOOL ? p.as_bool() : fb;
 }
 
-// yaml 쪽 시간 값도 동일하게 ms -> s.
+// yaml-side time values are likewise ms -> s.
 double pms(rclcpp::Node * n, const std::string & key, double fb_ms)
 {
   return pnum(n, key, fb_ms) * 1e-3;
@@ -131,8 +131,8 @@ std::vector<std::string> pstrs(rclcpp::Node * n, const std::string & key)
          p.as_string_array() : std::vector<std::string>{};
 }
 
-// `prefix` 아래 파라미터 하위 트리를 JSON 객체로 옮깁니다.
-// 후처리 단계 params 와 defaults.influence 를 JSON 쪽과 같은 코드로 다루기 위한 다리.
+// Copies the parameter subtree under `prefix` into a JSON object.
+// Bridge that lets postprocess stage params and defaults.influence share the JSON-side code.
 Json paramsToJson(rclcpp::Node * n, const std::string & prefix)
 {
   Json out = Json::object();
@@ -213,7 +213,7 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
     const std::string prefix = "postprocess." + name;
     StageSpec st;
     st.name = name;
-    // type 을 생략하면 이름이 곧 타입입니다.
+    // If type is omitted, the name is the type.
     st.type = pstr(n, prefix + ".type", name);
     st.params = paramsToJson(n, prefix);
     c->pipeline.push_back(std::move(st));
@@ -222,7 +222,7 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
 }
 
 // ---------------------------------------------------------------------------
-// 토픽 목록 JSON (inputs / drives)
+// Topics JSON (inputs / drives)
 // ---------------------------------------------------------------------------
 bool loadTopics(const std::string & path, Config * c, std::string * error)
 {
@@ -233,7 +233,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
   }
   Json root;
   try {
-    // 주석(//, /* */)을 허용해 설정 파일에 설명을 달 수 있게 합니다.
+    // Allow comments (//, /* */) so the config file can carry explanations.
     root = Json::parse(in, nullptr, true, /*ignore_comments=*/ true);
   } catch (const std::exception & e) {
     *error = std::string("JSON parse failed (") + path + "): " + e.what();
@@ -265,7 +265,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
     s.enabled = jbool(e, "enabled", true);
     s.hold = jms(e, "hold_ms", 500.0);
     s.params = e.contains("params") ? e["params"] : Json::object();
-    s.influence = c->default_influence;          // yaml defaults 에서 출발
+    s.influence = c->default_influence;          // start from the yaml defaults
     if (e.contains("influence")) {s.influence.merge(e["influence"]);}
     c->inputs.push_back(std::move(s));
   }
@@ -300,7 +300,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
       return false;
     }
 
-    // 영향 행렬: yaml defaults <- 입력별 기본 <- 드라이브별 지정
+    // Influence matrix: yaml defaults <- per-input defaults <- per-drive overrides
     const Json per_drive = (e.contains("influence") && e["influence"].is_object()) ?
       e["influence"] : Json::object();
     for (const auto & in_spec : c->inputs) {
@@ -309,7 +309,7 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
       if (it != per_drive.end()) {inf.merge(*it);}
       d.influence[in_spec.name] = inf;
     }
-    // 없는 입력을 가리키는 항목은 오타일 확률이 높아 오류로 잡습니다.
+    // An entry pointing at a nonexistent input is most likely a typo, so treat it as an error.
     for (auto it = per_drive.begin(); it != per_drive.end(); ++it) {
       if (input_names.find(it.key()) == input_names.end()) {
         *error = "drive '" + d.name + "': influence refers to unknown input '" + it.key() + "'.";

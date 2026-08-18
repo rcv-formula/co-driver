@@ -1,16 +1,16 @@
-// co_driver 메인 노드.
+// co_driver main node.
 //
-//   /drive_* 구독 ──▶ 채점기들(src/scorers/) ──▶ 점수 연산(compute) ──▶ 선택 ──▶ 후처리 ──▶ /drive
+//   /drive_* subs --> scorers (src/scorers/) --> compute --> select --> postprocess --> /drive
 //
-// 이 노드는 **센서를 구독하지 않습니다.** scan/map/imu/odom 을 보고 판단하는 일은
-// 각 채점기가 자기 구독자로 직접 합니다. 노드가 하는 일은 넷뿐입니다.
-//   1) 설정을 읽어 채점기와 /drive 구독을 만든다
-//   2) 평가 주기마다: 채점 -> 점수 연산 -> 선택
-//   3) 출력 주기마다: 후처리 -> /drive 발행
-//   4) 진단 발행 / 핫리로드 서비스
+// This node subscribes to **no sensors.** Judging from scan/map/imu/odom is done
+// by each scorer through its own subscriptions. The node does only four things:
+//   1) read config, create the scorers and the /drive subscriptions
+//   2) each evaluation tick: score -> compute -> select
+//   3) each output tick: postprocess -> publish /drive
+//   4) publish diagnostics / hot-reload service
 //
-// 평가(느려도 됨)와 출력(100Hz 고정)을 별도 타이머로 분리해, 채점이 무거워져도
-// 출력 주기가 흔들리지 않습니다.
+// Evaluation (may be slow) and output (fixed 100Hz) run on separate timers, so
+// heavy scoring cannot disturb the output rate.
 #include <algorithm>
 #include <cmath>
 #include <memory>
@@ -53,7 +53,7 @@ std::string num(double v)
 {
   if (!std::isfinite(v)) {return "null";}
   std::ostringstream os;
-  os.precision(6);              // softmax 확률의 합이 1 로 읽히도록
+  os.precision(6);              // so softmax probabilities read as summing to 1
   os << std::fixed << v;
   return os.str();
 }
@@ -61,7 +61,7 @@ std::string num(double v)
 }  // namespace
 
 // ===========================================================================
-// 선택 — 어느 드라이브를 쓸지. 채터링 방지를 위한 히스테리시스 + 최소 유지 시간.
+// Selection -- which drive to use. Hysteresis + minimum hold time against chattering.
 // ===========================================================================
 class Selector
 {
@@ -69,12 +69,12 @@ public:
   struct Result
   {
     bool has_selection{false};
-    std::string name;          // 1등 = 실제로 쓰는 드라이브
+    std::string name;          // the drive actually used
     std::string reason;
     bool switched{false};
-    // 점수 2등 — 합산 점수만으로 매긴 순위입니다. 선택(name)과는 무관하며,
-    // 히스테리시스 때문에 selected 가 점수 1등이 아니면 selected 와 같을 수도 있습니다.
-    // (드라이브별 점수 순위는 status 의 rank 필드에 전부 실립니다)
+    // Score runner-up -- ranked by combined score only. Independent of the
+    // selection (name); with hysteresis, if selected is not score rank 1 the
+    // runner-up may equal selected. (Per-drive ranks are all in status "rank".)
     std::string runner_up;
     bool has_runner_up{false};
   };
@@ -86,8 +86,8 @@ public:
   {
     Result r = selectFirst(drives, now);
 
-    // 점수 순위 — 유효 드라이브를 합산 점수로만 줄 세워 1·2등을 뽑습니다.
-    // 선택(r.name)은 히스테리시스가 걸려 있어 1등과 다를 수 있고, 여기는 그와 무관합니다.
+    // Score ranking -- order valid drives by combined score only, take ranks 1 and 2.
+    // The selection (r.name) carries hysteresis and may differ from rank 1; this ignores that.
     const Drive * first = nullptr;
     const Drive * second = nullptr;
     for (const auto & d : drives) {
@@ -111,8 +111,8 @@ private:
   {
     Result r;
 
-    // valid 는 active(신뢰 창 안 + 하드 게이트 통과)를 이미 함의합니다.
-    // 즉 여기 들어오는 것은 전부 "지금 살아 있는" 드라이브뿐입니다.
+    // valid already implies active (inside the trust window + hard gates passed),
+    // so everything considered here is a currently-live drive.
     const Drive * incumbent = nullptr;
     for (const auto & d : drives) {
       if (d.name == current_) {incumbent = &d; break;}
@@ -126,11 +126,11 @@ private:
     }
 
     if (!best) {
-      // 아무도 못 씀 -> fallback 시도
+      // nothing usable -> try the fallback
       if (!spec_.fallback.empty()) {
         for (const auto & d : drives) {
           if (d.name != spec_.fallback) {continue;}
-          // fallback 도 유효(=활성)해야 씁니다. 죽은 명령을 되살려 쓰지 않습니다.
+          // The fallback must itself be valid (= active); never revive a dead command.
           if (d.valid) {return commit(d.name, "fallback", now);}
         }
       }
@@ -140,7 +140,7 @@ private:
     }
 
     if (!incumbent_ok) {
-      // 현재 것이 죽었으면 히스테리시스 없이 즉시 갈아탑니다.
+      // If the incumbent died, switch immediately without hysteresis.
       return commit(best->name, current_.empty() ? "initial selection" : "incumbent invalid -> immediate switch", now);
     }
 
@@ -188,14 +188,14 @@ private:
 };
 
 // ===========================================================================
-// 후처리 — yaml 의 postprocess.pipeline 순서대로 최종 명령을 다듬습니다.
-// 새 단계를 넣으려면 아래 enum + 파싱 + apply 에 각각 한 case 씩 추가하세요.
+// Postprocess -- refines the final command in yaml postprocess.pipeline order.
+// To add a stage, add one case each to the enum, the parsing, and apply below.
 // ===========================================================================
 struct PostContext
 {
   double dt{0.0};
-  bool has_command{false};   // 이번 주기에 쓸 드라이브가 있었는가
-  bool switched{false};      // 이번 주기에 선택이 바뀌었는가
+  bool has_command{false};   // was there a usable drive this cycle
+  bool switched{false};      // did the selection change this cycle
   ackermann_msgs::msg::AckermannDrive previous;
   bool has_previous{false};
 };
@@ -237,7 +237,7 @@ public:
       } else if (spec.type == "speed_scale") {
         st.type = Type::SpeedScale;
         st.scale = jnum(p, "scale", 1.0);
-        // 런타임에 ros2 param set 으로 바꿀 수 있게 선언해 둡니다.
+        // Declared as a parameter so it can be changed at runtime via ros2 param set.
         st.scale_key = "postprocess." + spec.name + ".scale";
         if (node_->has_parameter(st.scale_key)) {
           node_->set_parameter(rclcpp::Parameter(st.scale_key, st.scale));
@@ -281,7 +281,7 @@ public:
     for (auto & s : stages_) {
       switch (s.type) {
         case Type::TimeoutStop: {
-            if (pc.has_command) {break;}   // 쓸 드라이브가 없을 때만 개입
+            if (pc.has_command) {break;}   // only intervenes when no drive is usable
             if (s.decel > 0.0 && pc.has_previous && pc.dt > 0.0) {
               const double step = s.decel * pc.dt;
               const double prev = pc.previous.speed;
@@ -297,7 +297,7 @@ public:
 
         case Type::SwitchBlend: {
             if (pc.switched && pc.has_previous) {
-              // 블렌딩 도중 또 바뀌면 "지금 나가고 있던 값"에서 다시 시작합니다.
+              // On another switch mid-blend, restart from the value currently going out.
               s.blend_from = pc.previous;
               s.blend_elapsed = 0.0;
               s.blend_active = true;
@@ -342,7 +342,7 @@ public:
                   pc.previous.steering_angle + std::copysign(max_step, delta));
               }
             }
-            // 가속/감속은 속도의 절댓값이 커지는가로 구분합니다(후진에서도 성립).
+            // Accel vs decel is decided by whether |speed| grows (holds in reverse too).
             const double dv = cmd.speed - pc.previous.speed;
             const bool speeding_up = std::abs(cmd.speed) > std::abs(pc.previous.speed);
             const double limit = (speeding_up ? s.max_accel : s.max_decel) * pc.dt;
@@ -353,7 +353,7 @@ public:
           }
 
         case Type::SpeedScale: {
-            // 매 주기 읽어야 런타임 변경이 즉시 반영됩니다.
+            // Read every cycle so runtime changes take effect immediately.
             double scale = s.scale;
             if (node_ && node_->has_parameter(s.scale_key)) {
               const auto p = node_->get_parameter(s.scale_key);
@@ -415,7 +415,7 @@ private:
     double max_steering_deg{50.0};
     double max_speed{8.0};
     double min_speed{0.0};
-    // switch_blend 상태
+    // switch_blend state
     bool blend_active{false};
     double blend_elapsed{0.0};
     ackermann_msgs::msg::AckermannDrive blend_from;
@@ -426,7 +426,7 @@ private:
 };
 
 // ===========================================================================
-// 노드
+// Node
 // ===========================================================================
 class CoDriverNode : public rclcpp::Node
 {
@@ -435,13 +435,13 @@ public:
   : rclcpp::Node("co_driver_node", rclcpp::NodeOptions(options)
       .automatically_declare_parameters_from_overrides(true))
   {
-    // 기본 설정은 yaml(ROS 파라미터), 늘어나는 목록은 이 JSON 에서 옵니다.
+    // Base config comes from yaml (ROS parameters); growing lists come from this JSON.
     if (!has_parameter("topics_file")) {declare_parameter<std::string>("topics_file", "");}
     topics_path_ = get_parameter("topics_file").as_string();
 
-    // 콜백 그룹을 나눠야 MultiThreadedExecutor 가 실제로 병렬로 돕니다.
-    // 기본 그룹은 MutuallyExclusive 라, 그대로 두면 무거운 채점기 하나가
-    // 출력 타이머까지 막아 /drive 주기가 흔들립니다.
+    // Separate callback groups are needed for the MultiThreadedExecutor to actually
+    // run in parallel. The default group is MutuallyExclusive; left alone, one heavy
+    // scorer would also block the output timer and jitter the /drive rate.
     eval_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     output_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     scorer_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -450,7 +450,7 @@ public:
     if (!Config::load(this, topics_path_, &cfg_, &err)) {throw std::runtime_error(err);}
     if (!build(&err)) {throw std::runtime_error(err);}
 
-    // --- /drive 후보 구독 (노드가 구독하는 것은 이것뿐입니다) ---
+    // --- /drive candidate subscriptions (the node's only subscriptions) ---
     drive_subs_.resize(drives_.size());
     for (std::size_t i = 0; i < drives_.size(); ++i) {
       const auto & d = drives_[i];
@@ -459,8 +459,8 @@ public:
         [this, i](const ackermann_msgs::msg::AckermannDriveStamped::ConstSharedPtr m) {
           std::lock_guard<std::mutex> lock(mtx_);
           drives_[i].cmd = *m;
-          // 퍼블리셔가 stamp 를 안 채우는 경우가 있어 수신 시각을 씁니다.
-          // noteReceived 가 수신 주기(EMA)도 같이 갱신합니다 — 신뢰 창 자동 산출용.
+          // Some publishers leave the stamp unset, so use the receive time.
+          // noteReceived also updates the receive-rate EMA -- feeds the auto trust window.
           drives_[i].noteReceived(now());
         });
       RCLCPP_INFO(
@@ -504,7 +504,7 @@ public:
 
 private:
   // -------------------------------------------------------------------------
-  // 설정 -> 채점기 / 드라이브 / 후처리
+  // Config -> scorers / drives / postprocess
   // -------------------------------------------------------------------------
   bool build(std::string * error)
   {
@@ -522,7 +522,7 @@ private:
         return false;
       }
       s->setContext(in.name, in.type, scorer_group_);
-      // 채점기가 여기서 자기 구독자를 만듭니다.
+      // The scorer creates its own subscriptions here.
       if (!s->configure(this, in.name, in.params)) {
         *error = "input '" + in.name + "' failed to configure";
         return false;
@@ -551,7 +551,7 @@ private:
     return true;
   }
 
-  // 계수만 바꿨을 때 재시작 없이 다시 읽습니다(구독을 새로 만들어야 하면 거부).
+  // Re-reads coefficient-only changes without a restart (refused if subscriptions must be rebuilt).
   bool reload(std::string * message)
   {
     Config fresh;
@@ -568,7 +568,7 @@ private:
     }
 
     std::lock_guard<std::mutex> lock(mtx_);
-    // 드라이브의 수신 상태는 보존하고 계수만 갈아끼웁니다.
+    // Keep each drive's receive state; swap only the coefficients.
     for (const auto & spec : fresh.drives) {
       for (auto & d : drives_) {
         if (d.name != spec.name) {continue;}
@@ -578,7 +578,7 @@ private:
         d.influence = spec.influence;
       }
     }
-    cfg_ = fresh;   // 토픽·주기는 구독/타이머에 묶여 있어 반영되지 않습니다
+    cfg_ = fresh;   // topics/rates are bound to subscriptions/timers and are not applied
     selector_.configure(cfg_.selection);
     if (!post_.configure(this, cfg_.pipeline, get_logger())) {
       *message = "reload failed: postprocess pipeline configuration error";
@@ -590,7 +590,7 @@ private:
   }
 
   // -------------------------------------------------------------------------
-  // 채점 -> 점수 연산 -> 선택
+  // Score -> compute -> select
   // -------------------------------------------------------------------------
   void evaluationTick()
   {
@@ -615,8 +615,8 @@ private:
         d.results.clear();
         if (d.enabled) {
           for (auto & e : scorers_) {
-            // 가중치 0 인 입력도 채점합니다 — veto 판정과 상태 표시에 필요합니다.
-            // 비동기 채점기가 pending 을 내면 직전 점수를 hold 동안 대신 씁니다.
+            // Zero-weight inputs are scored too -- needed for veto and status display.
+            // If an async scorer reports pending, the previous score substitutes for hold.
             const auto & name = e.scorer->name();
             double held = -1.0;
             d.results[name] =
@@ -638,7 +638,7 @@ private:
   }
 
   // -------------------------------------------------------------------------
-  // 후처리 -> 발행
+  // Postprocess -> publish
   // -------------------------------------------------------------------------
   void outputTick()
   {
@@ -655,7 +655,7 @@ private:
       pc.has_previous = has_output_;
       pc.previous = output_;
       pc.has_command = have_command_;
-      // switched 는 출력 주기가 한 번만 소비해야 blend 가 정확히 한 번 무장됩니다.
+      // switched must be consumed exactly once by the output tick so the blend arms exactly once.
       pc.switched = switch_pending_;
       switch_pending_ = false;
 
@@ -664,7 +664,7 @@ private:
           if (d.name == selected_) {cmd = d.cmd.drive; break;}
         }
       } else if (has_output_) {
-        // 쓸 드라이브가 없으면 직전 출력에서 출발해 timeout_stop 이 감속시킵니다.
+        // With no usable drive, start from the last output so timeout_stop decelerates it.
         cmd = output_;
       }
 
@@ -673,7 +673,7 @@ private:
       has_output_ = true;
     }
 
-    // 쓸 드라이브가 없어도 계속 발행합니다 — timeout_stop 의 감속이 차에 닿아야 합니다.
+    // Keep publishing even with no usable drive -- timeout_stop's deceleration must reach the car.
     ackermann_msgs::msg::AckermannDriveStamped out;
     out.header.stamp = t;
     out.header.frame_id = cfg_.output.frame_id;
@@ -682,7 +682,7 @@ private:
   }
 
   // -------------------------------------------------------------------------
-  // 진단 발행
+  // Diagnostics publishing
   // -------------------------------------------------------------------------
   void publishStatus(const Selector::Result & sel)
   {
@@ -695,13 +695,13 @@ private:
       selected_pub_->publish(s);
     }
     if (runner_up_pub_) {
-      // 합산 점수 2등. 유효 드라이브가 1개뿐이면 빈 문자열.
+      // Runner-up by combined score. Empty if only one valid drive.
       std_msgs::msg::String s;
       s.data = sel.has_runner_up ? sel.runner_up : "";
       runner_up_pub_->publish(s);
     }
     if (scores_pub_) {
-      // layout.dim[i].label 에 이름을 실어 외부에서 인덱스 없이 짝지을 수 있게 합니다.
+      // Names ride in layout.dim[i].label so consumers can match without indices.
       std_msgs::msg::Float64MultiArray m;
       m.layout.dim.resize(drives_.size());
       for (std::size_t i = 0; i < drives_.size(); ++i) {
@@ -714,11 +714,11 @@ private:
     }
     if (!status_pub_) {return;}
 
-    // 유효 드라이브를 점수순으로 세워 rank(1등, 2등, ...)를 매깁니다.
-    // 히스테리시스 때문에 selected 가 rank 1 이 아닐 수 있고, 그 차이가 보이는 게 목적입니다.
+    // Order valid drives by score to assign rank (1, 2, ...).
+    // With hysteresis, selected may not be rank 1; making that gap visible is the point.
     std::vector<const Drive *> ranked;
     for (const auto & d : drives_) {
-      if (d.valid) {ranked.push_back(&d);}   // 활성 드라이브만 순위에 들어갑니다
+      if (d.valid) {ranked.push_back(&d);}   // only active drives are ranked
     }
     std::sort(
       ranked.begin(), ranked.end(),
@@ -726,7 +726,7 @@ private:
     std::map<std::string, int> rank_of;
     for (std::size_t i = 0; i < ranked.size(); ++i) {rank_of[ranked[i]->name] = static_cast<int>(i) + 1;}
 
-    // 선형층의 전 단계를 그대로 보여 줍니다: x(채점기 원점수) -> s(φ 성형) -> c(W·φ)
+    // Expose every stage before the linear layer: x (raw scorer score) -> s (phi shaping) -> c (W*phi)
     std::ostringstream os;
     os << "{\"stamp\":" << num(ctx_.now.seconds())
        << ",\"selected\":\"" << esc(sel.has_selection ? sel.name : "") << "\""
@@ -746,12 +746,12 @@ private:
          << ",\"logit\":" << num(d.logit)
          << ",\"raw\":" << num(d.raw_logit)
          << ",\"bias\":" << num(d.bias)
-         // active = 지금 살아 있어 순위·선택 대상인가. valid = active + min_valid_score.
+         // active = currently live, eligible for ranking/selection. valid = active + min_valid_score.
          << ",\"active\":" << (d.active ? "true" : "false")
          << ",\"valid\":" << (d.valid ? "true" : "false")
          << ",\"age_ms\":" << num(d.age(ctx_.now) * 1e3)
-         << ",\"hold_ms\":" << num(d.hold * 1e3)          // 마지막 명령의 유효 시간
-         << ",\"hz\":" << num(d.measuredHz())         // 실측 수신 주파수
+         << ",\"hold_ms\":" << num(d.hold * 1e3)          // validity window of the last command
+         << ",\"hz\":" << num(d.measuredHz())         // measured receive rate
          << ",\"speed\":" << num(d.cmd.drive.speed)
          << ",\"steer\":" << num(d.cmd.drive.steering_angle);
       if (!d.reject.empty()) {os << ",\"reject\":\"" << esc(d.reject) << "\"";}
@@ -775,7 +775,7 @@ private:
                << ",\"s\":" << num(shapeInfluence(it->second, x))
                << ",\"w\":" << num(it->second.weight)
                << ",\"c\":" << num(it->second.weight * shapeInfluence(it->second, x));
-            // 비동기 채점기의 직전 점수를 대신 쓴 경우 그 나이를 함께 보여 줍니다.
+            // If an async scorer's previous score was substituted, also show its age.
             const auto ha = held_age_.find(d.name);
             if (ha != held_age_.end()) {
               const auto hb = ha->second.find(kv.first);
@@ -801,17 +801,17 @@ private:
     status_pub_->publish(s);
   }
 
-  // --- 상태 ---
+  // --- state ---
   std::string topics_path_;
   Config cfg_;
-  // 채점기와 그 입력의 hold(직전 점수 유효 시간)를 함께 들고 있습니다.
+  // Pairs each scorer with its input's hold (previous-score validity time).
   struct ScorerEntry
   {
     ScorerPtr scorer;
     double hold{0.5};
   };
   std::vector<ScorerEntry> scorers_;
-  // 진단용: 이번 주기에 캐시로 메운 점수의 나이[s] (아니면 음수)
+  // Diagnostics: age [s] of scores filled from cache this cycle (negative otherwise)
   std::map<std::string, std::map<std::string, double>> held_age_;
   std::vector<Drive> drives_;
   Selector selector_;
@@ -843,8 +843,8 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   try {
-    // 채점(무거울 수 있음)과 출력(고정 주기)이 서로를 막지 않도록 멀티스레드로 돕니다.
-    // 공유 상태는 노드 내부 뮤텍스가 지킵니다.
+    // Multithreaded so scoring (possibly heavy) and output (fixed rate) don't block each other.
+    // Shared state is guarded by the node's internal mutex.
     rclcpp::executors::MultiThreadedExecutor executor;
     auto node = std::make_shared<co_driver::CoDriverNode>(rclcpp::NodeOptions());
     executor.add_node(node);
@@ -852,7 +852,7 @@ int main(int argc, char ** argv)
   } catch (const std::exception & e) {
     const std::string what = e.what();
     RCLCPP_FATAL(rclcpp::get_logger("co_driver"), "%s", what.c_str());
-    // yaml 의 빈 리스트(`pipeline: []`)는 타입이 없어 파라미터 자동 선언에서 터집니다.
+    // An empty yaml list (`pipeline: []`) has no type and blows up automatic parameter declaration.
     if (what.find("No parameter value set") != std::string::npos) {
       RCLCPP_FATAL(
         rclcpp::get_logger("co_driver"),

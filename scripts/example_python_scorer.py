@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""외부(Python) 채점기 예제 — co_driver 의 external_score 계약 데모.
+"""External (Python) scorer example -- demo of co_driver's external_score contract.
 
-C++ 을 다시 빌드하지 않고 판단 로직을 실험할 때 쓰는 틀입니다. 이 노드는
-드라이브들의 /drive 와 원하는 센서를 직접 구독해서 점수를 계산하고,
-Float64MultiArray 하나로 내보냅니다. co_driver 토픽 목록 JSON 의 inputs 에
+A template for experimenting with decision logic without rebuilding the C++.
+This node subscribes directly to the candidates' /drive topics and whatever
+sensors you want, computes scores, and publishes them as a single
+Float64MultiArray. Add one block like this to the inputs of the co_driver
+topic-list JSON:
 
     {
       "name": "python_score",
@@ -19,24 +21,25 @@ Float64MultiArray 하나로 내보냅니다. co_driver 토픽 목록 JSON 의 in
       "influence": {"weight": 1.0, "linear": 0.3, "exp": 0.7, "exp_k": -3.0}
     }
 
-한 덩어리만 추가하면 바로 점수 체계에 들어옵니다 — 배포 설정에는 "external" 이라는
-이름으로 이미 들어 있으므로, 이 노드를 띄우기만 하면 반영됩니다.
-특정 드라이브만 다르게 반응시키려면 그 드라이브의 influence 에 같은 이름을 적어
-덮어쓰면 됩니다.
+and it joins the scoring right away -- the shipped config already includes it
+under the name "external", so just launching this node makes it take effect.
+To make only a specific drive react differently, override that drive's
+influence with the same name.
 
-계약 (src/scorers/external_score.cpp 와 동일):
-  * 타입은 std_msgs/Float64MultiArray.
-  * mode: per_candidate 면 layout.dim[i].label 에 드라이브 이름을 넣는 것이 가장
-    안전합니다(순서가 바뀌어도 짝이 맞음). label 이 비면 params 의 order 순서.
-  * mode: scalar 면 index 한 칸이 차량 전체 점수.
-  * stamp_indices 를 쓰면 그 칸들을 [sec, nanosec] 로 읽어 신선도를 판정합니다.
-    localization_pf 의 /localization_confidence 가 이 형태입니다.
-  * 값은 params 의 [input_min, input_max] 로 [0,1] 정규화되므로 원 단위 그대로
-    내도 됩니다. 그 뒤 influence 의 선형/지수 곡선이 적용됩니다.
-    여기서는 이해하기 쉽게 [0,1] 로 내보냅니다.
+Contract (same as src/scorers/external_score.cpp):
+  * The type is std_msgs/Float64MultiArray.
+  * mode: per_candidate -- putting the drive name into layout.dim[i].label is
+    the safest option (pairing survives reordering). If the label is empty,
+    the order from params' order is used.
+  * mode: scalar -- a single index holds one score for the whole vehicle.
+  * With stamp_indices, those slots are read as [sec, nanosec] to judge
+    freshness. localization_pf's /localization_confidence uses this shape.
+  * Values are normalized to [0,1] via params' [input_min, input_max], so you
+    may publish in raw units. The linear/exponential curves from influence are
+    applied afterwards. Here we publish in [0,1] for clarity.
 
-여기 담긴 예시 로직은 "조향이 완만한 명령을 선호"하는 아주 단순한 것입니다.
-실제 판단 로직으로 바꿔 쓰세요.
+The example logic included here is trivially simple: "prefer commands with
+gentle steering". Replace it with your real decision logic.
 """
 
 import math
@@ -60,13 +63,13 @@ class ExamplePythonScorer(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('rate_hz', 20.0)
         self.declare_parameter('timeout', 0.2)
-        # 이 조향각(도)에서 점수가 0 이 되도록 정규화합니다.
+        # Normalized so the score reaches 0 at this steering angle (degrees).
         self.declare_parameter('steer_tolerance_deg', 30.0)
 
         self.names = list(self.get_parameter('candidates').value)
         topics = list(self.get_parameter('drive_topics').value)
         if len(topics) != len(self.names):
-            raise RuntimeError('candidates 와 drive_topics 의 개수가 다릅니다.')
+            raise RuntimeError('candidates and drive_topics differ in length.')
 
         self.timeout = float(self.get_parameter('timeout').value)
         self.steer_tol = math.radians(float(self.get_parameter('steer_tolerance_deg').value))
@@ -93,7 +96,7 @@ class ExamplePythonScorer(Node):
         self.create_timer(period, self._tick)
 
         self.get_logger().info(
-            f'외부 채점기 시작: {self.names} -> '
+            f'External scorer started: {self.names} -> '
             f'{self.get_parameter("score_topic").value}')
 
     def _make_drive_cb(self, name):
@@ -112,24 +115,26 @@ class ExamplePythonScorer(Node):
         return (self.get_clock().now() - rx).nanoseconds * 1e-9 <= self.timeout
 
     def _score(self, name):
-        """후보 하나의 점수를 [0,1] 로 돌려줍니다. 여기를 바꿔 쓰세요.
+        """Return one candidate's score in [0,1]. Replace this with your own.
 
-        값이 없으면 None 을 돌려주고, 아래에서 NaN 으로 실어 보냅니다. co_driver 는
-        non-finite 값을 '판단 불가'로 보고 가중 평균에서 제외합니다.
+        Returns None when no value is available; below it is sent as NaN.
+        co_driver treats non-finite values as "no opinion" and excludes them
+        from the weighted average.
         """
         drive = self.latest[name]
         if drive is None or not self._fresh(name):
             return None
         if not math.isfinite(drive.steering_angle):
             return None
-        # 예시: 조향이 완만할수록 고득점.
+        # Example: the gentler the steering, the higher the score.
         return max(0.0, 1.0 - abs(drive.steering_angle) / self.steer_tol)
 
     def _tick(self):
         msg = Float64MultiArray()
         for name in self.names:
             dim = MultiArrayDimension()
-            # label 에 후보 이름을 넣으면 co_driver 가 순서와 무관하게 짝지어 줍니다.
+            # Putting the candidate name in label lets co_driver pair scores
+            # regardless of ordering.
             dim.label = name
             dim.size = 1
             dim.stride = 1

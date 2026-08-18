@@ -15,17 +15,17 @@ def generate_launch_description():
     config_arg = DeclareLaunchArgument(
         'config',
         default_value=default_config,
-        description='기본 설정 yaml (output/context/scoring/selection/postprocess)',
+        description='Main config yaml (output/context/scoring/selection/postprocess)',
     )
     topics_arg = DeclareLaunchArgument(
         'topics',
         default_value=default_topics,
-        description='입력/드라이브 토픽 목록 JSON (inputs/drives + 영향 행렬)',
+        description='Input/drive topic-list JSON (inputs/drives + influence matrix)',
     )
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
         default_value='false',
-        description='시뮬레이션 시간 사용 여부',
+        description='Whether to use simulation time',
     )
 
     co_driver_node = Node(
@@ -37,7 +37,7 @@ def generate_launch_description():
         parameters=[
             LaunchConfiguration('config'),
             {
-                # yaml 의 topics_file 을 launch 인자로 덮어씁니다.
+                # Override the yaml's topics_file with the launch argument.
                 'topics_file': LaunchConfiguration('topics'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             },

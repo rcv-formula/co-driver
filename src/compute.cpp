@@ -8,7 +8,7 @@ namespace co_driver
 {
 
 // ---------------------------------------------------------------------------
-// 응답 곡선 φ
+// Response curve phi
 // ---------------------------------------------------------------------------
 double shapeInfluence(const Influence & inf, double x)
 {
@@ -18,19 +18,21 @@ double shapeInfluence(const Influence & inf, double x)
   }
   u = std::clamp(u, 0.0, 1.0);
 
-  // (e^{k·u} - 1) / (e^{k} - 1) : [0,1] -> [0,1] 단조. k 의 부호가 곡률을 정합니다.
-  //   k > 0 볼록("아주 좋아야 점수를 준다"), k < 0 오목("조금만 나빠도 급락"), k ~ 0 선형
+  // (e^{k*u} - 1) / (e^{k} - 1) : [0,1] -> [0,1], monotonic. The sign of k sets the curvature:
+  //   k > 0 convex ("reward only when very good"), k < 0 concave ("drops fast when slightly bad"),
+  //   k ~ 0 linear
   const double e = (std::abs(inf.exp_k) > 1e-9) ?
     std::expm1(inf.exp_k * u) / std::expm1(inf.exp_k) : u;
 
-  // 선형 성분과 지수 성분을 배합비 하나로 섞습니다. 둘 다 [0,1] 이라 결과도 [0,1].
+  // Blend the linear and exponential components with a single mix ratio.
+  // Both are in [0,1], so the result is too.
   const double mix = std::clamp(inf.exp_mix, 0.0, 1.0);
   const double s = (1.0 - mix) * u + mix * e;
   return std::isfinite(s) ? std::clamp(s, 0.0, 1.0) : 0.0;
 }
 
 // ---------------------------------------------------------------------------
-// 채점 결과 확정 — 비동기 채점기의 pending 을 캐시로 메웁니다.
+// Resolve a score -- fill an async scorer's pending result from the cache.
 // ---------------------------------------------------------------------------
 ScoreResult resolveScore(
   Drive & d, const std::string & input, const ScoreResult & fresh, double hold,
@@ -38,7 +40,7 @@ ScoreResult resolveScore(
 {
   if (held_age) {*held_age = -1.0;}
 
-  // 새 점수가 나왔다 -> 캐시 갱신 후 그대로 사용.
+  // Fresh score arrived -> update the cache and use it as-is.
   if (fresh.available && !fresh.veto) {
     CachedScore & c = d.score_cache[input];
     c.value = std::clamp(fresh.value, 0.0, 1.0);
@@ -47,7 +49,7 @@ ScoreResult resolveScore(
     return fresh;
   }
 
-  // 아직 계산 중 -> 직전 점수를 대신 쓴다(있고, 아직 안 늙었으면).
+  // Still computing -> substitute the previous score (if present and not too old).
   if (fresh.is_pending) {
     const auto it = d.score_cache.find(input);
     if (it == d.score_cache.end() || !it->second.valid) {
@@ -63,12 +65,12 @@ ScoreResult resolveScore(
     return ScoreResult::ok(it->second.value, "held");
   }
 
-  // unavailable / vetoed 는 채점기의 명시적 판단이라 캐시로 덮지 않습니다.
+  // unavailable / vetoed are the scorer's explicit decisions; do not override them with the cache.
   return fresh;
 }
 
 // ---------------------------------------------------------------------------
-// 1단계 — 드라이브 하나의 선형층 출력 z_j = Σ W·φ(x) + b_j
+// Stage 1 -- one drive's linear-layer output z_j = sum(W * phi(x)) + b_j
 // ---------------------------------------------------------------------------
 void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
 {
@@ -77,12 +79,12 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
   d.valid = false;
   d.score = 0.0;
 
-  // 비활성 사유를 기록하되, 점수 계산은 계속합니다(가능한 한).
+  // Record the deactivation reason but keep computing the score (as far as possible).
   auto deactivate = [&d](const std::string & why) {
-      if (d.active) {d.reject = why;}   // 첫 사유만 남깁니다
+      if (d.active) {d.reject = why;}   // keep only the first reason
       d.active = false;
     };
-  // 아예 점수를 낼 수 없는 경우(명령이 없거나 NaN)만 z 를 0 으로 두고 끝냅니다.
+  // Only when no score is possible at all (no command, or NaN) do we zero z and stop.
   auto noScore = [&d](const std::string & why) {
       d.active = false;
       d.reject = why;
@@ -100,12 +102,12 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
     return;
   }
 
-  // --- 하드 게이트: 통과 못 하면 순위·선택에서 빠지지만 점수는 계속 계산합니다 ---
+  // --- Hard gates: failing one drops the drive from ranking/selection, but scoring continues ---
   if (!d.enabled) {
     deactivate("disabled");
   }
   if (!d.isFresh(now)) {
-    // hold 를 넘겼다 = 이 토픽은 지금 살아 있지 않다.
+    // Past the hold window = this topic is not alive right now.
     char buf[96];
     std::snprintf(
       buf, sizeof(buf), "stale %.0fms (hold %.0fms)", d.age(now) * 1e3, d.hold * 1e3);
@@ -120,10 +122,10 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
 
   const bool softmax_mode = (spec.combine == "softmax");
 
-  double linear_sum = 0.0;   // Σ W·φ
-  double abs_used = 0.0;     // Σ |W| (이번 주기에 쓸 수 있었던 것)
-  double abs_all = 0.0;      // Σ |W| (전체)
-  double pos_weight = 0.0;   // weighted_sum 정규화 분모 (φ 가 [0,1] 이라 Σw 로 충분)
+  double linear_sum = 0.0;   // sum(W * phi)
+  double abs_used = 0.0;     // sum(|W|) (terms usable this cycle)
+  double abs_all = 0.0;      // sum(|W|) (all terms)
+  double pos_weight = 0.0;   // weighted_sum normalization denominator (phi is in [0,1], so sum(w) suffices)
   int used = 0;
 
   for (const auto & kv : d.influence) {
@@ -135,7 +137,7 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
       if (inf.required) {
         deactivate("required[" + kv.first + "] unavailable");
       }
-      // missing: "zero" 면 φ=0 을 더한 셈, "mask" 면 아래에서 되스케일합니다.
+      // missing: "zero" effectively adds phi=0; "mask" rescales below.
       continue;
     }
 
@@ -145,9 +147,9 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
     if (inf.veto_below >= 0.0 && shaped < inf.veto_below) {
       deactivate("veto_below[" + kv.first + "]");
     }
-    if (std::abs(inf.weight) <= 1e-12) {continue;}   // 점수 미반영(veto 판정만)
+    if (std::abs(inf.weight) <= 1e-12) {continue;}   // not scored (veto check only)
 
-    linear_sum += inf.weight * shaped;   // 음수 가중치는 감점 항으로 그대로
+    linear_sum += inf.weight * shaped;   // negative weights stay as penalty terms
     abs_used += std::abs(inf.weight);
     if (inf.weight > 0.0) {
       pos_weight += inf.weight;
@@ -158,19 +160,19 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
   if (softmax_mode) {
     double z = linear_sum;
     if (spec.missing == "mask" && abs_used > 1e-9 && abs_all > 1e-9) {
-      // 빠진 입력이 있으면 남은 항으로 전체 스케일을 복원합니다. 채점기 하나가
-      // 데이터를 못 받았다고 그 드라이브의 logit 만 작아져 밀려나는 일을 막습니다.
+      // With missing inputs, restore the full scale from the remaining terms, so a
+      // drive is not pushed down just because one scorer received no data.
       z *= abs_all / abs_used;
     }
     d.raw_logit = z + d.bias;
   } else if (used == 0 || pos_weight <= 1e-9) {
-    d.raw_logit = 0.5 + d.bias;   // 판단 근거 없음 -> 중립
+    d.raw_logit = 0.5 + d.bias;   // no evidence -> neutral
   } else {
     d.raw_logit = linear_sum / pos_weight + d.bias;
   }
   if (!std::isfinite(d.raw_logit)) {d.raw_logit = 0.0;}
 
-  // EMA 는 softmax 이전 logit 에 겁니다(확률이 항상 정규화된 분포로 유지되도록).
+  // Apply the EMA to the pre-softmax logit (so the probabilities always stay a normalized distribution).
   const double alpha = std::clamp(spec.ema_alpha, 0.0, 1.0);
   if (!d.logit_initialized || alpha >= 1.0) {
     d.logit = d.raw_logit;
@@ -181,11 +183,11 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
 }
 
 // ---------------------------------------------------------------------------
-// 2단계 — softmax
+// Stage 2 -- softmax
 // ---------------------------------------------------------------------------
 void finalizeScores(std::vector<Drive> & drives, const ScoringSpec & spec)
 {
-  // 활성 드라이브만 모읍니다 — 비활성은 score 가 0 으로 남고 순위에 들어가지 않습니다.
+  // Only active drives take part -- inactive ones keep score 0 and are excluded from ranking.
   if (spec.combine != "softmax") {
     for (auto & d : drives) {
       if (!d.active) {continue;}
@@ -204,9 +206,9 @@ void finalizeScores(std::vector<Drive> & drives, const ScoringSpec & spec)
     max_logit = std::max(max_logit, d.logit);
     ++n;
   }
-  if (n == 0) {return;}   // 전원 실격 — 선택은 노드가 처리합니다
+  if (n == 0) {return;}   // everyone disqualified -- selection is handled by the node
 
-  // max 를 빼서 exp 오버플로를 막습니다(softmax 는 이 이동에 불변).
+  // Subtract the max to avoid exp overflow (softmax is invariant to this shift).
   double denom = 0.0;
   for (const auto & d : drives) {
     if (d.active) {denom += std::exp((d.logit - max_logit) / T);}
