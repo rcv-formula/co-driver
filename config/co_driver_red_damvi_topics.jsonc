@@ -89,9 +89,10 @@
       //     disambiguation: confidence 0.45 during a healthy Converging (raw 0.9 x
       //     multiplier 0.5) no longer looks anything like a broken Tracking,
       //     because the state says which one it is.
-      // Topic name is per-stack: slam_ours -> /slam_ours/state, the real-car
-      // localization_pf port -> /localization_pf/state. Only the confidence topic
-      // shares an absolute name between the two. Change it here when deploying.
+      // Topic name is per-stack: the real-car deployment (localization_pf) uses
+      // /localization_pf/state, the slam_ours replay rig uses /slam_ours/state.
+      // Only the confidence topic shares an absolute name between the two.
+      // Set here for the real car; switch it back when testing against replays.
       //
       // on_missing "value" + default_score 0.0: **silence closes the gate.**
       // slam_ours publishes no state at all until its map is loaded (the first
@@ -102,7 +103,7 @@
       // publish, or set on_missing to "unavailable" to disable the gate.
       "name": "loc_state",
       "type": "localization_state",
-      "params": {"topic": "/slam_ours/state", "timeout_ms": 0,
+      "params": {"topic": "/localization_pf/state", "timeout_ms": 0,
                  "on_missing": "value", "default_score": 0.0},
       // Neutral at the input level; only pp_main turns the veto on below.
       "influence": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0}
@@ -131,7 +132,7 @@
         "confidence_topic": "/localization_confidence",
         "confidence_index": 2,
         "confidence_timeout_ms": 300,
-        "state_topic": "/slam_ours/state",
+        "state_topic": "/localization_pf/state",
         "require_tracking": true,
         "min_confidence": 0.35,
         "hold_ms": 3000
