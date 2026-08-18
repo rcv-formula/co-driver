@@ -22,9 +22,20 @@
 //
 // timeout_ms 0 (the default) disables staleness: a latched publisher only
 // re-sends on transitions, so age since the last message means nothing.
-// If the topic never arrives at all (e.g. running against localization_pf,
-// which has no state topic), the score is unavailable and - at weight 0 -
-// the arbitration behaves exactly as if this input did not exist.
+//
+// on_missing decides what "no message yet" means:
+//   "value"        (red_damvi's choice) score default_score (0.0) - i.e. treat it
+//                  like Lost. slam_ours publishes nothing until its map is loaded
+//                  (first message is the Lost it emits at map-ready), so silence
+//                  means localization has not even started - or never will, if the
+//                  map failed to load. The gate must not open for that.
+//   "unavailable"  the input drops out of the combination; at weight 0 the
+//                  arbitration behaves as if this input did not exist. Only for
+//                  benches or stacks that genuinely have no state topic.
+//
+// Note the producer's enum has four states (WaitingForMap, Lost, Converging,
+// Tracking) folded to three on the wire: WaitingForMap and Lost both publish 0.
+// For this gate they mean the same thing - do not trust the map-based drive.
 #include <mutex>
 #include <string>
 
@@ -43,6 +54,8 @@ public:
     node_ = node;
     topic_ = jstr(p, "topic", "/slam_ours/state");
     timeout_ = jms(p, "timeout_ms", 0.0);   // 0 = latched topic, never stale
+    on_missing_ = jstr(p, "on_missing", "unavailable");   // unavailable | value
+    default_score_ = jnum(p, "default_score", 0.0);
     score_lost_ = jnum(p, "lost_score", 0.0);
     score_converging_ = jnum(p, "converging_score", 0.5);
     score_tracking_ = jnum(p, "tracking_score", 1.0);
@@ -76,6 +89,10 @@ public:
     {
       std::lock_guard<std::mutex> lock(mtx_);
       if (!has_msg_) {
+        if (on_missing_ == "value") {
+          // No message = the producer never reached map-ready. Same as Lost.
+          return ScoreResult::ok(default_score_, "no state yet (treated as not trusted)");
+        }
         return ScoreResult::unavailable("no message on " + topic_);
       }
       if (timeout_ > 0.0 && (ctx.now - stamp_).seconds() > timeout_) {
@@ -84,7 +101,7 @@ public:
       state = state_;
     }
     switch (state) {
-      case 0: return ScoreResult::ok(score_lost_, "Lost");
+      case 0: return ScoreResult::ok(score_lost_, "Lost (or no map)");
       case 1: return ScoreResult::ok(score_converging_, "Converging");
       case 2: return ScoreResult::ok(score_tracking_, "Tracking");
       default: return ScoreResult::unavailable("unknown state " + std::to_string(state));
@@ -97,6 +114,8 @@ private:
 
   std::string topic_;
   double timeout_{0.0};
+  std::string on_missing_{"unavailable"};
+  double default_score_{0.0};
   double score_lost_{0.0};
   double score_converging_{0.5};
   double score_tracking_{1.0};

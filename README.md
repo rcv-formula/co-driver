@@ -612,10 +612,23 @@ ambiguous - 0.45 can be a healthy Converging (raw 0.9) or a broken Tracking. The
 
 It is wired as a **gate, not a score**: weight 0 everywhere, with `veto_below: 0.25` on
 pp_main only. Because a zero weight adds nothing to any `sum|W|`, the calibrated
-confidence thresholds are numerically untouched whether the topic exists or not - against
-localization_pf (which has no state topic) the input reports unavailable and the
-arbitration behaves exactly as if it were not configured. Verified: with the topic
-absent, per-drive probabilities are bit-identical to the pre-gate configuration.
+confidence thresholds are numerically untouched.
+
+**Silence closes the gate** (`on_missing: "value"`, `default_score: 0.0`): slam_ours
+publishes no state at all until its map is loaded - the first message on the topic is the
+Lost it emits at map-ready - so "no message" means localization never started, possibly
+because the map failed to load. Treating silence as pass would open the gate in exactly
+the situation it exists for. Two consequences worth knowing:
+
+- The topic name is per-stack (`/slam_ours/state` vs `/localization_pf/state`; only the
+  confidence topic shares an absolute name). A wrong name reads as permanent silence,
+  which pins the car on gap_follow - loud and safe, not silent and wrong.
+- A bench with no state publisher must either latch one `Tracking(2)` message or set
+  `on_missing: "unavailable"` to disable the gate.
+
+On the wire, 0 means "Lost **or** waiting for map" - the producer's four-state enum
+(WaitingForMap, Lost, Converging, Tracking) folds both distrust states to 0. The gate
+treats them identically, which is the safe reading.
 
 What it adds:
 
@@ -625,6 +638,19 @@ What it adds:
   but broken" case, where the state stays 2 while the terms collapse.
 - **Converging is not a failure.** State 1 passes the gate, so a healthy convergence
   (confidence structurally halved) cannot be mistaken for a breakdown.
+
+Measured against a live slam_ours replaying 0526-1 (15 real state transitions, 6 Lost
+onsets including the map-ready first publish):
+
+- Every Lost onset produced the `veto_below[loc_state]` reject within **3-19 ms** of the
+  transition, and zero of the Converging periods were ever vetoed.
+- The two pathways split the work exactly as designed. When the confidence had been
+  degrading beforehand, the EMA pathway had **already** switched 0.01-0.25 s before the
+  state flipped. When the collapse was abrupt (confidence at 0 for only ~70 ms before the
+  Lost transition), the state veto won: selection flipped 14-19 ms after the transition,
+  where the EMA alone would have needed another ~400 ms.
+- Two Lost episodes lasted only 0.06-0.13 s; the return hysteresis absorbed them without
+  a flap.
 
 The raw-value contract is deliberate: the localization side ships `confidence` and
 `state` unfiltered, and every bit of smoothing, hysteresis and dwell logic lives here.
