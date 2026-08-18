@@ -75,6 +75,7 @@ install(PROGRAMS
   scripts/fake_localization_confidence.py
   scripts/fake_drive.py
   scripts/scan_qos_bridge.py
+  scripts/status_markers.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -783,6 +783,11 @@ private:
                 os << ",\"held_ms\":" << num(hb->second * 1e3);
               }
             }
+            // A scorer's note is its live progress report (e.g. the recovery
+            // gate's "recovering 1.2/3.0s") - the visualization reads it.
+            if (!kv.second.note.empty()) {
+              os << ",\"note\":\"" << esc(kv.second.note) << "\"";
+            }
             os << "}";
           }
         }

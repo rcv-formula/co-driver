@@ -37,6 +37,8 @@ def generate_launch_description():
         # mismatch instead of patching gap_follow.
         DeclareLaunchArgument('scan_bridge', default_value='false'),
         DeclareLaunchArgument('scan_topic', default_value='/scan'),
+        # RViz markers above the vehicle: which controller is selected and why.
+        DeclareLaunchArgument('markers', default_value='true'),
     ]
 
     co_driver = Node(
@@ -81,7 +83,16 @@ def generate_launch_description():
                      'out_topic': '/scan_reliable'}],
     )
 
-    actions = [*args, co_driver, monitor, scan_bridge]
+    markers = Node(
+        package='co_driver',
+        executable='status_markers.py',
+        name='co_driver_markers',
+        output='screen',
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration('markers')),
+    )
+
+    actions = [*args, co_driver, monitor, scan_bridge, markers]
 
     # gap_follow lives in its own repo; launching it is optional and best-effort.
     try:
