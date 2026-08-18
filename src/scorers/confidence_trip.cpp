@@ -50,6 +50,16 @@
 // stays high. On a scene like busan2 (13.5% of healthy tracking below 0.5)
 // it will trip during good driving - lengthen trip_ms or lower trip_below
 // per track.
+//
+// Term diagnostics: newer producers append the five raw terms behind the
+// aggregate (data = [stamp_sec, stamp_nanosec, confidence, term_score,
+// term_outlier, term_skip, term_spread, term_mass]; confidence = state
+// multiplier x min of the five). When the array carries them, the notes name
+// the limiting term, so status and the RViz marker show WHY the confidence
+// is low: term_mass = ambiguity (undiscriminated hypotheses - patience),
+// term_score/term_outlier = the match itself is bad, term_skip = unmapped or
+// dynamic obstacles (normal on busy tracks - do not read it as mismatch).
+// Diagnostics only; behavior does not depend on the terms.
 #include <cmath>
 #include <mutex>
 #include <string>
@@ -88,6 +98,20 @@ public:
           conf_ = msg->data[i];
           stamp_ = node_->now();
           has_msg_ = true;
+        }
+        // Optional appended terms: name the smallest one for the notes.
+        limit_.clear();
+        if (msg->data.size() >= 8) {
+          static const char * kTerm[5] =
+          {"term_score", "term_outlier", "term_skip", "term_spread", "term_mass"};
+          int arg = 0;
+          for (int k = 1; k < 5; ++k) {
+            if (msg->data[3 + k] < msg->data[3 + arg]) {arg = k;}
+          }
+          // Prefer the producer's own label when the layout carries one.
+          const std::size_t slot = static_cast<std::size_t>(3 + arg);
+          limit_ = (slot < msg->layout.dim.size() && !msg->layout.dim[slot].label.empty()) ?
+            msg->layout.dim[slot].label : kTerm[arg];
         }
       }, opts);
 
@@ -147,7 +171,9 @@ public:
     if (tripped_) {
       char buf[72];
       if (was_low_) {
-        std::snprintf(buf, sizeof(buf), "tripped: conf < %.2f for %.1fs", trip_below_, low_for_);
+        std::snprintf(
+          buf, sizeof(buf), "tripped: conf < %.2f for %.1fs%s%s", trip_below_, low_for_,
+          limit_.empty() ? "" : ", limit: ", limit_.c_str());
       } else {
         std::snprintf(buf, sizeof(buf), "tripped: clearing %.1f/%.1fs", high_for_, clear_);
       }
@@ -177,6 +203,7 @@ private:
   std::mutex mtx_;
   bool has_msg_{false};
   double conf_{0.0};
+  std::string limit_;
   rclcpp::Time stamp_;
   bool has_state_{false};
   uint8_t state_{255};
