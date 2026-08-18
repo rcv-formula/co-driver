@@ -37,7 +37,7 @@ red_damvi splits its configuration three ways:
 |---|---|
 | `co_driver_red_damvi.yaml` | output / scoring / selection / post-processing |
 | `co_driver_red_damvi_topics.jsonc` | wiring: inputs, drives, topic names |
-| `co_driver_red_damvi_tuning.jsonc` | every number: thresholds, hold times, weights, curves |
+| `localization_scoring.jsonc` | every number: thresholds, hold times, weights, curves |
 
 The tuning file is deep-merged over the topics file (`tuning_file` parameter), so
 retuning never touches the wiring.

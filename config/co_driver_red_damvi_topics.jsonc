@@ -4,7 +4,7 @@
 // only when it is fully healthy again.**
 //
 // Numbers live elsewhere:
-//   thresholds / hold times / weights / curves -> co_driver_red_damvi_tuning.jsonc
+//   thresholds / hold times / weights / curves -> localization_scoring.jsonc
 //   scoring / selection / postprocess          -> co_driver_red_damvi.yaml
 {
   "inputs": [

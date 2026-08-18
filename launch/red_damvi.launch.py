@@ -24,7 +24,7 @@ def generate_launch_description():
     share = get_package_share_directory('co_driver')
     default_config = os.path.join(share, 'config', 'co_driver_red_damvi.yaml')
     default_topics = os.path.join(share, 'config', 'co_driver_red_damvi_topics.jsonc')
-    default_tuning = os.path.join(share, 'config', 'co_driver_red_damvi_tuning.jsonc')
+    default_tuning = os.path.join(share, 'config', 'localization_scoring.jsonc')
 
     args = [
         DeclareLaunchArgument('config', default_value=default_config),
