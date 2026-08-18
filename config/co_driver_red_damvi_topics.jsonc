@@ -1,33 +1,17 @@
-// red_damvi topic list - PPcontroller (/drive_main) vs gap_follow (/drive_gf)
+// red_damvi wiring - which inputs and drives exist, and where they listen.
 //
-// One line: **when localization collapses, hand over to gap_follow.**
+// One line: **when localization collapses, hand over to gap_follow; come back
+// only when it is fully healthy again.**
 //
-// Why the weights look like this
-//   pp_main    follows a map and a raceline, so localization *is* its competence.
-//              -> large positive weight on `localization`. Its score collapses with
-//                 the confidence.
-//   gap_follow only reads /scan. It is exactly as good with or without localization.
-//              -> a constant floor score via `bias`, plus a small negative weight so
-//                 it steps aside on its own once confidence is healthy again.
-//
-// Base settings (scoring / selection / postprocess) live in
-// config/co_driver_red_damvi.yaml.
+// Numbers live elsewhere:
+//   thresholds / hold times / weights / curves -> co_driver_red_damvi_tuning.jsonc
+//   scoring / selection / postprocess          -> co_driver_red_damvi.yaml
 {
   "inputs": [
     {
-      // /localization_confidence, published by both localization_pf and slam_ours
-      // (absolute name in both, no prefix).
-      //   type   std_msgs/Float64MultiArray, RELIABLE, measured 100 Hz
-      //   data   [stamp_sec, stamp_nanosec, confidence], confidence in [0,1]
-      //
-      // on_missing is the crux of this configuration.
-      //   The default "unavailable" means "cannot judge", so missing:mask drops the
-      //   input entirely and the two drives end up competing on bias alone. But a
-      //   dead localization topic *is* localization being impossible. "value" with
-      //   default_score 0.0 makes a dead topic identical to confidence 0, which is
-      //   what brings gap_follow up.
-      //
-      // timeout_ms 200: the publisher runs at 100 Hz, so this is 20 periods.
+      // /localization_confidence, published by both localization_pf and
+      // slam_ours (absolute name in both, no prefix).
+      //   std_msgs/Float64MultiArray, data = [stamp_sec, stamp_nanosec, confidence]
       "name": "localization",
       "type": "external_score",
       "params": {
@@ -35,149 +19,49 @@
         "mode": "scalar",
         "index": 2,
         "stamp_indices": [0, 1],
-        "timeout_ms": 200,
-        "input_min": 0.0,
-        "input_max": 1.0,
-        "invert": false,
-        "on_missing": "value",
-        "default_score": 0.0
-      },
-      // Shared shaping default; the per-drive blocks below override it.
-      //
-      // in_min / in_max are set from measured confidence distributions rather than
-      // guessed. Across four replayed scenes (51k samples) the 5th percentile of
-      // confidence *while tracking normally* was:
-      //
-      //     icra 0.877 | 0522-2 0.867 | 0526-1 0.530 | busan2 0.361
-      //
-      // busan2 spends 13.5% of healthy tracking below 0.5, so any threshold near 0.5
-      // would hand the car to gap_follow during perfectly good driving. Real failures,
-      // on the other hand, drive the confidence to 0.0. So the interesting range is
-      // the bottom of the scale:
-      //
-      //   in_min 0.02 : at or below this, score 0 (localization is gone)
-      //   in_max 0.35 : at or above this, full marks - below busan2's healthy p05,
-      //                 so normal driving never enters the shaped region at all
-      //   exp_k 3.0   : convex, so the little that is left between 0.02 and 0.35
-      //                 still falls away steeply
-      //
-      // These two numbers describe the **producer**, not co_driver. slam_ours computes
-      // the confidence as (state multiplier) x min(5 terms). If that formula, those
-      // multipliers, or the output scale ever change, in_min/in_max stop meaning what
-      // they meant here and nothing will fail loudly - the arbitration will simply
-      // stop handing over, or start handing over constantly. Re-fit them against fresh
-      // per-scene percentiles: the handover threshold has to sit below the *worst*
-      // scene's 5th percentile of confidence during healthy tracking.
-      "influence": {"weight": 0.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
-    }
+        "invert": false
+      }
+    },
 
-    ,{
-      // slam_ours' state machine: 0=Lost, 1=Converging, 2=Tracking. Latched
-      // (transient_local), re-published on transitions only - hence timeout 0.
+    {
+      // Localization state machine: 0=Lost (or waiting for map), 1=Converging,
+      // 2=Tracking. std_msgs/UInt8, latched, republished on transitions only.
+      // Used as a gate, not a score: Lost instantly disqualifies pp_main.
       //
-      // Used as a **gate, not a score**: weight 0 everywhere, so this input adds
-      // nothing to any |W| sum and the calibrated confidence thresholds above are
-      // untouched whether this topic exists or not (localization_pf has no state
-      // topic; the input simply reports unavailable there and nothing changes).
-      //
-      // What it adds over confidence alone:
-      //   - Lost vetoes pp_main **instantly** (see the per-drive veto_below below).
-      //     An invalid incumbent switches immediately, bypassing the EMA (0.46 s),
-      //     the margin and the cooldown - so a declared Lost hands over faster than
-      //     the confidence pathway ever could.
-      //   - Converging (0.5) and Tracking (1.0) both pass the gate. This is the
-      //     disambiguation: confidence 0.45 during a healthy Converging (raw 0.9 x
-      //     multiplier 0.5) no longer looks anything like a broken Tracking,
-      //     because the state says which one it is.
-      // Topic name is per-stack: the real-car deployment (localization_pf) uses
-      // /localization_pf/state, the slam_ours replay rig uses /slam_ours/state.
-      // Only the confidence topic shares an absolute name between the two.
-      // Set here for the real car; switch it back when testing against replays.
-      //
-      // on_missing "value" + default_score 0.0: **silence closes the gate.**
-      // slam_ours publishes no state at all until its map is loaded (the first
-      // message is the Lost at map-ready), so "no message" means localization
-      // never started - possibly because the map failed to load. Treating that
-      // as pass would open the gate in exactly the situation it exists for.
-      // For a bench with no state publisher, either run one latched Tracking(2)
-      // publish, or set on_missing to "unavailable" to disable the gate.
+      // Topic name is per-stack: the real car (localization_pf) uses
+      // /localization_pf/state, the slam_ours replay rig /slam_ours/state.
+      // Silence closes the gate, so a wrong name pins the car on gap_follow -
+      // loud and safe, never silently disabled.
       "name": "loc_state",
       "type": "localization_state",
-      "params": {"topic": "/localization_pf/state", "timeout_ms": 0,
-                 "on_missing": "value", "default_score": 0.0},
-      // Neutral at the input level; only pp_main turns the veto on below.
-      "influence": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0}
-    }
-    ,{
-      // Recovery latch - the asymmetric edge of the arbitration.
-      //
-      // Leaving pp_main is fast (confidence EMA ~0.46 s for gradual degradation,
-      // state veto ~20 ms for abrupt Lost). Coming BACK is deliberately slow:
-      // once the arbitration has left pp_main, this gate keeps it disqualified
-      // until state == Tracking AND confidence >= 0.35 have held **continuously**
-      // for 3 s. Any dip resets the clock. Only then do the normal selection
-      // rules (margin, cooldown) get a say again.
-      //
-      // Why 0.35 and not the 0.226 return threshold: 0.226 is where pp_main
-      // merely wins the score again; 0.35 is where the response curve saturates,
-      // i.e. the confidence is fully out of the danger band. Requiring Tracking
-      // excludes returns during Converging (confidence structurally halved).
-      // Together: "fully safe", not "probably fine".
-      //
-      // While pp_main is the incumbent this gate has no effect at all, so it
-      // adds no new handover path and cannot flap on busan2-style dips.
+      "params": {"topic": "/localization_pf/state"}
+    },
+
+    {
+      // Return latch - keeps pp_main out until localization has been fully
+      // healthy for a sustained stretch (numbers in the tuning file).
       "name": "recovery",
       "type": "recovery_gate",
       "params": {
         "confidence_topic": "/localization_confidence",
         "confidence_index": 2,
-        "confidence_timeout_ms": 300,
-        "state_topic": "/localization_pf/state",
-        "require_tracking": true,
-        "min_confidence": 0.35,
-        "hold_ms": 3000
-      },
-      "influence": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0}
+        "state_topic": "/localization_pf/state"
+      }
     }
   ],
 
-  // hold_ms - how long the last command stays trusted. Past it the drive goes
-  // inactive: its score is still computed (for diagnostics) but it drops out of the
-  // softmax, the ranking and the selection. Rule of thumb: 3-5 times its period.
   "drives": [
     {
-      // PPcontroller. Map and raceline based.
+      // PPcontroller - map and raceline based; needs localization to mean anything
       "name": "pp_main",
       "topic": "/drive_main",
-      "hold_ms": 300,
-      "bias": 0.0,
-      "enabled": true,
-      "influence": {
-        // W = +3.0. Full confidence gives z = 3.0, zero confidence gives z = 0.0.
-        "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
-        // Lost (0.0) disqualifies pp_main outright; Converging (0.5) and
-        // Tracking (1.0) pass. weight 0 = no effect on the score, veto only.
-        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25},
-        // Return latch: after any handover away from pp_main, it stays
-        // disqualified until fully healthy for 3 s straight (see inputs).
-        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
-      }
+      "enabled": true
     },
-
     {
-      // gap_follow. Reads only /scan, so it keeps working when localization does not.
-      // bias 1.0 is its floor score, i.e. what it is worth when localization is gone.
-      // W = -1.5 makes it step aside once confidence recovers (z = -0.5).
+      // gap_follow - reactive on /scan alone; unaffected by localization
       "name": "gap_follow",
       "topic": "/drive_gf",
-      // gap_follow publishes once per scan. Measured /scan rate on the replay rig is
-      // 37 Hz (~27 ms), so 200 ms is about 7 periods.
-      "hold_ms": 200,
-      "bias": 1.0,
-      "enabled": true,
-      "influence": {
-        "localization": {"weight": -1.5, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
-      }
+      "enabled": true
     }
   ]
 }

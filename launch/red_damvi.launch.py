@@ -24,10 +24,13 @@ def generate_launch_description():
     share = get_package_share_directory('co_driver')
     default_config = os.path.join(share, 'config', 'co_driver_red_damvi.yaml')
     default_topics = os.path.join(share, 'config', 'co_driver_red_damvi_topics.jsonc')
+    default_tuning = os.path.join(share, 'config', 'co_driver_red_damvi_tuning.jsonc')
 
     args = [
         DeclareLaunchArgument('config', default_value=default_config),
         DeclareLaunchArgument('topics', default_value=default_topics),
+        # scorer thresholds / hold times / weights, merged over the topics file
+        DeclareLaunchArgument('tuning', default_value=default_tuning),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('gap_follow', default_value='true'),
         DeclareLaunchArgument('monitor', default_value='true'),
@@ -51,6 +54,7 @@ def generate_launch_description():
             LaunchConfiguration('config'),
             {
                 'topics_file': LaunchConfiguration('topics'),
+                'tuning_file': LaunchConfiguration('tuning'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             },
         ],

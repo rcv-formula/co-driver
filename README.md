@@ -31,7 +31,16 @@ ros2 launch co_driver red_damvi.launch.py scan_bridge:=true
 | `config/co_driver.yaml` | change output/scoring/selection/post-processing |
 | `config/co_driver_topics.jsonc` | add or remove input topics, drive candidates, weights |
 
-red_damvi uses its own pair: `co_driver_red_damvi.yaml` / `co_driver_red_damvi_topics.jsonc`.
+red_damvi splits its configuration three ways:
+
+| File | Holds |
+|---|---|
+| `co_driver_red_damvi.yaml` | output / scoring / selection / post-processing |
+| `co_driver_red_damvi_topics.jsonc` | wiring: inputs, drives, topic names |
+| `co_driver_red_damvi_tuning.jsonc` | every number: thresholds, hold times, weights, curves |
+
+The tuning file is deep-merged over the topics file (`tuning_file` parameter), so
+retuning never touches the wiring.
 Reload coefficients without restarting:
 
 ```bash

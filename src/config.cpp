@@ -222,9 +222,81 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
 }
 
 // ---------------------------------------------------------------------------
+// Tuning overlay - scorer parameters kept apart from the wiring
+// ---------------------------------------------------------------------------
+// The topics file describes the wiring: which inputs and drives exist, and
+// which topics they read. The optional tuning file (`tuning_file` parameter)
+// carries only numbers - thresholds, hold times, weights, curve shapes - and
+// is deep-merged onto the topics file before parsing, keyed by name:
+//
+//   {"inputs":  {"<input name>": {"params": {...}, "influence": {...}}},
+//    "drives":  {"<drive name>": {"bias": ..., "hold_ms": ...,
+//                                 "influence": {"<input name>": {...}}}}}
+//
+// A name that does not exist in the topics file is an error (typo guard).
+void deepMerge(Json & base, const Json & over)
+{
+  if (!base.is_object() || !over.is_object()) {
+    base = over;
+    return;
+  }
+  for (auto it = over.begin(); it != over.end(); ++it) {
+    if (base.contains(it.key()) && base[it.key()].is_object() && it.value().is_object()) {
+      deepMerge(base[it.key()], it.value());
+    } else {
+      base[it.key()] = it.value();
+    }
+  }
+}
+
+bool applyTuning(Json & root, const std::string & path, std::string * error)
+{
+  std::ifstream in(path);
+  if (!in) {
+    *error = "cannot open tuning file: " + path;
+    return false;
+  }
+  Json tuning;
+  try {
+    tuning = Json::parse(in, nullptr, true, /*ignore_comments=*/ true);
+  } catch (const std::exception & e) {
+    *error = std::string("JSON parse failed (") + path + "): " + e.what();
+    return false;
+  }
+  if (!tuning.is_object()) {
+    *error = "top level of the tuning file is not a JSON object.";
+    return false;
+  }
+  for (const char * section : {"inputs", "drives"}) {
+    if (!tuning.contains(section)) {continue;}
+    if (!tuning[section].is_object() || !root.contains(section)) {
+      *error = std::string("tuning `") + section + "` must be an object keyed by name.";
+      return false;
+    }
+    for (auto it = tuning[section].begin(); it != tuning[section].end(); ++it) {
+      bool found = false;
+      for (auto & entry : root[section]) {
+        if (jstr(entry, "name", "") == it.key()) {
+          deepMerge(entry, it.value());
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        *error = std::string("tuning file refers to unknown ") + section + " entry '" +
+          it.key() + "'.";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Topics JSON (inputs / drives)
 // ---------------------------------------------------------------------------
-bool loadTopics(const std::string & path, Config * c, std::string * error)
+bool loadTopics(
+  const std::string & path, const std::string & tuning_path, Config * c, std::string * error)
 {
   std::ifstream in(path);
   if (!in) {
@@ -241,6 +313,9 @@ bool loadTopics(const std::string & path, Config * c, std::string * error)
   }
   if (!root.is_object()) {
     *error = "top level of the topics file is not a JSON object.";
+    return false;
+  }
+  if (!tuning_path.empty() && !applyTuning(root, tuning_path, error)) {
     return false;
   }
 
@@ -343,7 +418,7 @@ bool Config::load(
     *error = "set the `topics_file` parameter to the path of the topics JSON.";
     return false;
   }
-  if (!loadTopics(topics_path, &c, &err)) {
+  if (!loadTopics(topics_path, pstr(node, "tuning_file", ""), &c, &err)) {
     *error = err;
     return false;
   }
