@@ -28,15 +28,27 @@
     },
 
     "recovery": {
-      // Return latch: once the arbitration has left pp_main, it may come back
-      // only after state == Tracking AND confidence >= min_confidence have
-      // held hold_ms continuously. Any dip resets the clock.
-      //   min_confidence 0.35 matches in_max in the topics file (fully out of
-      //   the danger band); keep the two in step.
+      // Return latch, anchored at the global-search ATTACH (Lost->Converging
+      // entry), not at full convergence. The verification is the dwell plus
+      // the confidence bar together: measured over 17 attaches, a wrong one
+      // decays (0.466 -> 0.38 @1s -> 0.29 @2s, dead at 2.8 s) and breaks the
+      // hold at ~1.4 s, while correct ones sit flat at 0.48+.
+      //
+      //   min_state 1        : attached (Converging) is enough - no waiting
+      //                        for Tracking (attach->Tracking median is 3.5 s,
+      //                        up to 12.4 s, so this halves the return time)
+      //   min_confidence 0.35: do NOT lower this much further. The dwell alone
+      //                        cannot reject a bad attach (one survived 2.8 s);
+      //                        the bar is what catches the decay. 0.35 is 70%
+      //                        of the Converging ceiling (~0.5) and matches
+      //                        in_max in the topics file - keep them in step.
+      //   hold_ms 2500       : the measured bad attach breaks the hold at
+      //                        ~1.4 s; 2.5 s adds margin over the single
+      //                        recorded sample (n=1 - be conservative).
       "params": {
-        "require_tracking": true,
+        "min_state": 1,
         "min_confidence": 0.35,
-        "hold_ms": 3000,
+        "hold_ms": 2500,
         "confidence_timeout_ms": 300
       }
     }

@@ -9,10 +9,19 @@
 //                                         Leaving is the other pathways' job;
 //                                         this scorer never causes a handover.
 //   once the arbitration has left it   -> gate closed. It reopens only after
-//                                         state == Tracking AND confidence >=
+//                                         state >= min_state AND confidence >=
 //                                         min_confidence have held
 //                                         **continuously** for hold_ms.
 //                                         Any dip resets the clock.
+//
+// min_state picks the anchor of the verification:
+//   2  wait for full convergence (Tracking) - the conservative original
+//   1  judge from the moment global search has ATTACHED (Converging entry).
+//      The dwell plus the confidence bar do the verification: a wrong attach
+//      decays (measured: 0.466 -> 0.38 @1s -> 0.29 @2s before dying at 2.8 s)
+//      and breaks the hold, while a correct one sits flat at 0.48+. Survival
+//      alone is NOT proof - the bar must stay high enough to catch the decay,
+//      which is why lowering it much below 0.35 defeats the design.
 //
 // Wired like the state gate: weight 0 (adds nothing to any |W| sum, so the
 // calibrated thresholds are untouched) with veto_below on pp_main only. While
@@ -60,7 +69,9 @@ public:
     conf_index_ = jint(p, "confidence_index", 2);
     conf_timeout_ = jms(p, "confidence_timeout_ms", 300.0);
     state_topic_ = jstr(p, "state_topic", "/slam_ours/state");
-    require_tracking_ = jbool(p, "require_tracking", true);
+    // min_state: 2 = require Tracking, 1 = attached (Converging) is enough,
+    // 0 = ignore the state entirely. require_tracking is the legacy spelling.
+    min_state_ = jint(p, "min_state", jbool(p, "require_tracking", true) ? 2 : 0);
     min_confidence_ = jnum(p, "min_confidence", 0.35);
     hold_ = jms(p, "hold_ms", 3000.0);
 
@@ -78,7 +89,7 @@ public:
         }
       }, opts);
 
-    if (require_tracking_) {
+    if (min_state_ > 0) {
       rclcpp::QoS qos(1);
       qos.reliable().transient_local();
       state_sub_ = node->create_subscription<std_msgs::msg::UInt8>(
@@ -92,8 +103,10 @@ public:
 
     RCLCPP_INFO(
       node->get_logger(),
-      "recovery gate '%s': reopen needs %s confidence >= %.2f held %.1fs",
-      name.c_str(), require_tracking_ ? "Tracking +" : "", min_confidence_, hold_);
+      "recovery gate '%s': reopen needs %s+ confidence >= %.2f held %.1fs",
+      name.c_str(),
+      min_state_ >= 2 ? "Tracking" : (min_state_ == 1 ? "attached (Converging)" : "any state"),
+      min_confidence_, hold_);
     return true;
   }
 
@@ -104,8 +117,9 @@ public:
     const bool conf_ok = has_conf_ &&
       (conf_timeout_ <= 0.0 || (ctx.now - conf_stamp_).seconds() <= conf_timeout_) &&
       std::isfinite(conf_) && conf_ >= min_confidence_;
-    // Silence on the state topic reads as not-Tracking, same as the state gate.
-    const bool state_ok = !require_tracking_ || (has_state_ && state_ == 2);
+    // Silence on the state topic reads as not-attached, same as the state gate.
+    const bool state_ok = min_state_ <= 0 ||
+      (has_state_ && state_ != 255 && state_ >= min_state_ && state_ <= 2);
     const bool healthy = conf_ok && state_ok;
 
     if (healthy && !was_healthy_) {
@@ -141,7 +155,7 @@ private:
   std::string conf_topic_, state_topic_;
   int conf_index_{2};
   double conf_timeout_{0.3};
-  bool require_tracking_{true};
+  int min_state_{2};
   double min_confidence_{0.35};
   double hold_{3.0};
 
