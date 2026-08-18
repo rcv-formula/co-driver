@@ -656,6 +656,36 @@ The raw-value contract is deliberate: the localization side ships `confidence` a
 `state` unfiltered, and every bit of smoothing, hysteresis and dwell logic lives here.
 One owner for the filtering, one place to tune it.
 
+### The recovery gate - coming back only when it is fully safe
+
+Leaving pp_main is fast by design. Coming back is deliberately slow: the `recovery_gate`
+scorer is a latch that keeps pp_main disqualified, once the arbitration has left it,
+until **state == Tracking and confidence >= 0.35 have held continuously for 3 s**. Any
+dip resets the clock; only after the hold do the normal selection rules (margin,
+cooldown) apply again. While pp_main is the incumbent the gate has no effect at all, so
+it adds no new handover path and cannot flap on busan2-style dips.
+
+Why these numbers: 0.226 is where pp_main merely wins the score again; 0.35 is where the
+response curve saturates - the confidence is fully out of the danger band. Requiring
+Tracking excludes returns during Converging, where the confidence is structurally halved
+and "looks recovered" means much less.
+
+Simulated on the recorded 0526-1 joint trace (confidence + state at 100 Hz), the gate
+changes returns from "probably fine" to "fully safe":
+
+| | without the gate | with the gate |
+|---|---|---|
+| returns happened at | confidence 0.25-0.49, all **during Converging** | confidence 0.836-0.975, all **in Tracking** |
+| the 60-65 s double collapse | two full switch pairs | one handover, one return |
+| switches | 10 | 7 |
+| gap_follow occupancy | 9.5 s | 41.7 s |
+
+The occupancy row is the honest cost: safety is bought with more time on the fallback.
+
+A drive with nothing selected yet counts as not-incumbent, so the **first** selection of
+pp_main also waits for sustained health - a car booting mid-track starts on gap_follow
+and earns its way onto the raceline.
+
 ### gap_follow gotchas
 
 Two things will silently produce no `/drive_gf` at all:

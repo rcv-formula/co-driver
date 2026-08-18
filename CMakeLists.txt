@@ -41,6 +41,7 @@ set(dependencies
 set(scorer_sources
   src/scorers/external_score.cpp       # external score topics (sync skeleton)
   src/scorers/localization_state.cpp   # Lost/Converging/Tracking state gate
+  src/scorers/recovery_gate.cpp        # return only after sustained full health
   src/scorers/example_async.cpp        # async skeleton for heavy computations
 )
 

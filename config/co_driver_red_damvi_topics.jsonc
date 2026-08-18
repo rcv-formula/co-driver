@@ -107,6 +107,37 @@
       // Neutral at the input level; only pp_main turns the veto on below.
       "influence": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0}
     }
+    ,{
+      // Recovery latch - the asymmetric edge of the arbitration.
+      //
+      // Leaving pp_main is fast (confidence EMA ~0.46 s for gradual degradation,
+      // state veto ~20 ms for abrupt Lost). Coming BACK is deliberately slow:
+      // once the arbitration has left pp_main, this gate keeps it disqualified
+      // until state == Tracking AND confidence >= 0.35 have held **continuously**
+      // for 3 s. Any dip resets the clock. Only then do the normal selection
+      // rules (margin, cooldown) get a say again.
+      //
+      // Why 0.35 and not the 0.226 return threshold: 0.226 is where pp_main
+      // merely wins the score again; 0.35 is where the response curve saturates,
+      // i.e. the confidence is fully out of the danger band. Requiring Tracking
+      // excludes returns during Converging (confidence structurally halved).
+      // Together: "fully safe", not "probably fine".
+      //
+      // While pp_main is the incumbent this gate has no effect at all, so it
+      // adds no new handover path and cannot flap on busan2-style dips.
+      "name": "recovery",
+      "type": "recovery_gate",
+      "params": {
+        "confidence_topic": "/localization_confidence",
+        "confidence_index": 2,
+        "confidence_timeout_ms": 300,
+        "state_topic": "/slam_ours/state",
+        "require_tracking": true,
+        "min_confidence": 0.35,
+        "hold_ms": 3000
+      },
+      "influence": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0}
+    }
   ],
 
   // hold_ms - how long the last command stays trusted. Past it the drive goes
@@ -125,7 +156,10 @@
         "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
         // Lost (0.0) disqualifies pp_main outright; Converging (0.5) and
         // Tracking (1.0) pass. weight 0 = no effect on the score, veto only.
-        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25}
+        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25},
+        // Return latch: after any handover away from pp_main, it stays
+        // disqualified until fully healthy for 3 s straight (see inputs).
+        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
       }
     },
 
