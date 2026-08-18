@@ -7,6 +7,12 @@ the vehicle:
     > gap_follow                      <- colored: pp_main green / gap_follow
     recovery gate: recovering 1.2/3.0s   orange / nothing red
     conf 0.42  p: main 0.03 gf 0.97
+    2.1s ago  pp_main > gap_follow  STATE VETO: Lost / no map
+    31.4s ago  gap_follow > pp_main  recovered
+
+The trailing lines are the last few switches with their age - a switch itself
+is over in tens of milliseconds, far too fast to catch on screen, so the
+reason that caused it stays readable afterwards.
 
 Placement is coordinated with the slam_ours eval markers, which sit at z=0.6
 above the vehicle (ns "slip") and at the map centre (reloc_*): this one uses
@@ -43,6 +49,7 @@ class StatusMarkers(Node):
         self.z = p("z", 1.2).value
         self.scale = p("text_height", 0.35).value
         self.rate = p("rate_hz", 10.0).value
+        self.history_len = p("history", 3).value
 
         self.buf = Buffer()
         self.tf = TransformListener(self.buf, self)
@@ -50,15 +57,32 @@ class StatusMarkers(Node):
         self.create_subscription(String, "/co_driver_node/status", self.on_status, 10)
         self.st = None
         self.last_pos = (0.0, 0.0)
+        self.prev_sel = None
+        self.first_status = True
+        self.switches = []      # (wall time, from, to, reason at that moment)
         self.create_timer(1.0 / self.rate, self.tick)
         self.get_logger().info(
             f"markers on /co_driver/markers (ns co_driver, {self.base} + z={self.z})")
 
     def on_status(self, msg):
         try:
-            self.st = json.loads(msg.data)
+            st = json.loads(msg.data)
         except json.JSONDecodeError:
-            pass
+            return
+        self.st = st
+        sel = st.get("selected") or None
+        if sel != self.prev_sel:
+            # The switch is over in milliseconds; freeze its reason here so the
+            # marker can keep showing it afterwards.
+            if not self.first_status:
+                self.switches.append(
+                    (self.now(), self.prev_sel, sel, self.reason_line(st)))
+                self.switches = self.switches[-self.history_len:]
+            self.prev_sel = sel
+        self.first_status = False
+
+    def now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def reason_line(self, st):
         """One line saying which pathway is in charge right now."""
@@ -99,9 +123,14 @@ class StatusMarkers(Node):
             if isinstance(e, dict) and "x" in e:
                 conf = f"conf {e['x']:.2f}  "
                 break
-        text = (f"> {sel or 'NO DRIVE'}\n"
-                f"{self.reason_line(st)}\n"
-                f"{conf}p: {probs}")
+        lines = [f"> {sel or 'NO DRIVE'}",
+                 self.reason_line(st),
+                 f"{conf}p: {probs}"]
+        t_now = self.now()
+        for tw, frm, to, why in reversed(self.switches):
+            lines.append(
+                f"{t_now - tw:5.1f}s ago  {frm or '(none)'} > {to or '(none)'}  {why}")
+        text = "\n".join(lines)
 
         m = Marker()
         m.header.frame_id = self.frame
