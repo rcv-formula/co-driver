@@ -71,18 +71,30 @@
       "influence": {"weight": 0.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
     }
 
-    // Possible extension, not enabled here.
-    //
-    // slam_ours computes confidence as (state multiplier) x min(5 terms), where the
-    // state multiplier is Lost 0.0 / Converging 0.5 / Tracking 1.0. That makes a
-    // middling value ambiguous: 0.45 can be a healthy Converging (raw 0.9) or a
-    // broken Tracking. Subscribing to the state topic separately would disambiguate
-    // it (/slam_ours/state, std_msgs/UInt8, transient_local).
-    //
-    // This configuration deliberately does not depend on that: the thresholds above
-    // sit low enough that only a genuine collapse (confidence -> 0, which is what
-    // both Lost and a broken Tracking produce) triggers a handover. Adding the state
-    // would need a new scorer in src/scorers/, and would tie the config to slam_ours.
+    ,{
+      // slam_ours' state machine: 0=Lost, 1=Converging, 2=Tracking. Latched
+      // (transient_local), re-published on transitions only - hence timeout 0.
+      //
+      // Used as a **gate, not a score**: weight 0 everywhere, so this input adds
+      // nothing to any |W| sum and the calibrated confidence thresholds above are
+      // untouched whether this topic exists or not (localization_pf has no state
+      // topic; the input simply reports unavailable there and nothing changes).
+      //
+      // What it adds over confidence alone:
+      //   - Lost vetoes pp_main **instantly** (see the per-drive veto_below below).
+      //     An invalid incumbent switches immediately, bypassing the EMA (0.46 s),
+      //     the margin and the cooldown - so a declared Lost hands over faster than
+      //     the confidence pathway ever could.
+      //   - Converging (0.5) and Tracking (1.0) both pass the gate. This is the
+      //     disambiguation: confidence 0.45 during a healthy Converging (raw 0.9 x
+      //     multiplier 0.5) no longer looks anything like a broken Tracking,
+      //     because the state says which one it is.
+      "name": "loc_state",
+      "type": "localization_state",
+      "params": {"topic": "/slam_ours/state", "timeout_ms": 0},
+      // Neutral at the input level; only pp_main turns the veto on below.
+      "influence": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0}
+    }
   ],
 
   // hold_ms - how long the last command stays trusted. Past it the drive goes
@@ -98,7 +110,10 @@
       "enabled": true,
       "influence": {
         // W = +3.0. Full confidence gives z = 3.0, zero confidence gives z = 0.0.
-        "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+        "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
+        // Lost (0.0) disqualifies pp_main outright; Converging (0.5) and
+        // Tracking (1.0) pass. weight 0 = no effect on the score, veto only.
+        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25}
       }
     },
 

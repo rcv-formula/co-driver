@@ -39,8 +39,9 @@ set(dependencies
 # 새 채점기를 만들면 이 목록에 파일 한 줄만 추가하면 됩니다.
 # (각 파일이 CO_DRIVER_REGISTER_SCORER 로 스스로 등록합니다)
 set(scorer_sources
-  src/scorers/external_score.cpp   # 외부 점수 토픽 (동기 스켈레톤)
-  src/scorers/example_async.cpp    # 무거운 계산을 분리하는 비동기 스켈레톤
+  src/scorers/external_score.cpp       # external score topics (sync skeleton)
+  src/scorers/localization_state.cpp   # Lost/Converging/Tracking state gate
+  src/scorers/example_async.cpp        # async skeleton for heavy computations
 )
 
 add_executable(co_driver_node

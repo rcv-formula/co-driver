@@ -602,15 +602,33 @@ Two behaviours worth knowing about, both confirmed on real data rather than fixt
   `switch_cooldown_ms` is worth thinking about, and why raising it much further is the
   wrong answer (see the comment in the yaml).
 
-### A note on ambiguous confidence values
+### The state gate
 
 slam_ours computes the confidence as `(state multiplier) x min(5 terms)` where the state
 multiplier is Lost 0.0 / Converging 0.5 / Tracking 1.0. A middling value is therefore
-ambiguous - 0.45 can be a healthy Converging (raw 0.9) or a broken Tracking. This
-configuration deliberately does not depend on telling those apart: the thresholds sit low
-enough that only a genuine collapse toward 0 triggers a handover, and both readings of a
-failure produce that. Disambiguating properly would mean subscribing to the state topic
-from a new scorer, which would tie the configuration to one localization implementation.
+ambiguous - 0.45 can be a healthy Converging (raw 0.9) or a broken Tracking. The
+`localization_state` scorer subscribes `/slam_ours/state` (`std_msgs/UInt8`, 0=Lost
+1=Converging 2=Tracking, latched) to carry that distinction.
+
+It is wired as a **gate, not a score**: weight 0 everywhere, with `veto_below: 0.25` on
+pp_main only. Because a zero weight adds nothing to any `sum|W|`, the calibrated
+confidence thresholds are numerically untouched whether the topic exists or not - against
+localization_pf (which has no state topic) the input reports unavailable and the
+arbitration behaves exactly as if it were not configured. Verified: with the topic
+absent, per-drive probabilities are bit-identical to the pre-gate configuration.
+
+What it adds:
+
+- **Lost disqualifies pp_main instantly.** An invalid incumbent switches without
+  hysteresis, so a declared Lost hands over in ~20 ms (measured) versus ~460 ms through
+  the confidence EMA. The confidence pathway remains as the backstop for the "Tracking
+  but broken" case, where the state stays 2 while the terms collapse.
+- **Converging is not a failure.** State 1 passes the gate, so a healthy convergence
+  (confidence structurally halved) cannot be mistaken for a breakdown.
+
+The raw-value contract is deliberate: the localization side ships `confidence` and
+`state` unfiltered, and every bit of smoothing, hysteresis and dwell logic lives here.
+One owner for the filtering, one place to tune it.
 
 ### gap_follow gotchas
 
