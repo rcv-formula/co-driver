@@ -101,6 +101,21 @@ public:
         }, opts);
     }
 
+    // Guardrail: the producer halves the confidence during Converging (state
+    // multiplier 0.5), and multi-hypothesis ambiguity lowers the ceiling
+    // further (conf <= 0.5 x dominant mass). A bar at or above ~0.45 can
+    // therefore never be met before Tracking, which silently defeats
+    // min_state 1 - the exact misconfiguration that pinned a test car on
+    // gap_follow. Warn loudly instead of failing silently.
+    if (min_state_ == 1 && min_confidence_ >= 0.45) {
+      RCLCPP_WARN(
+        node->get_logger(),
+        "recovery gate '%s': min_confidence %.2f is above the Converging ceiling "
+        "(~0.5 x dominant hypothesis mass). With min_state 1 the hold can never "
+        "start before Tracking - the attach anchor is effectively disabled. "
+        "Use 0.25-0.35, or set min_state 2 if you really want this bar.",
+        name.c_str(), min_confidence_);
+    }
     RCLCPP_INFO(
       node->get_logger(),
       "recovery gate '%s': reopen needs %s+ confidence >= %.2f held %.1fs",
