@@ -27,6 +27,31 @@
       "params": {"timeout_ms": 0}
     },
 
+    "loc_trip": {
+      // Early handover: confidence < trip_below sustained trip_ms disqualifies
+      // pp_main. This is where "detect earlier" lives - the user's 0.50.
+      //   trip_below 0.50 : the score pathway only fires at 0.171; this bar
+      //                     catches the quiet degradations (0.25-0.45 hover)
+      //                     the curve saturation hides. Tuned for a course
+      //                     where healthy confidence stays high - on a scene
+      //                     like busan2 (13.5% of healthy tracking below 0.5)
+      //                     it will trip during good driving; lengthen trip_ms
+      //                     or lower the bar per track.
+      //   trip_ms 500     : a momentary dip proves nothing (confidence is
+      //                     noisy even when the pose is right); only a
+      //                     sustained stay below the bar is a degradation.
+      //                     Tolerance lives HERE, not in lowering the bar.
+      //   clear_ms 2500   : the trip releases only after confidence has been
+      //                     back above the bar for this long - time verifies
+      //                     the recovery too, mirroring the recovery latch.
+      "params": {
+        "trip_below": 0.50,
+        "trip_ms": 500,
+        "clear_ms": 2500,
+        "timeout_ms": 300
+      }
+    },
+
     "recovery": {
       // Return latch, anchored at the global-search ATTACH (Lost->Converging
       // entry), not at full convergence. The verification is the dwell plus

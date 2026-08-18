@@ -53,6 +53,24 @@
     },
 
     {
+      // Early-degradation trip - the score curve saturates at in_max, so a
+      // localization hovering at 0.25-0.45 (quietly wrong, not collapsed)
+      // never reaches the score pathway's handover. This input watches the
+      // raw confidence and disqualifies pp_main when it stays below the trip
+      // bar for a sustained stretch (numbers in localization_scoring.jsonc).
+      // Engaged only while Tracking - Lost/Converging belong to the state
+      // veto and the recovery latch (a fresh attach legitimately sits below
+      // the trip bar and must not be gated here).
+      "name": "loc_trip",
+      "type": "confidence_trip",
+      "params": {
+        "topic": "/localization_confidence",
+        "index": 2,
+        "state_topic": "/localization_pf/state"
+      }
+    },
+
+    {
       // Return latch - keeps pp_main out until localization has been fully
       // healthy for a sustained stretch (conditions in localization_scoring.jsonc).
       "name": "recovery",
@@ -80,6 +98,8 @@
         "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
         // Lost (or silence) disqualifies pp_main outright; weight 0 = veto only
         "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25},
+        // early-degradation trip (see localization_scoring.jsonc); veto only
+        "loc_trip": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // return latch (see localization_scoring.jsonc); weight 0 = veto only
         "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
       }
