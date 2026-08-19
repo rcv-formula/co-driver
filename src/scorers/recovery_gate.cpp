@@ -40,6 +40,11 @@
 //     "influence": {"weight": 0.0, "veto_below": -1.0}   // per-drive opt-in
 //   }
 //
+// ignore_terms works exactly as it does for the score input and the trip: the
+// health test uses state_multiplier x min(terms not ignored) when the producer
+// appends them, so persistent occlusion (term_skip low, pose terms fine) does
+// not strand the car on the fallback for as long as an obstacle is in view.
+//
 // "Fully healthy" deliberately means more than "above the handover threshold":
 // handover happens below confidence 0.171, but reopening demands 0.35 - the
 // point where the response curve saturates and the value is fully out of the
@@ -54,6 +59,7 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 
+#include "co_driver/confidence_terms.hpp"
 #include "co_driver/scorer.hpp"
 
 namespace co_driver
@@ -73,6 +79,7 @@ public:
     // 0 = ignore the state entirely. require_tracking is the legacy spelling.
     min_state_ = jint(p, "min_state", jbool(p, "require_tracking", true) ? 2 : 0);
     min_confidence_ = jnum(p, "min_confidence", 0.35);
+    ignore_terms_ = jstrs(p, "ignore_terms");
     hold_ = jms(p, "hold_ms", 3000.0);
 
     rclcpp::SubscriptionOptions opts;
@@ -87,6 +94,7 @@ public:
           conf_stamp_ = node_->now();
           has_conf_ = true;
         }
+        readConfidenceTerms(*msg, &terms_, &labels_);
       }, opts);
 
     if (min_state_ > 0) {
@@ -129,9 +137,20 @@ public:
   void prepare(const Context & ctx, const std::vector<Drive> &) override
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    // Judge the same value the rest of the arbitration judges: the aggregate,
+    // or the smallest non-ignored term scaled by the state multiplier.
+    double value = conf_;
+    if (!ignore_terms_.empty()) {
+      double judged = 0.0;
+      std::string judged_label;
+      if (minJudgedTerm(terms_, labels_, ignore_terms_, &judged, &judged_label)) {
+        const double mult = (!has_state_ || state_ == 2) ? 1.0 : (state_ == 1 ? 0.5 : 0.0);
+        value = mult * judged;
+      }
+    }
     const bool conf_ok = has_conf_ &&
       (conf_timeout_ <= 0.0 || (ctx.now - conf_stamp_).seconds() <= conf_timeout_) &&
-      std::isfinite(conf_) && conf_ >= min_confidence_;
+      std::isfinite(value) && value >= min_confidence_;
     // Silence on the state topic reads as not-attached, same as the state gate.
     const bool state_ok = min_state_ <= 0 ||
       (has_state_ && state_ != 255 && state_ >= min_state_ && state_ <= 2);
@@ -172,11 +191,14 @@ private:
   double conf_timeout_{0.3};
   int min_state_{2};
   double min_confidence_{0.35};
+  std::vector<std::string> ignore_terms_;
   double hold_{3.0};
 
   std::mutex mtx_;
   bool has_conf_{false}, has_state_{false};
   double conf_{0.0};
+  std::vector<double> terms_;
+  std::vector<std::string> labels_;
   rclcpp::Time conf_stamp_;
   uint8_t state_{255};
   bool was_healthy_{false};

@@ -18,7 +18,18 @@
         "timeout_ms": 200,
         // dead topic = confidence 0 (a silent localization IS a failed one)
         "on_missing": "value",
-        "default_score": 0.0
+        "default_score": 0.0,
+        // Exclude the obstacle meter from the score as well as from the trip.
+        // term_skip counts beams masked out as unexplained - unmapped or
+        // dynamic obstacles - and the producer masks them BEFORE scoring, so
+        // the pose terms stay at 1.000 through heavy occlusion. It can reach
+        // 0.00 with a vehicle alongside, which takes the aggregate to 0.00 and
+        // would collapse pp_main's logit while the pose is perfectly good.
+        // The reported value becomes
+        //     state_multiplier x min(terms except term_skip)
+        // so real mismatch still lands: the producer drops the whole beam mask
+        // once >50% of beams disagree, and term_score/term_outlier fall with it.
+        "ignore_terms": ["term_skip"]
       }
     },
 
@@ -44,11 +55,28 @@
       //   clear_ms 2500   : the trip releases only after confidence has been
       //                     back above the bar for this long - time verifies
       //                     the recovery too, mirroring the recovery latch.
+      //   ignore_terms    : judge min(remaining terms) instead of the
+      //                     aggregate. term_skip counts beams masked out as
+      //                     unexplained - i.e. how much unmapped or dynamic
+      //                     obstacle is in view - and the producer masks
+      //                     those beams BEFORE scoring, so term_score and
+      //                     term_outlier stay at 1.000 right through heavy
+      //                     occlusion. Judging the aggregate therefore hands
+      //                     the car over whenever another vehicle drives
+      //                     alongside (measured: two spurious handovers on a
+      //                     busan2 replay with every pose term at 1.000).
+      //                     Excluding it is safe because the producer discards
+      //                     the whole mask once >50% of beams disagree, and
+      //                     from there term_score/term_outlier collapse
+      //                     together - real mismatch is still caught. Only
+      //                     applies when the producer publishes the 8-slot
+      //                     array; older 3-slot ones keep using the aggregate.
       "params": {
         "trip_below": 0.50,
         "trip_ms": 500,
         "clear_ms": 2500,
-        "timeout_ms": 300
+        "timeout_ms": 300,
+        "ignore_terms": ["term_skip"]
       }
     },
 
@@ -85,11 +113,15 @@
       //   hold_ms 2500       : the measured bad attach breaks the hold at
       //                        ~1.4 s; 2.5 s adds margin over the single
       //                        recorded sample (n=1 - be conservative).
+      //   ignore_terms    : same exclusion as the score input and the trip, so
+      //                     persistent occlusion cannot strand the car on the
+      //                     fallback for as long as an obstacle is in view.
       "params": {
         "min_state": 1,
         "min_confidence": 0.35,
         "hold_ms": 2500,
-        "confidence_timeout_ms": 300
+        "confidence_timeout_ms": 300,
+        "ignore_terms": ["term_skip"]
       }
     }
   }

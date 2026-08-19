@@ -18,13 +18,17 @@
       // /localization_confidence, published by both localization_pf and
       // slam_ours (absolute name in both, no prefix).
       //   std_msgs/Float64MultiArray, data = [stamp_sec, stamp_nanosec, confidence]
+      // localization_confidence rather than the generic external_score: this
+      // producer appends its five raw terms, and one of them (term_skip) is an
+      // obstacle meter rather than a pose-quality meter. See the ignore_terms
+      // note in localization_scoring.jsonc.
       "name": "localization",
-      "type": "external_score",
+      "type": "localization_confidence",
       "params": {
         "topic": "/localization_confidence",
-        "mode": "scalar",
         "index": 2,
-        "stamp_indices": [0, 1]
+        "stamp_indices": [0, 1],
+        "state_topic": "/localization_pf/state"
       },
       // Response curve, shared default for all drives (overridden per drive below).
       // Fitted to measured confidence distributions (healthy-tracking p05 per

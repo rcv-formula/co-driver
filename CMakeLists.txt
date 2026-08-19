@@ -40,6 +40,7 @@ set(dependencies
 # (Each file registers itself via CO_DRIVER_REGISTER_SCORER.)
 set(scorer_sources
   src/scorers/external_score.cpp       # external score topics (sync skeleton)
+  src/scorers/localization_confidence.cpp  # confidence with nuisance terms excluded
   src/scorers/localization_state.cpp   # Lost/Converging/Tracking state gate
   src/scorers/recovery_gate.cpp        # return only after sustained full health
   src/scorers/confidence_trip.cpp      # early handover on sustained partial degradation

@@ -51,15 +51,35 @@
 // it will trip during good driving - lengthen trip_ms or lower trip_below
 // per track.
 //
-// Term diagnostics: newer producers append the five raw terms behind the
-// aggregate (data = [stamp_sec, stamp_nanosec, confidence, term_score,
+// Terms and ignore_terms: newer producers append the five raw terms behind
+// the aggregate (data = [stamp_sec, stamp_nanosec, confidence, term_score,
 // term_outlier, term_skip, term_spread, term_mass]; confidence = state
-// multiplier x min of the five). When the array carries them, the notes name
-// the limiting term, so status and the RViz marker show WHY the confidence
-// is low: term_mass = ambiguity (undiscriminated hypotheses - patience),
-// term_score/term_outlier = the match itself is bad, term_skip = unmapped or
-// dynamic obstacles (normal on busy tracks - do not read it as mismatch).
-// Diagnostics only; behavior does not depend on the terms.
+// multiplier x min of the five). When the array carries them, the trip judges
+//
+//     effective = min(terms not named in ignore_terms)
+//
+// instead of the aggregate, and the notes name the limiting term either way.
+//
+// This exists because one term is a nuisance meter rather than a pose-quality
+// meter. term_skip reports how many beams had to be masked out as unexplained
+// - i.e. how much unmapped or dynamic obstacle is in view - and on the
+// producer side that masking runs BEFORE scoring, so term_score and
+// term_outlier are computed on the surviving beams and stay at 1.000 through
+// heavy occlusion. Judging the aggregate therefore hands the car to the
+// fallback whenever another vehicle drives alongside, which is exactly the
+// moment not to switch controllers. Measured on a busan2 replay: two spurious
+// handovers, every pose term at 1.000 throughout.
+//
+// Excluding term_skip does NOT hide a real failure. The producer discards the
+// whole mask once more than half the beams disagree ("if most of it does not
+// match, we are probably lost"), and from that point term_score and
+// term_outlier collapse together - so genuine mismatch is caught by the terms
+// that remain. Keep term_spread in the judged set: it is the one that reacts
+// if occlusion ever does start costing pose accuracy.
+//
+// The term path only applies behind the Tracking gate, because the terms are
+// pre-multiplier values and only comparable to the bar where the multiplier
+// is 1.0. Without state_topic the scorer keeps judging the aggregate.
 #include <cmath>
 #include <mutex>
 #include <string>
@@ -68,6 +88,7 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 
+#include "co_driver/confidence_terms.hpp"
 #include "co_driver/scorer.hpp"
 
 namespace co_driver
@@ -83,6 +104,8 @@ public:
     index_ = jint(p, "index", 2);
     state_topic_ = jstr(p, "state_topic", "");
     trip_below_ = jnum(p, "trip_below", 0.50);
+    // Producer-specific term names, so no default: the config names them.
+    ignore_terms_ = jstrs(p, "ignore_terms");
     trip_ = jms(p, "trip_ms", 500.0);
     clear_ = jms(p, "clear_ms", 2500.0);
     timeout_ = jms(p, "timeout_ms", 300.0);
@@ -99,20 +122,8 @@ public:
           stamp_ = node_->now();
           has_msg_ = true;
         }
-        // Optional appended terms: name the smallest one for the notes.
-        limit_.clear();
-        if (msg->data.size() >= 8) {
-          static const char * kTerm[5] =
-          {"term_score", "term_outlier", "term_skip", "term_spread", "term_mass"};
-          int arg = 0;
-          for (int k = 1; k < 5; ++k) {
-            if (msg->data[3 + k] < msg->data[3 + arg]) {arg = k;}
-          }
-          // Prefer the producer's own label when the layout carries one.
-          const std::size_t slot = static_cast<std::size_t>(3 + arg);
-          limit_ = (slot < msg->layout.dim.size() && !msg->layout.dim[slot].label.empty()) ?
-            msg->layout.dim[slot].label : kTerm[arg];
-        }
+        // Optional appended terms; the decision itself is made in prepare().
+        readConfidenceTerms(*msg, &terms_, &term_labels_);
       }, opts);
 
     if (!state_topic_.empty()) {
@@ -129,9 +140,10 @@ public:
 
     RCLCPP_INFO(
       node->get_logger(),
-      "confidence trip '%s': < %.2f for %.0fms trips; >= %.2f for %.0fms clears%s",
+      "confidence trip '%s': < %.2f for %.0fms trips; >= %.2f for %.0fms clears%s%s",
       name.c_str(), trip_below_, trip_ * 1e3, trip_below_, clear_ * 1e3,
-      state_topic_.empty() ? "" : " (Tracking only)");
+      state_topic_.empty() ? "" : " (Tracking only)",
+      ignore_terms_.empty() ? "" : " (ignoring listed terms)");
     return true;
   }
 
@@ -151,11 +163,34 @@ public:
       low_for_ = high_for_ = 0.0;
       return;
     }
+    // What the trip judges: the aggregate, or - when the producer publishes
+    // the terms and the Tracking gate guarantees a multiplier of 1.0 - the
+    // smallest term that is not on the ignore list.
+    double effective = conf_;
+    limit_.clear();
+    limit_value_ = 0.0;
+    eff_limit_.clear();
+    obstacle_drag_ = false;
+    if (!state_topic_.empty()) {
+      double judged = 0.0;
+      std::string judged_label;
+      if (minJudgedTerm(
+          terms_, term_labels_, ignore_terms_, &judged, &judged_label,
+          &limit_value_, &limit_))
+      {
+        effective = judged;
+        eff_limit_ = judged_label;
+        // Worth surfacing: the aggregate looks bad only because of an ignored
+        // term, i.e. obstacles are in view but the pose is fine.
+        obstacle_drag_ = isIgnoredTerm(limit_, ignore_terms_) &&
+          limit_value_ < trip_below_ && effective >= trip_below_;
+      }
+    }
     // Missing or stale confidence counts as low - a silent localization is a
     // failed one, same policy as the score input.
     const bool low = !has_msg_ ||
       (timeout_ > 0.0 && (ctx.now - stamp_).seconds() > timeout_) ||
-      !std::isfinite(conf_) || conf_ < trip_below_;
+      !std::isfinite(effective) || effective < trip_below_;
     // One edge timestamp for both directions, stamped from ctx.now the first
     // time it is needed. Keeping two separately-initialised timestamps meant
     // one of them could be read before ever being assigned - a default
@@ -181,20 +216,28 @@ public:
   ScoreResult score(const Drive &, const Context &) override
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    char buf[96];
     if (tripped_) {
-      char buf[72];
       if (was_low_) {
         std::snprintf(
-          buf, sizeof(buf), "tripped: conf < %.2f for %.1fs%s%s", trip_below_, low_for_,
-          limit_.empty() ? "" : ", limit: ", limit_.c_str());
+          buf, sizeof(buf), "tripped: < %.2f for %.1fs%s%s", trip_below_, low_for_,
+          eff_limit_.empty() ? "" : ", limit: ", eff_limit_.c_str());
       } else {
         std::snprintf(buf, sizeof(buf), "tripped: clearing %.1f/%.1fs", high_for_, clear_);
       }
       return ScoreResult::ok(0.0, buf);
     }
     if (was_low_) {
-      char buf[64];
-      std::snprintf(buf, sizeof(buf), "low %.1f/%.1fs", low_for_, trip_);
+      std::snprintf(
+        buf, sizeof(buf), "low %.1f/%.1fs%s%s", low_for_, trip_,
+        eff_limit_.empty() ? "" : " ", eff_limit_.c_str());
+      return ScoreResult::ok(1.0, buf);
+    }
+    if (obstacle_drag_) {
+      // Healthy pose, obstacles in view - say so, or the low aggregate on the
+      // status stream looks like an unexplained near-miss.
+      std::snprintf(
+        buf, sizeof(buf), "obstacles: %s %.2f (not judged)", limit_.c_str(), limit_value_);
       return ScoreResult::ok(1.0, buf);
     }
     return ScoreResult::ok(1.0);
@@ -212,11 +255,16 @@ private:
   double trip_{0.5};
   double clear_{2.5};
   double timeout_{0.3};
+  std::vector<std::string> ignore_terms_;
 
   std::mutex mtx_;
   bool has_msg_{false};
   double conf_{0.0};
-  std::string limit_;
+  std::vector<double> terms_;
+  std::vector<std::string> term_labels_;
+  std::string limit_, eff_limit_;
+  double limit_value_{0.0};
+  bool obstacle_drag_{false};
   rclcpp::Time stamp_;
   bool has_state_{false};
   uint8_t state_{255};
