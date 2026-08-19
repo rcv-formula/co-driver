@@ -142,7 +142,9 @@ public:
     // and the recovery latch. Leaving Tracking resets the trip entirely.
     if (!state_topic_.empty() && !(has_state_ && state_ == 2)) {
       tripped_ = false;
-      was_low_ = false;
+      // Drop the dwell edge too: re-entering Tracking must start measuring
+      // from that moment, never from a timestamp taken before the excursion.
+      edge_valid_ = false;
       low_for_ = high_for_ = 0.0;
       return;
     }
@@ -151,17 +153,25 @@ public:
     const bool low = !has_msg_ ||
       (timeout_ > 0.0 && (ctx.now - stamp_).seconds() > timeout_) ||
       !std::isfinite(conf_) || conf_ < trip_below_;
-    if (low && !was_low_) {low_since_ = ctx.now;}
-    if (!low && was_low_) {high_since_ = ctx.now;}
-    was_low_ = low;
+    // One edge timestamp for both directions, stamped from ctx.now the first
+    // time it is needed. Keeping two separately-initialised timestamps meant
+    // one of them could be read before ever being assigned - a default
+    // rclcpp::Time carries the system clock, and subtracting it from the ROS
+    // clock throws, killing the node.
+    if (low != was_low_ || !edge_valid_) {
+      edge_ = ctx.now;
+      was_low_ = low;
+      edge_valid_ = true;
+    }
+    const double dwell = (ctx.now - edge_).seconds();
     if (low) {
-      low_for_ = (ctx.now - low_since_).seconds();
-      if (low_for_ >= trip_) {tripped_ = true;}
+      low_for_ = dwell;
       high_for_ = 0.0;
+      if (dwell >= trip_) {tripped_ = true;}
     } else {
       low_for_ = 0.0;
-      high_for_ = (ctx.now - high_since_).seconds();
-      if (tripped_ && high_for_ >= clear_) {tripped_ = false;}
+      high_for_ = dwell;
+      if (tripped_ && dwell >= clear_) {tripped_ = false;}
     }
   }
 
@@ -211,7 +221,8 @@ private:
   bool tripped_{false};
   double low_for_{0.0};
   double high_for_{0.0};
-  rclcpp::Time low_since_, high_since_;
+  bool edge_valid_{false};
+  rclcpp::Time edge_;
 };
 
 CO_DRIVER_REGISTER_SCORER(ConfidenceTripScorer, "confidence_trip")
