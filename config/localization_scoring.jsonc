@@ -52,6 +52,18 @@
       //                     noisy even when the pose is right); only a
       //                     sustained stay below the bar is a degradation.
       //                     Tolerance lives HERE, not in lowering the bar.
+      //
+      // Status of this trip, stated plainly: across all four replay scenes
+      // (38k Tracking samples) it fires ZERO times with ignore_terms applied.
+      // The longest stretch of genuinely degraded pose terms in the corpus is
+      // 90 ms - when localization goes wrong there it collapses and the state
+      // machine declares Lost within ~30 ms, which the state veto already
+      // handles in 7-19 ms. So the trip is an untested safety net, aimed at
+      // the "quietly wrong for a long time" case the user observed on a
+      // perceptually aliased course but which no recorded dataset contains.
+      // Judge it against that course when it is recorded; do not read the
+      // corpus silence as validation. (Before ignore_terms the same trip fired
+      // 11 times across the corpus - every one of them occlusion, not error.)
       //   clear_ms 2500   : the trip releases only after confidence has been
       //                     back above the bar for this long - time verifies
       //                     the recovery too, mirroring the recovery latch.
