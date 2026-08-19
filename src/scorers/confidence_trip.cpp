@@ -142,6 +142,9 @@ public:
     // and the recovery latch. Leaving Tracking resets the trip entirely.
     if (!state_topic_.empty() && !(has_state_ && state_ == 2)) {
       tripped_ = false;
+      // Clear the direction as well, or score() keeps reporting the pre-excursion
+      // "low ..." note for as long as the trip stays disengaged.
+      was_low_ = false;
       // Drop the dwell edge too: re-entering Tracking must start measuring
       // from that moment, never from a timestamp taken before the excursion.
       edge_valid_ = false;
