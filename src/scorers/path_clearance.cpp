@@ -64,6 +64,7 @@
 
 #include <sensor_msgs/msg/laser_scan.hpp>
 
+#include "co_driver/arc_geometry.hpp"
 #include "co_driver/scorer.hpp"
 
 namespace co_driver
@@ -153,8 +154,7 @@ private:
     const sensor_msgs::msg::LaserScan & scan, double delta, double horizon) const
   {
     if (scan.ranges.empty() || scan.angle_increment <= 0.0) {return horizon;}
-    const bool straight = std::abs(std::tan(delta)) < 1e-4;
-    const double radius = straight ? 0.0 : wheelbase_ / std::tan(delta);
+    const auto arc = ArcProjection::fromCommand(delta, wheelbase_, horizon, max_sweep_);
 
     double free_m = horizon;
     for (std::size_t i = 0; i < scan.ranges.size(); ++i) {
@@ -163,26 +163,9 @@ private:
       // evidence of free space, so they simply do not count.
       if (!std::isfinite(r) || r < scan.range_min || r > scan.range_max) {continue;}
       const double a = scan.angle_min + scan.angle_increment * static_cast<double>(i);
-      const double px = r * std::cos(a);
-      const double py = r * std::sin(a);
-
-      double lateral, along;
-      if (straight) {
-        lateral = std::abs(py);
-        along = px;
-      } else {
-        // Circle of the commanded arc is centred at (0, radius).
-        const double qx = px;
-        const double qy = py - radius;
-        double theta = std::atan2(qx / radius, -qy / radius);
-        if (theta < 0.0) {theta += 2.0 * M_PI;}   // only ahead, never behind
-        // Past the sweep cap we are no longer describing the near future.
-        if (theta > max_sweep_) {continue;}
-        along = std::abs(radius) * theta;
-        lateral = std::abs(std::hypot(qx, qy) - std::abs(radius));
-      }
-      if (along <= 0.0 || along >= free_m) {continue;}
-      if (lateral <= half_width_) {free_m = along;}
+      double along, lateral;
+      if (!arc.project(r * std::cos(a), r * std::sin(a), &along, &lateral)) {continue;}
+      if (along < free_m && lateral <= half_width_) {free_m = along;}
     }
     return free_m;
   }

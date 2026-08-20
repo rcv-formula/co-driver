@@ -48,6 +48,19 @@ set(scorer_sources
   src/scorers/example_async.cpp        # async skeleton for heavy computations
 )
 
+# Obstacle avoidance needs the detector's message package. It is optional so
+# that this package still builds without it; the scorer type simply does not
+# exist, and a config asking for it fails at startup with the list of types
+# that do.
+find_package(obstacle_context_msgs QUIET)
+if(obstacle_context_msgs_FOUND)
+  list(APPEND scorer_sources src/scorers/obstacle_avoid.cpp)
+  list(APPEND dependencies obstacle_context_msgs)
+  message(STATUS "co_driver: obstacle_context_msgs found - building obstacle_avoid")
+else()
+  message(STATUS "co_driver: obstacle_context_msgs not found - skipping obstacle_avoid")
+endif()
+
 add_executable(co_driver_node
   src/co_driver_node.cpp   # main node - ROS wiring
   src/config.cpp           # config - yaml + topic-list JSON

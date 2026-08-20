@@ -121,6 +121,70 @@
     },
 
     {
+      // Obstacle avoidance, from the detector's clustered output rather than
+      // the raw scan. Same question as clearance, better evidence: clusters
+      // wider than 3 m (long walls) are dropped by the detector and never
+      // arrive here, which /scan alone cannot do.
+      //
+      // Requires obstacle_context_msgs at build time and /obstacle_clusters at
+      // run time. Without either, the input reports unavailable and, at
+      // weight 0, the arbitration behaves exactly as if it were not configured.
+      //
+      // Trusted fields only: the detector measures its cluster geometry at
+      // 0.77 cm inter-scan residual, but its motion estimates read 1-4 m/s on
+      // static objects while driving, so speed / velocity / motion_label are
+      // all ignored. See the header of src/scorers/obstacle_avoid.cpp.
+      //
+      // The knob here is a distance along the path, not a braking margin:
+      // this fires on objects worth going around, while path_clearance asks
+      // the last-moment question of whether there is still room. Neither is
+      // tuned on track yet, and they should be tuned together, since a false
+      // positive in either hands the car over.
+      "name": "obstacles",
+      "type": "obstacle_avoid",
+      "params": {
+        "topic": "/obstacle_clusters",
+        "wheelbase": 0.324,
+        "vehicle_half_width": 0.18,
+        // Extra room either side of the vehicle when deciding "on the path".
+        // 0.55 m is from the 0813 recording: the three real objects on that
+        // track are only caught from 0.50 m upward, and 0.50-0.60 m all give
+        // the same result, so this sits in the middle of the verified band.
+        // Avoidance wants more room than "will just barely miss" - this is not
+        // the last-moment check, that is path_clearance.
+        "lateral_margin_m": 0.55,
+        // an obstacle anywhere on the commanded path within this much travel
+        // is reason to go around it (bounded, so it stays sane at any speed)
+        "trigger_time": 1.5,
+        "min_trigger_m": 1.0,
+        "max_trigger_m": 4.0,
+        "max_sweep_deg": 90.0,
+        "min_speed": 0.2,
+        // Wall-labelled clusters are skipped - but the detector only considers
+        // the label at 1.0 m and wider, so a wall fragment or guard-rail
+        // section narrower than that arrives as an ordinary obstacle and will
+        // be avoided. The fixed structure 0.75 m off the right flank in the
+        // 0813 recording is 0.91 m wide and can never be labelled. This is a
+        // partial filter, not wall rejection.
+        "ignore_wall_static": true,
+        // Clusters wider than this are structure, not obstacles to go around.
+        // The detector only applies its wall label at 1.0 m and wider, so
+        // 0.6-1.0 m fragments arrive unlabelled - and on the 0813 recording
+        // that is exactly what this scorer detected on its first pass: two
+        // handovers on a 0.97 m, 280-point structure beside the car, and none
+        // on the three real objects (0.13-0.20 m, 9-10 points). With this set,
+        // the same run gives 3 handovers, all three real, none false.
+        // Cost: a genuinely wide obstacle is ignored. Raise it if the track
+        // has any, but stay below the detector's 1.0 m labelling threshold.
+        "max_width_m": 0.6,
+        "min_point_count": 0,
+        "block_ms": 200,
+        "clear_ms": 700,
+        "timeout_ms": 500
+      }
+    },
+
+    {
       // Return latch - keeps pp_main out until localization has been fully
       // healthy for a sustained stretch (conditions in localization_scoring.jsonc).
       "name": "recovery",
@@ -155,7 +219,9 @@
         // geometry veto: the commanded path runs into something solid.
         // Only pp_main carries it - vetoing every candidate at once would
         // leave nothing to drive with and fall through to timeout_stop.
-        "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
+        "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
+        // obstacle veto: a detected obstacle sits on the commanded path
+        "obstacles": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
       }
     },
     {
