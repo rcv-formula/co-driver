@@ -56,8 +56,20 @@ struct ArcProjection
     } else {
       const double qx = px;
       const double qy = py - radius;
-      double theta = std::atan2(qx / radius, -qy / radius);
-      if (theta < 0.0) {theta += 2.0 * M_PI;}
+      // Signed heading change to reach the point, in the same sign convention
+      // as radius: positive for a left turn, negative for a right one.
+      const double t = std::atan2(qx / radius, -qy / radius);
+      // Travelling forward moves the heading in the direction of the turn, so
+      // anything whose sign disagrees with radius is BEHIND the vehicle.
+      //
+      // This used to normalise a negative t by adding 2*pi, which is only
+      // correct for a left turn. On a right turn every forward point has t < 0
+      // by construction, so it became ~2*pi - |t|, always exceeded max_sweep,
+      // and project() rejected it. path_clearance and obstacle_avoid were
+      // therefore blind for the whole of every right-hand turn - silently,
+      // reporting "clear" rather than "no data".
+      if (t * radius < 0.0) {return false;}
+      const double theta = std::abs(t);
       if (theta > max_sweep) {return false;}
       a = std::abs(radius) * theta;
       l = std::abs(std::hypot(qx, qy) - std::abs(radius));

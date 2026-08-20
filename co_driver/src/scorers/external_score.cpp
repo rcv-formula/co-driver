@@ -163,10 +163,25 @@ private:
       const auto si = static_cast<std::size_t>(stamp_indices_[0]);
       const auto ni = static_cast<std::size_t>(stamp_indices_[1]);
       if (si < data_.size() && ni < data_.size()) {
-        stamp_ = rclcpp::Time(
-          static_cast<int64_t>(data_[si]), static_cast<uint32_t>(data_[ni]),
-          node_->get_clock()->get_clock_type());
-        stamped = true;
+        const double sec = data_[si], nsec = data_[ni];
+        // These come straight off the wire. rclcpp::Time throws on a negative
+        // time point, and this runs in a subscription callback - under the
+        // MultiThreadedExecutor an escaping exception is std::terminate, i.e.
+        // the whole arbiter dies mid-run with no /drive. A malformed stamp is
+        // not worth the car; fall back to arrival time.
+        if (std::isfinite(sec) && std::isfinite(nsec) &&
+          sec >= 0.0 && sec <= 4.0e18 && nsec >= 0.0 && nsec < 2.0e9)
+        {
+          stamp_ = rclcpp::Time(
+            static_cast<int64_t>(sec), static_cast<uint32_t>(nsec),
+            node_->get_clock()->get_clock_type());
+          stamped = true;
+        } else {
+          RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "'%s': stamp slots carry %.3f/%.3f - not a usable time; using arrival time.",
+            name().c_str(), sec, nsec);
+        }
       }
     }
     if (!stamped) {stamp_ = node_->now();}
