@@ -26,6 +26,18 @@
 // vehicle wide subtends about 74 degrees at 5 cm, so an angular test would let
 // any close return anywhere in front veto every possible command.
 //
+// The projection stops after max_sweep_deg of heading change. A command is a
+// snapshot, not a trajectory: at full lock the arc is a 30 cm circle, so
+// following it far enough curls the corridor around into whatever is beside or
+// behind the car, and the check stops answering "am I about to drive into
+// something" and starts answering "if I pirouette, will I clip my own tail".
+// On the 0813 recording that produced two vetoes totalling 2.3 s from a fixed
+// object 0.75 m off the right flank, reached only after 140 degrees of sweep,
+// while the detector and the raw scan both showed the path ahead open at
+// 2.86 m. Any cap at or below 120 degrees removes them; gentle steering
+// sweeps only a few degrees over the whole horizon, so normal driving is
+// untouched.
+//
 // Blocked and clear are both sustained, for the same reason the confidence
 // trip sustains: one noisy sweep is not evidence. block_ms is short because
 // this fires late by nature - the car is already pointed at the obstacle.
@@ -72,6 +84,7 @@ public:
     step_ = std::max(0.02, jnum(p, "step_m", 0.05));
     min_clearance_ = jnum(p, "min_clearance_m", 0.8);
     min_speed_ = jnum(p, "min_speed", 0.2);
+    max_sweep_ = jnum(p, "max_sweep_deg", 90.0) * M_PI / 180.0;
     block_ = jms(p, "block_ms", 200.0);
     clear_ = jms(p, "clear_ms", 700.0);
     timeout_ = jms(p, "timeout_ms", 500.0);
@@ -90,8 +103,10 @@ public:
 
     RCLCPP_INFO(
       node->get_logger(),
-      "path clearance '%s' <- %s (block below %.2fm sustained %.0fms)",
-      name.c_str(), topic_.c_str(), min_clearance_, block_ * 1e3);
+      "path clearance '%s' <- %s (block below %.2fm sustained %.0fms, "
+      "sweep capped at %.0fdeg)",
+      name.c_str(), topic_.c_str(), min_clearance_, block_ * 1e3,
+      max_sweep_ * 180.0 / M_PI);
     return true;
   }
 
@@ -161,6 +176,8 @@ private:
         const double qy = py - radius;
         double theta = std::atan2(qx / radius, -qy / radius);
         if (theta < 0.0) {theta += 2.0 * M_PI;}   // only ahead, never behind
+        // Past the sweep cap we are no longer describing the near future.
+        if (theta > max_sweep_) {continue;}
         along = std::abs(radius) * theta;
         lateral = std::abs(std::hypot(qx, qy) - std::abs(radius));
       }
@@ -223,6 +240,7 @@ private:
   double step_{0.05};
   double min_clearance_{0.8};
   double min_speed_{0.2};
+  double max_sweep_{M_PI / 2.0};
   double block_{0.2};
   double clear_{0.7};
   double timeout_{0.5};

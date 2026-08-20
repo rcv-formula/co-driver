@@ -105,6 +105,14 @@
         "min_clearance_m": 0.8,
         // a crawling command cannot run into anything soon
         "min_speed": 0.2,
+        // stop projecting after this much heading change - a command is a
+        // snapshot, not a trajectory. At full lock the arc is a 30 cm circle,
+        // and following it further curls the corridor into whatever is beside
+        // or behind the car (measured: two vetoes on the 0813 run from an
+        // object off the right flank, reached only after 140 degrees of sweep,
+        // with the path ahead open at 2.86 m). Gentle steering sweeps only a
+        // few degrees, so normal driving is unaffected.
+        "max_sweep_deg": 90.0,
         // one noisy sweep is not evidence; clearing is slower than blocking
         "block_ms": 200,
         "clear_ms": 700,
