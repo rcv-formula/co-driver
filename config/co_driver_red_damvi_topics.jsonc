@@ -75,6 +75,44 @@
     },
 
     {
+      // Geometry check, independent of localization: project pp_main's own
+      // command along the commanded arc and see whether the live scan says
+      // something solid is in the way.
+      //
+      // This is the only detector that survives a confidently wrong pose. If
+      // global search attaches to the wrong branch of a fork, the straight
+      // walls still match and the disagreeing sector is masked out by the
+      // producer (zero particle consensus), so the whole disagreement lands in
+      // term_skip - which the score deliberately excludes to stay immune to
+      // passing vehicles. Confidence therefore reads healthy while the
+      // raceline controller steers into the wrong branch.
+      //
+      // Its parameters are vehicle geometry and stopping distance rather than
+      // localization tuning, so they sit here rather than in
+      // localization_scoring.jsonc. wheelbase and vehicle_half_width match
+      // gap_follow's own config (0.324 / 0.18).
+      "name": "clearance",
+      "type": "path_clearance",
+      "params": {
+        "topic": "/scan",
+        "wheelbase": 0.324,
+        "vehicle_half_width": 0.18,
+        // how far ahead to look: lookahead_time x speed, bounded
+        "lookahead_time": 1.0,
+        "min_lookahead_m": 0.5,
+        "max_lookahead_m": 3.0,
+        // below this much free path along the command, the drive is blocked
+        "min_clearance_m": 0.8,
+        // a crawling command cannot run into anything soon
+        "min_speed": 0.2,
+        // one noisy sweep is not evidence; clearing is slower than blocking
+        "block_ms": 200,
+        "clear_ms": 700,
+        "timeout_ms": 500
+      }
+    },
+
+    {
       // Return latch - keeps pp_main out until localization has been fully
       // healthy for a sustained stretch (conditions in localization_scoring.jsonc).
       "name": "recovery",
@@ -105,7 +143,11 @@
         // early-degradation trip (see localization_scoring.jsonc); veto only
         "loc_trip": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // return latch (see localization_scoring.jsonc); weight 0 = veto only
-        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
+        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
+        // geometry veto: the commanded path runs into something solid.
+        // Only pp_main carries it - vetoing every candidate at once would
+        // leave nothing to drive with and fall through to timeout_stop.
+        "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
       }
     },
     {
