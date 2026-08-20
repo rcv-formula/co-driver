@@ -118,8 +118,15 @@ public:
       return setState(drive.name, ctx, true, max_lookahead_, "below min_speed");
     }
 
-    const double horizon = std::clamp(
-      lookahead_time_ * std::abs(v), min_lookahead_, max_lookahead_);
+    // Never look less far than the clearance we demand. freeDistance reports
+    // the horizon when nothing blocks, so a horizon shorter than
+    // min_clearance_m would read as "blocked" on an empty scan - which at
+    // 0.2-0.8 m/s vetoed the drive continuously regardless of what the lidar
+    // saw. Measured on the 0813 recording: 9 of 11 vetoes came from this
+    // alone, on 361 frames that had no return on the path at all.
+    const double horizon = std::max(
+      std::clamp(lookahead_time_ * std::abs(v), min_lookahead_, max_lookahead_),
+      min_clearance_);
     const double free_m = freeDistance(*scan, delta, horizon);
     return setState(drive.name, ctx, free_m >= min_clearance_, free_m, "");
   }
