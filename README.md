@@ -2,6 +2,18 @@
 
 Arbitrates multiple `/drive` candidates by score, post-processes the winner, publishes it to `/drive`.
 
+## Layout
+
+    co_driver/               the node
+    obstacle_context_msgs/   cluster message definitions, vendored
+
+`obstacle_context_msgs` is owned by the obstacle detector and copied here so
+this repository builds and runs on its own. The node links its typesupport
+library, so a build made where the package exists will not start where it does
+not - it fails in the dynamic linker, before `main()`. Keep the `.msg` files
+byte-identical to the detector's, or publisher and subscriber stop matching
+with no error reported.
+
 ## Build
 
 ```bash

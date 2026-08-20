@@ -52,14 +52,17 @@ set(scorer_sources
 # that this package still builds without it; the scorer type simply does not
 # exist, and a config asking for it fails at startup with the list of types
 # that do.
-find_package(obstacle_context_msgs QUIET)
-if(obstacle_context_msgs_FOUND)
-  list(APPEND scorer_sources src/scorers/obstacle_avoid.cpp)
-  list(APPEND dependencies obstacle_context_msgs)
-  message(STATUS "co_driver: obstacle_context_msgs found - building obstacle_avoid")
-else()
-  message(STATUS "co_driver: obstacle_context_msgs not found - skipping obstacle_avoid")
-endif()
+# obstacle_context_msgs ships in this repository, next to this package.
+#
+# It used to be an optional find: absent -> obstacle_avoid quietly dropped. That
+# was wrong in the worst way. The node still LINKS the typesupport library once
+# it has been built against it, so a binary built on a machine that had the
+# package dies on a machine that does not - in the dynamic linker, before
+# main(), with "cannot open shared object file". No node, no /drive, no status,
+# and nothing driving the car. Vendoring the definitions makes it unconditional.
+find_package(obstacle_context_msgs REQUIRED)
+list(APPEND scorer_sources src/scorers/obstacle_avoid.cpp)
+list(APPEND dependencies obstacle_context_msgs)
 
 add_executable(co_driver_node
   src/co_driver_node.cpp   # main node - ROS wiring

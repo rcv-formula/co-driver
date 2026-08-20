@@ -516,10 +516,45 @@ private:
       }
       auto s = ScorerRegistry::instance().create(in.type);
       if (!s) {
+        // An unknown type is nearly always an optional scorer whose message
+        // package is absent on this machine - obstacle_avoid needs
+        // obstacle_context_msgs, and CMake drops the whole file when it is not
+        // found. Refusing to start here takes the ENTIRE arbitration down: no
+        // /drive, no /co_driver_node/status, and a car with nothing driving it.
+        // Coming up without that one input is strictly safer, so do that and
+        // make the degradation impossible to miss.
         std::string known;
         for (const auto & t : ScorerRegistry::instance().types()) {known += t + " ";}
-        *error = "input '" + in.name + "': unknown type '" + in.type + "'. Available: " + known;
-        return false;
+        RCLCPP_ERROR(
+          get_logger(),
+          "input '%s': unknown type '%s' - starting WITHOUT it. Available: %s",
+          in.name.c_str(), in.type.c_str(), known.c_str());
+        // Neutralise it everywhere so it cannot disqualify a drive it can no
+        // longer judge, and so `missing: mask` does not rescale the logit by a
+        // weight nothing is contributing. This does NOT restore the
+        // calibration: a weight that was compensated by a drive's bias leaves
+        // that bias behind, biased toward the fallback. Say so, per drive.
+        for (auto & spec : cfg_.drives) {
+          auto inf = spec.influence.find(in.name);
+          if (inf == spec.influence.end()) {continue;}
+          const bool weighted = std::abs(inf->second.weight) > 1e-12;
+          const bool vetoing = inf->second.veto_below >= 0.0;
+          inf->second.weight = 0.0;
+          inf->second.veto_below = -1.0;
+          inf->second.required = false;
+          if (weighted || vetoing) {
+            RCLCPP_ERROR(
+              get_logger(),
+              "  drive '%s' scored input '%s' (weight %.2f%s). It is now inert, "
+              "but drive bias %.2f was calibrated WITH it - the handover "
+              "thresholds have moved. Load a config that drops this input and "
+              "restores the uncompensated bias before trusting this run.",
+              spec.name.c_str(), in.name.c_str(), inf->second.weight,
+              vetoing ? ", vetoing" : "", spec.bias);
+          }
+        }
+        missing_inputs_.push_back(in.name + " (" + in.type + ")");
+        continue;
       }
       s->setContext(in.name, in.type, scorer_group_);
       // The scorer creates its own subscriptions here.
@@ -811,6 +846,9 @@ private:
     double hold{0.5};
   };
   std::vector<ScorerEntry> scorers_;
+  // Inputs whose scorer type was never registered - the optional message
+  // package they need is absent on this machine. Kept for the status stream.
+  std::vector<std::string> missing_inputs_;
   // Diagnostics: age [s] of scores filled from cache this cycle (negative otherwise)
   std::map<std::string, std::map<std::string, double>> held_age_;
   std::vector<Drive> drives_;

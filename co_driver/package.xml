@@ -27,7 +27,7 @@
   <depend>nlohmann-json-dev</depend>
 
   <!-- optional: enables the obstacle_avoid scorer when present -->
-  <exec_depend>obstacle_context_msgs</exec_depend>
+  <depend>obstacle_context_msgs</depend>
 
   <exec_depend>ros2launch</exec_depend>
 

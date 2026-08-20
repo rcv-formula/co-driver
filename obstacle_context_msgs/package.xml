@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>obstacle_context_msgs</name>
+  <version>0.0.1</version>
+  <description>
+    Custom messages for obstacle cluster tracking.
+
+    Vendored copy. The definitions are owned by the obstacle detector
+    (dynamic_obstacle_detector); this copy exists so co_driver builds and runs
+    on a vehicle that does not carry the detector's workspace. Without it,
+    CMake drops obstacle_avoid, the config still names that scorer type, and
+    the node used to refuse to start - no /drive, no status, nothing driving
+    the car.
+
+    Keep byte-identical to the detector's definitions. The two must generate
+    the same type hash or publisher and subscriber silently stop matching, and
+    nothing reports an error - the topic simply carries no data. If the
+    detector changes a field, copy the .msg files across in the same change.
+  </description>
+
+  <maintainer email="kjh0212031@gmail.com">kjh</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>std_msgs</depend>
+
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
