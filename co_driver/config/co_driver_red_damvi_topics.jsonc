@@ -329,7 +329,20 @@
         // geometry veto: the commanded path runs into something solid.
         // Only pp_main carries it - vetoing every candidate at once would
         // leave nothing to drive with and fall through to timeout_stop.
-        "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
+        // VETO DISABLED (-1 = off). Measured on the vehicle: path_clearance
+        // disqualified pp_main in 216 of 522 status samples - 41% of the run -
+        // while the same scorer fired ZERO times across the whole 0813 replay.
+        // A gate that quiet in replay and that loud on the car is not measuring
+        // what it claims to. It is also known-broken: the arc projection
+        // normalised the sweep angle for a left turn only, so on every
+        // right-hand turn it saw nothing at all and reported "clear" rather
+        // than "no data" - meaning even the 41% is half-blind.
+        //
+        // It stays wired and keeps reporting, so its distance still appears in
+        // the status and the RViz markers and can be judged against what the
+        // car actually did. It just cannot disqualify a drive until the
+        // geometry is fixed AND validated against a vehicle recording.
+        "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0},
         // Obstacles enter as a SCORE, not a gate. The input reports how clear
         // the commanded path is (1 = nothing to avoid, 0 = must avoid), and
         // the weight turns that into a contribution the softmax weighs.
@@ -351,7 +364,16 @@
       // it step aside once confidence recovers (z = 1.0 - 1.5*phi).
       "name": "gap_follow",
       "topic": "/drive_gf",
-      "hold_ms": 200,
+      // The fallback needs the LOOSEST hold in the config, not the tightest.
+      // It was 200 ms while pp_main sat at 450, so the drive that exists to
+      // catch every other failure was the first to be disqualified by a
+      // dropped message. gap_follow is reactive on /scan: on a 10-20 Hz lidar
+      // 200 ms is two to four publish periods, and the same jitter that forced
+      // pp_main up from 300 ms takes it out. Whenever that coincided with
+      // pp_main being vetoed - which is the normal state during a handover -
+      // there was no valid drive at all, /co_driver_node/selected went empty
+      // and timeout_stop braked the car.
+      "hold_ms": 500,
       "bias": 1.0,
       "enabled": true,
       "influence": {

@@ -12,6 +12,7 @@
 // Evaluation (may be slow) and output (fixed 100Hz) run on separate timers, so
 // heavy scoring cannot disturb the output rate.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -135,7 +136,16 @@ private:
         }
       }
       r.reason = "no valid drive";
-      current_.clear();
+      // current_ is deliberately NOT cleared. It is the memory of who was
+      // driving, and a gap in validity is not a handover. Clearing it made the
+      // next tick re-commit the SAME drive with switched=true, which re-armed
+      // switch_blend (dragging the output through a 300 ms ramp from whatever
+      // timeout_stop had decelerated to) and reset last_switch_, locking out a
+      // genuine score-margin handover for a full switch_cooldown afterwards.
+      // One missed 20 ms tick was enough. Externally that reads exactly as the
+      // command coming out shoved and delayed, with nothing selected in
+      // between. Keeping it costs nothing: a drive can only be selected while
+      // it is valid, so a stale incumbent still cannot drive.
       return r;
     }
 
@@ -489,12 +499,18 @@ public:
       });
 
     using namespace std::chrono;
+    // Both ticks are wrapped. MultiThreadedExecutor dispatches callbacks onto
+    // worker std::threads, where an escaping exception is std::terminate - not
+    // something main()'s try/catch can ever see. For an arbiter whose entire
+    // safety story is "keep publishing, decelerate on timeout", losing the
+    // process is the worst available outcome: better to drop one tick, say so,
+    // and keep the output alive.
     eval_timer_ = create_wall_timer(
       duration_cast<nanoseconds>(duration<double>(1.0 / std::max(1.0, cfg_.evaluation_rate_hz))),
-      [this]() {evaluationTick();}, eval_group_);
+      [this]() {guarded("evaluation", [this]() {evaluationTick();});}, eval_group_);
     output_timer_ = create_wall_timer(
       duration_cast<nanoseconds>(duration<double>(1.0 / std::max(1.0, cfg_.output.rate_hz))),
-      [this]() {outputTick();}, output_group_);
+      [this]() {guarded("output", [this]() {outputTick();});}, output_group_);
 
     RCLCPP_INFO(
       get_logger(), "co_driver up: %zu scorers x %zu drives -> %s (eval %.0fHz / output %.0fHz)",
@@ -627,41 +643,109 @@ private:
   // -------------------------------------------------------------------------
   // Score -> compute -> select
   // -------------------------------------------------------------------------
+  // Scoring runs on a SNAPSHOT, with no node lock held.
+  //
+  // It used to run inside one lock_guard that covered prepare() and every
+  // score() call for every drive. The callback groups made it look decoupled -
+  // eval, output and the scorer subscriptions each have their own - but they
+  // all take this same mutex, so the split bought nothing: outputTick() and the
+  // /drive_main // /drive_gf callbacks queued behind the whole scoring pass.
+  // The heavy work lives in score(): a full arc projection over the scan and
+  // over every cluster, once PER DRIVE. On a vehicle with few cores that is
+  // long enough for the 100 Hz output timer to miss firings, and /drive
+  // disappears in stretches while the node is still perfectly alive.
+  //
+  // Now the lock is held only to take a consistent copy and to write the result
+  // back - microseconds either side. The scorers see a snapshot that is at most
+  // one scoring pass old, which is also more consistent than before, where a
+  // command could change halfway through a drive's own scoring.
+  // Run one tick, swallowing anything it throws. A scorer is third-party code
+  // as far as this node is concerned; a bad message should cost a cycle, not
+  // the vehicle. Throttled so a persistent fault is visible without flooding.
+  template<typename F>
+  void guarded(const char * what, F && f)
+  {
+    try {
+      f();
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "%s tick threw (%s) - skipping this cycle. The output keeps running; "
+        "if this repeats, a scorer is faulting on its input.", what, e.what());
+    } catch (...) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "%s tick threw a non-std exception - skipping this cycle.", what);
+    }
+  }
+
   void evaluationTick()
   {
     const rclcpp::Time t = now();
     Selector::Result sel;
 
+    std::vector<Drive> snap;
+    Context ctx;
     {
       std::lock_guard<std::mutex> lock(mtx_);
-
       ctx_.now = t;
       ctx_.dt = eval_t_valid_ ? std::max(0.0, (t - last_eval_).seconds()) : 0.0;
       last_eval_ = t;
       eval_t_valid_ = true;
-      ctx_.drives = &drives_;
       ctx_.has_last_output = has_output_;
       ctx_.last_output = output_;
       ctx_.last_selected = selector_.current();
+      snap = drives_;
+      ctx = ctx_;
+    }
+    ctx.drives = &snap;
 
-      for (auto & e : scorers_) {e.scorer->prepare(ctx_, drives_);}
-
-      for (auto & d : drives_) {
-        d.results.clear();
-        if (d.enabled) {
-          for (auto & e : scorers_) {
-            // Zero-weight inputs are scored too -- needed for veto and status display.
-            // If an async scorer reports pending, the previous score substitutes for hold.
-            const auto & name = e.scorer->name();
-            double held = -1.0;
-            d.results[name] =
-              resolveScore(d, name, e.scorer->score(d, ctx_), e.hold, t, &held);
-            held_age_[d.name][name] = held;
-          }
+    // ---- unlocked: the expensive part ----
+    const auto t0 = std::chrono::steady_clock::now();
+    std::map<std::string, std::map<std::string, double>> held_age;
+    for (auto & e : scorers_) {e.scorer->prepare(ctx, snap);}
+    for (auto & d : snap) {
+      d.results.clear();
+      if (d.enabled) {
+        for (auto & e : scorers_) {
+          // Zero-weight inputs are scored too -- needed for veto and status display.
+          // If an async scorer reports pending, the previous score substitutes for hold.
+          const auto & name = e.scorer->name();
+          double held = -1.0;
+          d.results[name] =
+            resolveScore(d, name, e.scorer->score(d, ctx), e.hold, t, &held);
+          held_age[d.name][name] = held;
         }
-        computeLogit(d, cfg_.scoring, t);
       }
-      finalizeScores(drives_, cfg_.scoring);
+      computeLogit(d, cfg_.scoring, t);
+    }
+    finalizeScores(snap, cfg_.scoring);
+    const double score_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      // Merge back only what scoring produced. Reception state (cmd, last_rx,
+      // has_cmd, the rate EMA) belongs to the subscription callbacks, which were
+      // free to run while this pass was unlocked - copying the snapshot wholesale
+      // would throw away commands that arrived meanwhile.
+      for (auto & d : drives_) {
+        auto it = std::find_if(
+          snap.begin(), snap.end(), [&d](const Drive & s) {return s.name == d.name;});
+        if (it == snap.end()) {continue;}
+        d.results = std::move(it->results);
+        d.score_cache = std::move(it->score_cache);
+        d.raw_logit = it->raw_logit;
+        d.logit = it->logit;
+        d.logit_initialized = it->logit_initialized;
+        d.score = it->score;
+        d.active = it->active;
+        d.valid = it->valid;
+        d.reject = it->reject;
+      }
+      held_age_ = std::move(held_age);
+      eval_ms_ = score_ms;
+      eval_ms_max_ = std::max(eval_ms_max_, score_ms);
 
       sel = selector_.select(drives_, t);
       have_command_ = sel.has_selection;
@@ -769,6 +853,11 @@ private:
        << ",\"reason\":\"" << esc(sel.reason) << "\""
        << ",\"switched\":" << (sel.switched ? "true" : "false")
        << ",\"combine\":\"" << esc(cfg_.scoring.combine) << "\""
+       // Cost of the scoring pass. If eval_ms approaches the evaluation period
+       // the stack is too heavy for its rate - visible here rather than as an
+       // unexplained stutter on /drive.
+       << ",\"eval_ms\":" << num(eval_ms_)
+       << ",\"eval_ms_max\":" << num(eval_ms_max_)
        << ",\"temperature\":" << num(cfg_.scoring.temperature)
        << ",\"drives\":[";
     for (std::size_t i = 0; i < drives_.size(); ++i) {
@@ -851,6 +940,9 @@ private:
   std::vector<std::string> missing_inputs_;
   // Diagnostics: age [s] of scores filled from cache this cycle (negative otherwise)
   std::map<std::string, std::map<std::string, double>> held_age_;
+  // Cost of one scoring pass, in ms. Published in the status so a stack that
+  // is too slow for its evaluation rate is visible instead of guessed at.
+  double eval_ms_{0.0}, eval_ms_max_{0.0};
   std::vector<Drive> drives_;
   Selector selector_;
   PostProcess post_;
