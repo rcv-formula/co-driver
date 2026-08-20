@@ -84,6 +84,16 @@ class StatusMarkers(Node):
     def now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
+    @staticmethod
+    def _note(drive, key):
+        e = (drive.get("inputs") or {}).get(key)
+        return (e or {}).get("note", "") if isinstance(e, dict) else ""
+
+    @staticmethod
+    def _x(drive, key):
+        e = (drive.get("inputs") or {}).get(key)
+        return e.get("x") if isinstance(e, dict) else None
+
     def reason_line(self, st):
         """One line saying which pathway is in charge right now."""
         pp = next((d for d in st["drives"] if d["name"] == "pp_main"), None)
@@ -93,12 +103,32 @@ class StatusMarkers(Node):
         if "veto_below[loc_state]" in rej:
             return "STATE VETO: Lost / no map"
         if "veto_below[recovery]" in rej:
-            note = (pp.get("inputs", {}).get("recovery") or {})
-            n = note.get("note", "") if isinstance(note, dict) else ""
-            return f"recovery gate: {n or 'waiting for sustained health'}"
+            return f"recovery gate: {self._note(pp, 'recovery') or 'waiting'}"
+        if "veto_below[obstacles]" in rej:
+            return f"OBSTACLE: {self._note(pp, 'obstacles')}"
+        if "veto_below[clearance]" in rej:
+            return f"PATH BLOCKED: {self._note(pp, 'clearance')}"
         if rej:
             return rej
         return st.get("reason", "")
+
+    def obstacle_line(self, st):
+        """What the obstacle input is saying, even when it is not deciding.
+
+        The point of watching this on screen is to see the demand build and
+        fade, not only the moment it wins - a handover that looks wrong is
+        usually a demand that was already visible seconds earlier.
+        """
+        pp = next((d for d in st["drives"] if d["name"] == "pp_main"), None)
+        if pp is None:
+            return ""
+        x = self._x(pp, "obstacles")
+        note = self._note(pp, "obstacles")
+        if x is None:
+            return ""
+        demand = max(0.0, 1.0 - x)
+        bar = "#" * int(round(demand * 10)) + "." * (10 - int(round(demand * 10)))
+        return f"obstacle [{bar}] {demand:.2f}  {note}"
 
     def tick(self):
         if self.st is None:
@@ -124,8 +154,11 @@ class StatusMarkers(Node):
                 conf = f"conf {e['x']:.2f}  "
                 break
         lines = [f"> {sel or 'NO DRIVE'}",
-                 self.reason_line(st),
-                 f"{conf}p: {probs}"]
+                 self.reason_line(st)]
+        ob = self.obstacle_line(st)
+        if ob:
+            lines.append(ob)
+        lines.append(f"{conf}p: {probs}")
         t_now = self.now()
         for tw, frm, to, why in reversed(self.switches):
             lines.append(

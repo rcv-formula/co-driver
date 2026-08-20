@@ -54,6 +54,12 @@ ros2 run co_driver drive_monitor.py   # who is driving, switches, oscillation ve
 ros2 topic echo /co_driver_node/status   # full per-drive scores as JSON
 ```
 
+## Testing
+
+Stand-ins that fabricate vehicle input - dummy drive commands, synthetic
+confidence - are not part of this package, so nothing that invents controller
+or sensor data can be installed onto a car by accident.
+
 ## Add a scorer
 
 Copy `src/scorers/external_score.cpp`, add the file to `scorer_sources` in `CMakeLists.txt`, add an entry to the topics JSON `inputs`.

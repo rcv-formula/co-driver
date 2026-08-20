@@ -176,9 +176,71 @@
         "lateral_margin_m": 0.55,
         // an obstacle anywhere on the commanded path within this much travel
         // is reason to go around it (bounded, so it stays sane at any speed)
+        //
+        // The two bounds were widened after the 0813 joint run. They exist to
+        // keep the window sane at the speed extremes, but set too tight they
+        // close the graded band entirely, and the demand becomes a step:
+        // measured over 18337 status samples, NOT ONE fell in the graded
+        // 0.01-0.85 range - every non-zero sample was already past the veto.
+        // At that run's 0.6-1.7 m/s the old min_trigger 1.0 clamped the
+        // trigger while full urgency floated free, leaving well under half a
+        // metre between "noticed" and "committed". The old max_trigger 4.0
+        // does the same at the other end: past ~2.7 m/s the trigger stops
+        // growing while full urgency keeps up with speed, and the band closes
+        // again. 2.0 / 6.0 keeps at least ~1.2 m of graded approach from
+        // 0.5 m/s to 6 m/s.
+        //
+        // This changes nothing in the mid range: at 2.5 m/s the trigger is
+        // 1.5 x v = 3.75 m either way, so the commit distance the regression
+        // suite pins (2.0 m static / deferred dynamic) is untouched.
         "trigger_time": 1.5,
-        "min_trigger_m": 1.0,
-        "max_trigger_m": 4.0,
+        "min_trigger_m": 2.0,
+        "max_trigger_m": 6.0,
+        // Urgency is measured in time of travel, not metres, so speed decides
+        // what counts as close: inside this many seconds of travel the demand
+        // is full, and it fades out to the trigger distance. Seeing an
+        // obstacle is not a reason to hand over - being about to arrive at
+        // one is.
+        //
+        // full_urgency_time is deliberately NOT lowered to open the band -
+        // it sets the commit distance, and at 2.5 m/s dropping 0.8 -> 0.6
+        // would move the commit from 2.0 m to 1.5 m, i.e. 0.6 s of travel,
+        // against a 200 ms detection hold plus a 300 ms blend. The band is
+        // opened from the trigger end, where being early costs nothing but a
+        // rising bar on the status stream.
+        "full_urgency_time": 0.8,
+        "min_full_urgency_m": 0.8,
+        // DYNAMIC-labelled clusters get a shorter window, i.e. we commit to
+        // the detour later. The label is velocity-derived and not reliable,
+        // but it only appears when the relative speed is high, and something
+        // moving fast may have moved on by the time we arrive. Using it only
+        // to be MORE conservative means a wrong label costs nothing. Note the
+        // car runs the detector in STATIC_ONLY mode, where DYNAMIC is
+        // overwritten before publication - this is inert there until that
+        // changes.
+        "dynamic_urgency_scale": 0.6,
+        // and never more than this much ground, whatever the speed. The
+        // detector's false-DYNAMIC rate climbs with ego speed (5% below
+        // 1 m/s, 31% at 5-6 m/s) exactly as the cost of a late commit climbs
+        // with it. Scaling alone lets both grow together; this bounds it.
+        "dynamic_delay_max_m": 0.5,
+        // Confidence, not threat. max_dense_weight is a range-normalised
+        // spatial accumulation over ~7 frames, independent of the velocity
+        // estimates; low values are transient or noise clusters (the detector
+        // measured a spurious corridor intrusion at 0.0 with 7 points). Real
+        // objects on 0813 sit at p10 55.6 / median 80.4, so 20 is a floor that
+        // rejects noise without touching them. It is NOT a wall filter -
+        // structure scores higher on this field, not lower.
+        "dense_full": 20.0,
+        // Note: the detector zeroes max_dense_weight, observed_count,
+        // is_wall_static and track_id when its odom input is unavailable.
+        // An all-zero trust signature is read as "cannot measure" rather than
+        // "not trustworthy", and the cluster is judged on geometry alone -
+        // otherwise losing localization would quietly turn obstacle avoidance
+        // off at exactly the wrong moment.
+        // Drop single-frame flickers only. Higher would delay reacting to a
+        // newly appeared object, which is exactly when reacting matters.
+        "min_observed": 2,
         "max_sweep_deg": 90.0,
         "min_speed": 0.2,
         // Wall-labelled clusters are skipped - but the detector only considers
@@ -204,10 +266,21 @@
         // an obstacle risks driving into one.
         "max_width_m": 0.0,
         "min_point_count": 0,
-        // Prompt return: nothing was wrong with pp_main, the path was simply
-        // occupied. Contrast the clearance check's 2000 ms.
+        // Return once the path is clear - nothing was wrong with pp_main, it
+        // was simply occupied. Contrast the clearance check's 5000 ms.
+        //
+        // 1200 ms, raised from 700. On the 0813 run the five detours each ran
+        // 0.86-1.10 s of demand and every one of them returned at exactly
+        // 1.50 s - the arbitration's switch_cooldown_ms, not this hold. That
+        // is the wrong thing to be in charge of the return: the cooldown is a
+        // flap guard that knows nothing about where the obstacle is, and at
+        // 1.5 s the car can still be alongside it when pp_main resumes and
+        // steers back toward the raceline. 1200 ms puts this hold above the
+        // cooldown floor, so the return is once again driven by the obstacle
+        // having gone past - 2.4-4.8 m of travel at 2-4 m/s, comfortably
+        // clear of anything the detector reports as a cluster.
         "block_ms": 200,
-        "clear_ms": 700,
+        "clear_ms": 1200,
         "timeout_ms": 500
       }
     },
@@ -232,8 +305,17 @@
       // PPcontroller - map and raceline based; needs localization to mean anything
       "name": "pp_main",
       "topic": "/drive_main",
-      "hold_ms": 300,
-      "bias": 0.0,
+      // 450 ms, raised from 300. PPcontroller publishes at 100 Hz, but on the
+      // 0813 run it dropped out five times for 305-335 ms - just past a 300 ms
+      // hold, which disqualified a controller that was alive and handed the
+      // car to gap_follow for no reason. 450 ms clears the worst measured gap
+      // by ~115 ms and still catches a genuinely dead controller inside half a
+      // second.
+      "hold_ms": 450,
+      // -4.5 cancels the obstacle input's +4.5 when the path is clear, so this
+      // drive's logit is unchanged from the calibrated 3.0*phi(confidence).
+      // Changing one without the other moves every localization threshold.
+      "bias": -4.5,
       "enabled": true,
       "influence": {
         // W = +3.0: full confidence -> z = 3.0, zero confidence -> z = 0.0
@@ -248,8 +330,19 @@
         // Only pp_main carries it - vetoing every candidate at once would
         // leave nothing to drive with and fall through to timeout_stop.
         "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
-        // obstacle veto: a detected obstacle sits on the commanded path
-        "obstacles": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5}
+        // Obstacles enter as a SCORE, not a gate. The input reports how clear
+        // the commanded path is (1 = nothing to avoid, 0 = must avoid), and
+        // the weight turns that into a contribution the softmax weighs.
+        //
+        // The bias below is -4.5 to match: with a clear path the contribution
+        // is +4.5 and the two cancel, so z_pp_main is exactly 3.0*phi(conf)
+        // as before and every calibrated localization threshold is untouched.
+        // Only an actual obstacle moves the balance, by up to -4.5. Against
+        // gap_follow's floor that flips the selection at a demand of about
+        // 0.85, which is why veto_below sits at 0.15 - the same point,
+        // expressed as a hard gate so a certain obstacle also gets the
+        // immediate-handover path instead of waiting on margin and cooldown.
+        "obstacles": {"weight": 4.5, "exp_mix": 0.0, "veto_below": 0.15}
       }
     },
     {
