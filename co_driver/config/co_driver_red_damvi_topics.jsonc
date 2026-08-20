@@ -165,6 +165,72 @@
       "type": "obstacle_avoid",
       "params": {
         "topic": "/obstacle_clusters",
+        // Judged against the PLANNED line, not the current steering angle.
+        // The steering angle swings with every correction and says nothing
+        // about the corner after this one; the plan is where the car is
+        // actually going. The plan's z coordinate carries the planned speed,
+        // which is what decides how much room the manoeuvre needs.
+        //
+        // Latched (transient_local), so it arrives on subscribe. The csv is
+        // the standby for a car whose planner is not running - same three
+        // columns, x, y, speed. Losing both falls back to the commanded arc
+        // and says so loudly in the note rather than reporting a clear path.
+        "path_topic": "/global_path",
+        "path_csv": "",
+        "path_frame": "map",
+        "base_frame": "base_link",
+        "tf_timeout_ms": 200,
+        "use_path_speed": true,
+
+        // Commit distance is derived from the manoeuvre, not tuned:
+        //   speed x (reaction + sqrt(2 x lateral_need / lateral_accel))
+        // reaction covers the 200 ms detection hold plus the 300 ms handover
+        // blend. At 7 m/s with a 0.73 m corridor and 5 m/s^2 that is 7.8 m.
+        // This is what "stay on the fast controller until the last moment it
+        // is still avoidable" means in numbers.
+        "reaction_time": 0.5,
+        "lateral_accel": 5.0,
+        "commit_margin_m": 0.5,
+        // Must equal veto_below on pp_main below (score = 1 - demand). Keeping
+        // them in step is what makes "commit distance" a real distance.
+        "commit_demand": 0.85,
+
+        // Reported cluster positions wander, and more so far away (fewer beams
+        // on the object, coarser angular quantisation) and fast (more ego
+        // motion between the scan and this decision). The on-path test is
+        // softened by this spread instead of pretending the lateral offset is
+        // exact, so a cluster near the corridor edge grades rather than
+        // flickering in and out.
+        //
+        // Measured on the 0814 recording by tracking each cluster by track_id
+        // and taking the frame-to-frame movement perpendicular to the line of
+        // sight - 20353 samples. The 90th percentile fits
+        //     jitter = 0.001 + 0.0358 x range
+        // almost exactly (p90 by band: 0.072 / 0.080 / 0.153 / 0.252 / 0.346
+        // at 1 / 3 / 5 / 7 / 9 m). Range is the whole story.
+        //
+        // Speed is NOT: holding range fixed, the same p90 does not rise with
+        // speed (0.089 / 0.060 / 0.106 / 0.082 across speed bands at 2-4 m).
+        // The apparent speed trend in the raw numbers is range in disguise -
+        // the car was only fast where the obstacles were far. The small speed
+        // term that remains is an allowance for ego motion between the scan
+        // stamp and this decision, not a measurement, and it is UNVERIFIED
+        // above 2.33 m/s, which is as fast as that recording ever went.
+        //
+        // The detector measured the same quantity on 0813 with ego motion
+        // removed and got roughly half the slope (lateral p90 6.0 cm at 1.2 m
+        // rising to 15.8 cm at 8.8 m). The larger figure is used, because this
+        // spread only ever widens the grey band at the corridor EDGE - an
+        // obstacle actually on the line still scores a full 1.0 however large
+        // the spread is - so overestimating costs decisiveness at the margin
+        // and nothing else.
+        "jitter_base_m": 0.02,
+        "jitter_per_m": 0.036,
+        "jitter_per_mps": 0.02,
+
+        // Once the obstacle's station on the plan is behind us it is passed,
+        // which is geometry rather than a timeout, so the return is quick.
+        "passed_clear_ms": 250,
         "wheelbase": 0.324,
         "vehicle_half_width": 0.18,
         // Extra room either side of the vehicle when deciding "on the path".
@@ -193,9 +259,21 @@
         // This changes nothing in the mid range: at 2.5 m/s the trigger is
         // 1.5 x v = 3.75 m either way, so the commit distance the regression
         // suite pins (2.0 m static / deferred dynamic) is untouched.
-        "trigger_time": 1.5,
+        // Sized for the speeds the plan actually asks for. The raceline on
+        // this track calls for up to 8.0 m/s, and at 7 m/s a 6 m cap is 0.86 s
+        // of travel - less than the manoeuvre needs, so the car would arrive
+        // at the commit distance the same instant it first noticed anything.
+        // 2.5 s of travel, capped at 14 m, gives 17.5 m of intent at 7 m/s.
+        //
+        // NOTE the real ceiling is the detector, not this: it publishes
+        // nothing beyond max_valid_range (10.0 m as of the 0814 recording,
+        // where the furthest of 35076 clusters was exactly 10.00 m). Until
+        // that is raised, 7 m/s leaves only ~2.7 m between first sight and the
+        // commit distance. Raising the cap here costs nothing and stops
+        // co_driver being the limit once the detector's range grows.
+        "trigger_time": 2.5,
         "min_trigger_m": 2.0,
-        "max_trigger_m": 6.0,
+        "max_trigger_m": 14.0,
         // Urgency is measured in time of travel, not metres, so speed decides
         // what counts as close: inside this many seconds of travel the demand
         // is full, and it fades out to the trigger distance. Seeing an

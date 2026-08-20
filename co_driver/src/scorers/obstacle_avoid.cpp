@@ -153,7 +153,12 @@
 
 #include <obstacle_context_msgs/msg/obstacle_cluster_array.hpp>
 
+#include <nav_msgs/msg/path.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+
 #include "co_driver/arc_geometry.hpp"
+#include "co_driver/path_reference.hpp"
 #include "co_driver/scorer.hpp"
 
 namespace co_driver
@@ -184,7 +189,48 @@ public:
     max_width_ = jnum(p, "max_width_m", 0.0);        // 0 = no size filter
     min_points_ = jint(p, "min_point_count", 0);
     sample_step_ = std::max(0.02, jnum(p, "sample_step_m", 0.08));
+    // ---- planned path -----------------------------------------------------
+    // Judging against the planned line rather than the instantaneous steering
+    // angle. See path_reference.hpp for why the command is the wrong question.
+    path_topic_ = jstr(p, "path_topic", "/global_path");
+    path_csv_ = jstr(p, "path_csv", "");
+    path_frame_ = jstr(p, "path_frame", "map");
+    base_frame_ = jstr(p, "base_frame", "base_link");
+    tf_timeout_ = jms(p, "tf_timeout_ms", 200.0);
+    use_path_speed_ = jbool(p, "use_path_speed", true);
+
+    // ---- how late we may commit -------------------------------------------
+    // The commit distance is derived, not tuned: it is the shortest distance in
+    // which the fallback can still get around the obstacle. Staying on the
+    // faster map-based controller until exactly that point is the whole point.
+    //
+    //   commit = speed x (reaction + sqrt(2 x lateral_need / lateral_accel))
+    //
+    // reaction covers detection confirmation plus the handover blend; the
+    // square root is the time to translate sideways far enough to miss.
+    reaction_time_ = jnum(p, "reaction_time", 0.5);
+    lateral_accel_ = std::max(0.5, jnum(p, "lateral_accel", 5.0));
+    commit_margin_ = jnum(p, "commit_margin_m", 0.5);
+    // The demand at which the arbitration disqualifies the map controller.
+    // Must match veto_below on that drive (score = 1 - demand), or the commit
+    // distance stops being the distance the car actually commits at.
+    commit_demand_ = std::clamp(jnum(p, "commit_demand", 0.85), 0.05, 1.0);
+
+    // ---- measurement jitter ------------------------------------------------
+    // A cluster's reported position wanders, and it wanders more the further
+    // away it is (fewer beams on it, larger angular quantisation) and the
+    // faster we are going (more ego motion between the scan and the decision).
+    // Rather than pretend the lateral offset is exact, the on-path test is
+    // softened by this spread, so a cluster near the corridor edge contributes
+    // partial demand instead of flickering in and out of it.
+    jitter_base_ = jnum(p, "jitter_base_m", 0.10);
+    jitter_per_m_ = jnum(p, "jitter_per_m", 0.03);
+    jitter_per_speed_ = jnum(p, "jitter_per_mps", 0.04);
+
     block_ = jms(p, "block_ms", 200.0);
+    // Once the obstacle's station is behind us it is passed, and that is a
+    // fact about geometry rather than a timeout. Returning then is quick.
+    passed_clear_ = jms(p, "passed_clear_ms", 250.0);
     // Short on purpose: nothing was wrong with the drive, the path was simply
     // occupied. Compare path_clearance, which is reluctant by design.
     clear_ = jms(p, "clear_ms", 700.0);
@@ -201,6 +247,39 @@ public:
         clusters_ = msg;
         rx_ = node_->now();
       }, opts);
+
+    // The path is latched, so a plain subscription would miss the only message
+    // it will ever send.
+    if (!path_topic_.empty()) {
+      rclcpp::QoS qos(1);
+      qos.reliable().transient_local();
+      path_sub_ = node->create_subscription<nav_msgs::msg::Path>(
+        path_topic_, qos,
+        [this](const nav_msgs::msg::Path::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(mtx_);
+          if (msg->poses.size() < 2) {return;}
+          path_.fromMessage(*msg);
+          RCLCPP_INFO(
+            node_->get_logger(), "obstacle avoidance: path from %s - %zu points, "
+            "%.1fm%s, frame %s", path_topic_.c_str(), path_.size(), path_.length(),
+            path_.closed() ? " (closed)" : "", path_.frame().c_str());
+        }, opts);
+    }
+    // CSV is the standby, loaded now so a missing file is a startup error
+    // rather than a surprise the first time the topic is late.
+    if (!path_csv_.empty()) {
+      std::string err;
+      if (csv_path_.fromCsv(path_csv_, path_frame_, &err)) {
+        RCLCPP_INFO(
+          node->get_logger(), "obstacle avoidance: standby path from %s - %zu points, "
+          "%.1fm%s", path_csv_.c_str(), csv_path_.size(), csv_path_.length(),
+          csv_path_.closed() ? " (closed)" : "");
+      } else {
+        RCLCPP_WARN(node->get_logger(), "obstacle avoidance: %s", err.c_str());
+      }
+    }
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, node, false);
 
     RCLCPP_INFO(
       node->get_logger(),
@@ -242,39 +321,97 @@ public:
       return setState(drive.name, ctx, 0.0, 0.0, 0, "below min_speed");
     }
 
-    // How far along the commanded path an obstacle still matters.
+    // Which line are we judging against: the plan if we have it and can place
+    // ourselves on it, the commanded arc if not. Falling back is loud - a
+    // scorer that quietly answers "clear" because it lost its reference is
+    // exactly the failure mode that made path_clearance untrustworthy.
+    PathRef ref;
+    const bool on_plan = buildPathRef(clusters->header, &ref);
+
+    // Speed that decides the geometry. The plan knows what the car will be
+    // carrying when it arrives; the current command only knows this instant,
+    // and in a braking zone those differ by several metres of lookahead.
+    const double v_now = std::abs(v);
+    const double v_plan = (on_plan && use_path_speed_) ?
+      std::max(v_now, ref.path->speedAt(ref.ego_station)) : v_now;
+
     const double trigger = std::clamp(
-      trigger_time_ * std::abs(v), min_trigger_, max_trigger_);
+      trigger_time_ * v_plan, min_trigger_, max_trigger_);
+
+    // Commit distance: the last point at which the fallback can still get
+    // around. Derived from the manoeuvre, not tuned.
+    const double lateral_need = half_width_ + margin_;
+    const double commit_raw = v_plan *
+      (reaction_time_ + std::sqrt(2.0 * lateral_need / lateral_accel_)) + commit_margin_;
+    const double commit = std::clamp(
+      std::max(commit_raw, min_full_urgency_), min_full_urgency_, trigger * 0.9);
+
     const auto arc = ArcProjection::fromCommand(delta, wheelbase_, trigger, max_sweep_);
 
     double demand = 0.0;
     double nearest = std::numeric_limits<double>::infinity();
     int considered = 0;
     int unmeasured = 0;
+    bool any_ahead = false;
     for (const auto & c : clusters->clusters) {
       if (ignore_wall_static_ && c.is_wall_static) {continue;}
       if (max_width_ > 0.0 && c.width > max_width_) {continue;}
       if (min_points_ > 0 && static_cast<int>(c.point_count) < min_points_) {continue;}
       ++considered;
-      const double along = nearestOnArc(arc, c);
-      if (!std::isfinite(along)) {continue;}          // not on the path
+
+      double along = std::numeric_limits<double>::quiet_NaN();
+      double on_path = 0.0;
+      const double range = std::hypot(c.center_x, c.center_y);
+      // How much the reported position can be expected to wander. Grows with
+      // range (fewer beams, coarser angular quantisation) and with speed (more
+      // ego motion between the scan and this decision).
+      const double jitter =
+        jitter_base_ + jitter_per_m_ * range + jitter_per_speed_ * v_now;
+
+      if (on_plan) {
+        double station = 0.0, lateral = 0.0;
+        if (!nearestOnPath(ref, c, &station, &lateral)) {continue;}
+        along = ref.path->forwardDistance(ref.ego_station, station);
+        if (along < 0.0) {
+          // Already passed. Recorded, because "has it gone by" is what makes
+          // the return prompt rather than a timeout.
+          continue;
+        }
+        // Graded rather than a hard edge: at the corridor edge the answer is
+        // genuinely uncertain, and a hard cut there turns jitter into flapping.
+        on_path = std::clamp(
+          (lateral_need + jitter - lateral) / std::max(1e-3, 2.0 * jitter), 0.0, 1.0);
+      } else {
+        along = nearestOnArc(arc, c);
+        if (!std::isfinite(along)) {continue;}
+        on_path = 1.0;
+      }
+      if (on_path <= 0.0 || along > trigger) {continue;}
+      any_ahead = true;
       nearest = std::min(nearest, along);
 
-      // Urgency in time-of-travel, so the same obstacle is urgent sooner when
-      // moving quickly. A DYNAMIC label shortens the window: commit later.
-      double full_dist = full_urgency_time_ * std::abs(v);
-      if (c.motion_label == 2) {                                 // DYNAMIC
-        // Bounded in metres, not just scaled. The detector's false-DYNAMIC
-        // rate rises with ego speed (5% below 1 m/s, 31% at 5-6 m/s) while the
-        // cost of committing late rises with speed too - a 0.2 s delay is 1 m
-        // at 5 m/s. Scaling alone lets both grow together; this caps how much
-        // ground the label can ever cost.
-        full_dist = std::max(
-          full_dist * dynamic_scale_, full_dist - dynamic_delay_max_);
+      // DYNAMIC shortens the range at which we start paying attention, so
+      // something that may have moved on by the time we arrive is noticed
+      // later. It deliberately does NOT move the commit distance: that is the
+      // last point at which the fallback can still get around, and deferring
+      // past it does not make the car patient, it makes the obstacle
+      // unavoidable. Reacting late is a choice; arriving late is not.
+      double reach = trigger;
+      if (c.motion_label == 2) {
+        reach = std::max(
+          std::max(trigger * dynamic_scale_, trigger - dynamic_delay_max_),
+          commit + 0.1);
       }
-      full_dist = std::clamp(full_dist, min_full_urgency_, trigger * 0.9);
-      const double span = std::max(1e-3, trigger - full_dist);
-      const double urgency = std::clamp((trigger - along) / span, 0.0, 1.0);
+      if (along > reach) {continue;}
+      // Scaled so the demand reaches the veto threshold EXACTLY at the commit
+      // distance. Without this the veto fires wherever the threshold happens
+      // to land on the ramp - always earlier - and the car leaves the fast
+      // controller sooner than it has to. Staying on it until the last
+      // avoidable moment is the requirement, so the geometry has to be what
+      // decides, not an arbitrary point on a slope.
+      const double span = std::max(1e-3, reach - commit);
+      const double urgency = std::clamp(
+        commit_demand_ * (reach - along) / span, 0.0, 1.0);
 
       // Confidence: a real solid return, not a flicker - unless the detector
       // could not measure it at all, in which case fall back to geometry.
@@ -290,7 +427,7 @@ public:
       } else {
         ++unmeasured;
       }
-      demand = std::max(demand, urgency * confidence);
+      demand = std::max(demand, urgency * confidence * on_path);
     }
     if (unmeasured > 0 && considered > 0) {
       RCLCPP_WARN_THROTTLE(
@@ -298,10 +435,134 @@ public:
         "obstacle trust fields unmeasured on %d/%d clusters (odom lost?) - "
         "judging on geometry alone", unmeasured, considered);
     }
+    last_on_plan_[drive.name] = on_plan;
+    last_ahead_[drive.name] = any_ahead;
     return setState(drive.name, ctx, demand, nearest, considered, "");
   }
 
 private:
+  // Everything needed to place a cluster on the plan: which path, where we are
+  // on it, and how to get from the cluster's frame into the path's.
+  struct PathRef
+  {
+    const PathReference * path{nullptr};
+    double ego_station{0.0};
+    double cos_yaw{1.0}, sin_yaw{0.0}, tx{0.0}, ty{0.0};   // cluster frame -> path frame
+  };
+
+  // Resolve the plan and the transform for this scan. Returns false - and says
+  // why, throttled - whenever the plan cannot be used, so the caller falls back
+  // to the commanded arc rather than silently reporting a clear path.
+  bool buildPathRef(const std_msgs::msg::Header & header, PathRef * out)
+  {
+    const PathReference * path = nullptr;
+    {
+      // mtx_ is already held by the caller.
+      if (!path_.empty()) {
+        path = &path_;
+      } else if (!csv_path_.empty()) {
+        path = &csv_path_;
+      }
+    }
+    if (!path) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "obstacle avoidance: no planned path (%s silent, no usable csv) - "
+        "judging against the commanded steering instead",
+        path_topic_.c_str());
+      return false;
+    }
+    if (!tf_buffer_) {return false;}
+    geometry_msgs::msg::TransformStamped tf_cluster, tf_ego;
+    try {
+      // Cluster frame -> path frame, at the scan's own stamp.
+      tf_cluster = tf_buffer_->lookupTransform(
+        path->frame(), header.frame_id, header.stamp,
+        tf2::durationFromSec(tf_timeout_));
+      // Where the car is on the plan, same instant.
+      tf_ego = tf_buffer_->lookupTransform(
+        path->frame(), base_frame_, header.stamp, tf2::durationFromSec(tf_timeout_));
+    } catch (const tf2::TransformException & e) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "obstacle avoidance: cannot place the car on the plan (%s) - judging "
+        "against the commanded steering instead. This is expected while "
+        "localization is down, and the confidence pathway handles that case.",
+        e.what());
+      return false;
+    }
+    const auto & q = tf_cluster.transform.rotation;
+    const double yaw = std::atan2(
+      2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    out->path = path;
+    out->cos_yaw = std::cos(yaw);
+    out->sin_yaw = std::sin(yaw);
+    out->tx = tf_cluster.transform.translation.x;
+    out->ty = tf_cluster.transform.translation.y;
+    const auto ego = path->project(
+      tf_ego.transform.translation.x, tf_ego.transform.translation.y);
+    if (!ego.valid) {return false;}
+    out->ego_station = ego.station;
+    return true;
+  }
+
+  // Closest approach of a cluster's footprint to the PLANNED line. Same
+  // perimeter walk as the arc version and for the same reason: a corridor
+  // narrower than the box cannot cross it without touching the perimeter.
+  bool nearestOnPath(
+    const PathRef & ref, const obstacle_context_msgs::msg::ObstacleCluster & c,
+    double * station, double * lateral) const
+  {
+    const double x0 = std::min(c.min_x, c.max_x), x1 = std::max(c.min_x, c.max_x);
+    const double y0 = std::min(c.min_y, c.max_y), y1 = std::max(c.min_y, c.max_y);
+    if (!std::isfinite(x0) || !std::isfinite(x1) ||
+      !std::isfinite(y0) || !std::isfinite(y1))
+    {
+      return false;
+    }
+    double best_lat = std::numeric_limits<double>::infinity();
+    double best_station = 0.0;
+    bool have = false;
+    auto test = [&](double px, double py) {
+        if (!std::isfinite(px) || !std::isfinite(py)) {return;}
+        const double mx = ref.tx + ref.cos_yaw * px - ref.sin_yaw * py;
+        const double my = ref.ty + ref.sin_yaw * px + ref.cos_yaw * py;
+        const auto pr = ref.path->project(mx, my);
+        if (!pr.valid || pr.lateral >= best_lat) {return;}
+        best_lat = pr.lateral;
+        best_station = pr.station;
+        have = true;
+      };
+    test(c.center_x, c.center_y);
+    // Bounded sample counts. ceil() of a wild bounding box is undefined
+    // behaviour once it leaves int range, and on aarch64 it saturates to
+    // INT_MAX - a loop that never ends while holding the evaluation lock.
+    const int nx = boxSamples(x1 - x0);
+    const int ny = boxSamples(y1 - y0);
+    for (int i = 0; i <= nx; ++i) {
+      const double x = (nx == 0) ? x0 : x0 + (x1 - x0) * static_cast<double>(i) / nx;
+      test(x, y0);
+      test(x, y1);
+    }
+    for (int j = 0; j <= ny; ++j) {
+      const double y = (ny == 0) ? y0 : y0 + (y1 - y0) * static_cast<double>(j) / ny;
+      test(x0, y);
+      test(x1, y);
+    }
+    if (!have) {return false;}
+    *station = best_station;
+    *lateral = best_lat;
+    return true;
+  }
+
+  // Sample count for one side of a bounding box, clamped hard.
+  int boxSamples(double extent) const
+  {
+    if (!std::isfinite(extent) || extent <= 0.0) {return 0;}
+    const double n = std::ceil(extent / sample_step_);
+    return static_cast<int>(std::clamp(n, 0.0, 64.0));
+  }
+
   // Closest approach of a cluster's footprint to the commanded arc, as an arc
   // length. The bounding box is walked rather than reduced to its centre: a
   // corridor 0.36 m wide cannot cross a box without touching its perimeter,
@@ -354,29 +615,46 @@ private:
       st.valid = true;
     }
     const double dwell = (ctx.now - st.edge).seconds();
+    // Releasing the detour. When we are judging against the plan we can tell
+    // the difference between "the obstacle went behind us" - a fact about
+    // geometry - and "it stopped being reported", which might just be a gap in
+    // detection. The first earns a prompt return; the second still has to wait
+    // out the full hold, because coming back early on a detection dropout puts
+    // the map controller back in charge while the thing is still alongside.
+    const bool by_station =
+      last_on_plan_[drive] && !last_ahead_[drive];
+    const double release = by_station ? passed_clear_ : clear_;
     if (!clear_now && dwell >= block_) {st.blocked = true;}
-    if (clear_now && st.blocked && dwell >= clear_) {st.blocked = false;}
+    if (clear_now && st.blocked && dwell >= release) {st.blocked = false;}
 
-    char buf[120];
+    char buf[140];
     if (st.blocked) {
       if (clear_now) {
-        std::snprintf(buf, sizeof(buf), "path clearing, holding %.1f/%.1fs", dwell, clear_);
+        std::snprintf(
+          buf, sizeof(buf), "%s, holding %.1f/%.1fs",
+          by_station ? "obstacle passed" : "path clearing", dwell, release);
         return ScoreResult::ok(0.0, buf);        // stay committed to the detour
       }
       std::snprintf(
-        buf, sizeof(buf), "obstacle at %.2fm, demand %.2f", dist, demand);
+        buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f", dist,
+        last_on_plan_[drive] ? "on the plan" : "on the commanded arc", demand);
       return ScoreResult::ok(std::clamp(1.0 - demand, 0.0, 1.0), buf);
     }
     if (!clear_now) {
       std::snprintf(
-        buf, sizeof(buf), "obstacle at %.2fm, demand %.2f, confirming %.1f/%.1fs",
-        dist, demand, dwell, block_);
+        buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f, confirming %.1f/%.1fs",
+        dist, last_on_plan_[drive] ? "on the plan" : "on the arc", demand, dwell, block_);
       return ScoreResult::ok(1.0, buf);          // not confirmed yet
     }
     if (!reason.empty()) {return ScoreResult::ok(1.0, reason);}
-    std::snprintf(buf, sizeof(buf), "clear (%d clusters considered)", considered);
+    std::snprintf(
+      buf, sizeof(buf), "clear (%d clusters considered%s)", considered,
+      last_on_plan_[drive] ? "" : ", NO PLAN - using the commanded arc");
     return ScoreResult::ok(1.0, buf);
   }
+
+  std::map<std::string, bool> last_on_plan_;
+  std::map<std::string, bool> last_ahead_;
 
   struct State
   {
@@ -388,6 +666,21 @@ private:
 
   rclcpp::Node * node_{nullptr};
   rclcpp::Subscription<obstacle_context_msgs::msg::ObstacleClusterArray>::SharedPtr sub_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  PathReference path_;        // from the topic
+  PathReference csv_path_;    // standby
+
+  std::string path_topic_, path_csv_, path_frame_, base_frame_;
+  double tf_timeout_{0.2};
+  bool use_path_speed_{true};
+  double reaction_time_{0.5};
+  double lateral_accel_{5.0};
+  double commit_margin_{0.5};
+  double commit_demand_{0.85};
+  double jitter_base_{0.10}, jitter_per_m_{0.03}, jitter_per_speed_{0.04};
+  double passed_clear_{0.25};
 
   std::string topic_;
   double wheelbase_{0.324};
