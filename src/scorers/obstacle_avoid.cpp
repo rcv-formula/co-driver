@@ -1,11 +1,16 @@
 // Obstacle avoidance - hand the car to the fallback while an obstacle sits on
 // the commanded path, and give it back once the path is clear again.
 //
-// Same question as path_clearance, different evidence. path_clearance reads the
-// raw scan and so cannot tell a wall from a cone; this reads the obstacle
-// detector's clustered output, which drops anything wider than 3 m and labels
-// what it believes to be wall. That discrimination is the entire reason to
-// have both.
+// This is a detour, not a loss of trust - which is what separates it from
+// path_clearance. There the drive was steering into structure, meaning its
+// world model was wrong; here the world model is fine and something is simply
+// lying in the way. So the drive gets its job back as soon as the path is
+// clear, with only enough hysteresis to not flicker, while path_clearance
+// makes it wait several times longer.
+//
+// The evidence differs too. path_clearance reads the raw scan and cannot tell
+// a wall from a cone; this reads the detector's clustered output, which drops
+// anything wider than 3 m.
 //
 // ---------------------------------------------------------------------------
 // What this trusts, and what it deliberately ignores
@@ -27,6 +32,21 @@
 // almost nothing laterally. The bounding box is used directly instead.
 //
 // ---------------------------------------------------------------------------
+// This node does not detect obstacles. It receives them.
+//
+// Everything about what is or is not an obstacle - clustering, the 3 m width
+// drop, the wall label - is the detector's judgement and arrives on its topic.
+// The only decision made here is geometric: does that obstacle sit on the path
+// this drive is commanding. Nothing in this file re-classifies a cluster.
+//
+// max_width_m exists as a blunt cap for stacks whose detector does no size
+// filtering of its own, and is off in the red_damvi configuration. Using it to
+// separate walls from obstacles was tried and abandoned: across five datasets
+// real objects and sub-1 m structure share a width distribution identical to
+// two decimals, and a 0.6 m cut missed 45% of confirmed obstacles while still
+// passing 82% of the structure it was aimed at. That judgement does not live
+// here.
+//
 // Two size filters, because is_wall_static alone is not enough
 //
 // The detector only considers a cluster for the wall label at 1.0 m and wider,
@@ -96,6 +116,8 @@ public:
     min_points_ = jint(p, "min_point_count", 0);
     sample_step_ = std::max(0.02, jnum(p, "sample_step_m", 0.08));
     block_ = jms(p, "block_ms", 200.0);
+    // Short on purpose: nothing was wrong with the drive, the path was simply
+    // occupied. Compare path_clearance, which is reluctant by design.
     clear_ = jms(p, "clear_ms", 700.0);
     timeout_ = jms(p, "timeout_ms", 500.0);
 

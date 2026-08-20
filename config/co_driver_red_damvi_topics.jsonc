@@ -75,6 +75,18 @@
     },
 
     {
+      // TWO GEOMETRY CHECKS, TWO ROLES - do not collapse them.
+      //
+      //   clearance  the drive is commanding a path into solid geometry, so
+      //              its idea of where it is must be wrong. Leaving is fast,
+      //              coming back is reluctant (clear_ms 2000).
+      //   obstacles  the map is right and the raceline is right, something is
+      //              simply lying in the way. Leaving is fast, coming back is
+      //              prompt (clear_ms 700) - nothing was wrong with the drive.
+      //
+      // Same veto, different meaning, and therefore different patience about
+      // trusting pp_main again.
+      //
       // Geometry check, independent of localization: project pp_main's own
       // command along the commanded arc and see whether the live scan says
       // something solid is in the way.
@@ -113,9 +125,18 @@
         // with the path ahead open at 2.86 m). Gentle steering sweeps only a
         // few degrees, so normal driving is unaffected.
         "max_sweep_deg": 90.0,
-        // one noisy sweep is not evidence; clearing is slower than blocking
+        // One noisy sweep is not evidence. Clearing is deliberately slow: a
+        // drive that commanded a path into structure keeps the veto until it
+        // has commanded a clear one for five seconds.
+        //
+        // Five, not two, because returning costs ~2.2 s anyway (switch
+        // cooldown plus selection margin) and anything under that floor is
+        // absorbed by it. Measured at 2000 ms: clearance returned in 2.11 s
+        // against the obstacle detour's 2.25 s - the intended asymmetry did
+        // not exist. This is the knob that separates the two roles, so it has
+        // to be above the floor to do anything.
         "block_ms": 200,
-        "clear_ms": 700,
+        "clear_ms": 5000,
         "timeout_ms": 500
       }
     },
@@ -167,24 +188,24 @@
         // 0813 recording is 0.91 m wide and can never be labelled. This is a
         // partial filter, not wall rejection.
         "ignore_wall_static": true,
-        // Safety cap only - NOT a wall discriminator. Measured across five
-        // datasets, the width distributions of real foreign objects and of
-        // sub-1 m mapped structure are the same to two decimals (p50 0.37,
-        // p75 0.55 for both). A 0.6 m cut would miss 45% of confirmed real
-        // obstacles while still passing 82% of the structure it was meant to
-        // stop - it looked clean only because 0813's objects happen to be
-        // unusually small (p50 0.15 m there, 0.44-0.49 m elsewhere). 1.2 m
-        // cuts obvious structure and leaves discrimination to the corridor.
+        // Off. What is an obstacle and what is structure is the detector's
+        // call, not co_driver's - this node does not detect obstacles, it
+        // receives them and decides only whether they sit on the commanded
+        // path. The detector already drops anything wider than 3 m and labels
+        // what it judges to be wall; second-guessing that with a width of my
+        // own was overreach, and the measurements agreed: across five datasets
+        // real objects and sub-1 m structure share the same width distribution
+        // to two decimals, so no threshold here separates them anyway.
         //
-        // Consequence, stated plainly: on 0813 this leaves 2 false handovers
-        // per run (2.0 s of 67 s) on a 0.97 m wall fragment 0.5 m off the
-        // flank, alongside all 3 real detections. That is the deliberate
-        // direction - an unnecessary handover to the fallback costs a little
-        // speed, a missed obstacle costs the car. Narrow lateral_margin_m per
-        // track if the walls sit closer than the corridor is wide; that is
-        // the knob, not this one.
-        "max_width_m": 1.2,
+        // Consequence, accepted by the user: an unlabelled wall fragment on
+        // the path is avoided like any other obstacle. On 0813 that is 2 extra
+        // handovers per run alongside the 3 real ones. Reacting to a wall
+        // costs a little speed; deciding for ourselves that something is not
+        // an obstacle risks driving into one.
+        "max_width_m": 0.0,
         "min_point_count": 0,
+        // Prompt return: nothing was wrong with pp_main, the path was simply
+        // occupied. Contrast the clearance check's 2000 ms.
         "block_ms": 200,
         "clear_ms": 700,
         "timeout_ms": 500

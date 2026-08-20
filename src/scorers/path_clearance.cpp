@@ -1,4 +1,30 @@
-// Path clearance - refuse a command that drives into what the lidar calls solid.
+// Path clearance - the drive is steering into solid geometry, so its idea of
+// where it is must be wrong.
+//
+// This is NOT obstacle detection and NOT obstacle avoidance. It never decides
+// that anything is an obstacle - it asks only whether the geometry the lidar
+// reports is compatible with the path this drive is commanding. Deciding what
+// counts as an obstacle belongs to the obstacle detector, and reaches the
+// arbitration through obstacle_avoid.
+//
+// The difference between the two is the whole point of having both. obstacle_avoid handles "the map is right, the raceline is
+// right, something is lying in the way" - a detour, taken and given back. This
+// one handles "the commanded path leads into structure", which on a map-based
+// controller means its world model is wrong, not that the world changed.
+//
+//   obstacle_avoid   localization fine, path fine, something in the way
+//                    -> go around it, come back promptly, nothing was wrong
+//                       with the drive itself
+//   path_clearance   the drive is commanding a path into solid geometry
+//                    -> it has just demonstrated it cannot be trusted, so
+//                       coming back is deliberately reluctant
+//
+// That asymmetry lives in clear_ms, and it has to clear a floor to exist at
+// all: any return costs about 2.2 s regardless (switch cooldown plus the
+// selection margin), so a clear time under that is simply absorbed. This one
+// is set well above the floor; obstacle_avoid's sits below it, where the floor
+// is the binding constraint and the detour comes back as fast as the
+// arbitration allows.
 //
 // Every other judgement in this arbitration asks the localization whether it
 // believes itself. This one does not ask anyone: it projects the drive's own
@@ -87,7 +113,12 @@ public:
     min_speed_ = jnum(p, "min_speed", 0.2);
     max_sweep_ = jnum(p, "max_sweep_deg", 90.0) * M_PI / 180.0;
     block_ = jms(p, "block_ms", 200.0);
-    clear_ = jms(p, "clear_ms", 700.0);
+    // Deliberately long, and long enough to matter: returning to a drive
+    // costs about 2.2 s anyway (switch cooldown plus the selection margin), so
+    // a clear time below that is absorbed by the floor and changes nothing.
+    // Measured: at 2000 ms this returned in 2.11 s against the obstacle
+    // detour's 2.25 s - no asymmetry at all, despite the intent.
+    clear_ = jms(p, "clear_ms", 5000.0);
     timeout_ = jms(p, "timeout_ms", 500.0);
 
     // Lidar drivers and rosbag replays publish BEST_EFFORT; a RELIABLE
@@ -225,7 +256,7 @@ private:
   double min_speed_{0.2};
   double max_sweep_{M_PI / 2.0};
   double block_{0.2};
-  double clear_{0.7};
+  double clear_{5.0};
   double timeout_{0.5};
 
   std::mutex mtx_;
