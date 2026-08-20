@@ -41,20 +41,34 @@
     "loc_trip": {
       // Early handover: confidence < trip_below sustained trip_ms disqualifies
       // pp_main. This is where "detect earlier" lives - the user's 0.50.
-      //   trip_below 0.50 : the score pathway only fires at 0.171; this bar
-      //                     catches the quiet degradations (0.25-0.45 hover)
-      //                     the curve saturation hides. Tuned for a course
-      //                     where healthy confidence stays high - on a scene
-      //                     like busan2 (13.5% of healthy tracking below 0.5)
-      //                     it will trip during good driving; lengthen trip_ms
-      //                     or lower the bar per track.
+      //   trip_below 0.40 : the score pathway only fires at 0.171; this bar
+      //                     catches the quiet degradations the curve
+      //                     saturation hides.
+      //
+      //                     Set from the 0813 real-vehicle recording, not
+      //                     guessed. That run (dynamic and static obstacles,
+      //                     deliberate lidar occlusion, 67 s) bottomed out at
+      //                     an effective confidence of 0.5006 - six ten
+      //                     thousandths above the 0.50 this used to be, with
+      //                     term_spread as the limiter, which ignore_terms
+      //                     does not and must not exclude. Healthy driving on
+      //                     the user's own course therefore reaches into the
+      //                     0.50-0.55 band (p0.1 = 0.522, p1 = 0.612).
+      //
+      //                     0.40 buys 0.10 of margin at no measured cost in
+      //                     detection: across four replay scenes and the
+      //                     vehicle recording, no genuine fault ever sat in
+      //                     0.40-0.50. Real faults collapse to 0.00-0.19 and
+      //                     reach Lost within ~30 ms, where the state veto
+      //                     takes over in 7-19 ms.
       //   trip_ms 500     : a momentary dip proves nothing (confidence is
       //                     noisy even when the pose is right); only a
       //                     sustained stay below the bar is a degradation.
       //                     Tolerance lives HERE, not in lowering the bar.
       //
       // Status of this trip, stated plainly: across all four replay scenes
-      // (38k Tracking samples) it fires ZERO times with ignore_terms applied.
+      // (38k Tracking samples) plus the 0813 vehicle recording it fires ZERO
+      // times with ignore_terms applied.
       // The longest stretch of genuinely degraded pose terms in the corpus is
       // 90 ms - when localization goes wrong there it collapses and the state
       // machine declares Lost within ~30 ms, which the state veto already
@@ -84,7 +98,7 @@
       //                     applies when the producer publishes the 8-slot
       //                     array; older 3-slot ones keep using the aggregate.
       "params": {
-        "trip_below": 0.50,
+        "trip_below": 0.40,
         "trip_ms": 500,
         "clear_ms": 2500,
         "timeout_ms": 300,
