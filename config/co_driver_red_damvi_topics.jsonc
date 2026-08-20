@@ -167,16 +167,23 @@
         // 0813 recording is 0.91 m wide and can never be labelled. This is a
         // partial filter, not wall rejection.
         "ignore_wall_static": true,
-        // Clusters wider than this are structure, not obstacles to go around.
-        // The detector only applies its wall label at 1.0 m and wider, so
-        // 0.6-1.0 m fragments arrive unlabelled - and on the 0813 recording
-        // that is exactly what this scorer detected on its first pass: two
-        // handovers on a 0.97 m, 280-point structure beside the car, and none
-        // on the three real objects (0.13-0.20 m, 9-10 points). With this set,
-        // the same run gives 3 handovers, all three real, none false.
-        // Cost: a genuinely wide obstacle is ignored. Raise it if the track
-        // has any, but stay below the detector's 1.0 m labelling threshold.
-        "max_width_m": 0.6,
+        // Safety cap only - NOT a wall discriminator. Measured across five
+        // datasets, the width distributions of real foreign objects and of
+        // sub-1 m mapped structure are the same to two decimals (p50 0.37,
+        // p75 0.55 for both). A 0.6 m cut would miss 45% of confirmed real
+        // obstacles while still passing 82% of the structure it was meant to
+        // stop - it looked clean only because 0813's objects happen to be
+        // unusually small (p50 0.15 m there, 0.44-0.49 m elsewhere). 1.2 m
+        // cuts obvious structure and leaves discrimination to the corridor.
+        //
+        // Consequence, stated plainly: on 0813 this leaves 2 false handovers
+        // per run (2.0 s of 67 s) on a 0.97 m wall fragment 0.5 m off the
+        // flank, alongside all 3 real detections. That is the deliberate
+        // direction - an unnecessary handover to the fallback costs a little
+        // speed, a missed obstacle costs the car. Narrow lateral_margin_m per
+        // track if the walls sit closer than the corridor is wide; that is
+        // the knob, not this one.
+        "max_width_m": 1.2,
         "min_point_count": 0,
         "block_ms": 200,
         "clear_ms": 700,

@@ -36,11 +36,18 @@
 // beside the car, and none at all on the three real objects, which are
 // 0.13-0.20 m wide and 9-10 points. Exactly backwards.
 //
-// max_width_m closes the gap from this side: above it a cluster is treated as
-// structure rather than an obstacle to go around. Set it below the detector's
-// 1.0 m labelling threshold and above the largest thing worth avoiding. The
-// cost is real - a genuinely wide obstacle is ignored - so it is off by
-// default and the deployment config sets it explicitly.
+// max_width_m cuts obvious structure, but it is a safety cap and not a
+// discriminator, because no width threshold is one. Measured across five
+// datasets, real foreign objects and sub-1 m mapped structure have the same
+// width distribution to two decimals (p50 0.37, p75 0.55 for both); a 0.6 m
+// cut misses 45% of confirmed obstacles while still passing 82% of the
+// structure it was aimed at. Distance-along-the-path does not separate them
+// either - tested, and it removes the real objects while keeping the wall.
+//
+// So the residual is accepted rather than filtered away: near a wall closer
+// than the corridor is wide, this scorer will occasionally hand over when it
+// did not need to. That is the safe direction. lateral_margin_m is the knob
+// for trading it off per track; the width cap is not.
 //
 // The trigger is a distance along the commanded path, not a braking margin:
 // an obstacle anywhere on the path within trigger_time seconds of travel is
