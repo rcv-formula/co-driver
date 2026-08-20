@@ -12,3 +12,7 @@ log/
 # Python
 __pycache__/
 *.pyc
+
+# vehicle recordings dropped here for analysis - never committed
+bag/
+*.mcap
