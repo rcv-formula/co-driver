@@ -78,6 +78,7 @@ class DriveMonitor(Node):
         self.out_count = 0
         self.pending_jump = None            # switch we are still measuring
         self.wiring_bad = False
+        self.last_pubs = None      # publisher set at the last wiring check
 
         self.csv = None
         if self.csv_path:
@@ -101,16 +102,45 @@ class DriveMonitor(Node):
 
     # --- wiring -------------------------------------------------------
     def check_wiring(self):
-        """Two publishers on the output topic means two nodes are fighting."""
+        """A second publisher on the output topic means two nodes are fighting.
+
+        The arbiter itself is the expected publisher, so it is never the
+        conflict. Everything else is named as it actually is: this used to
+        blame gap_follow's drive_topic on every repeat, which is misleading
+        advice when gap_follow is correctly on its own topic and the extra
+        publisher is a mux, a teleop or a safety node.
+        """
         pubs = self.get_publishers_info_by_topic(self.output_topic)
         names = [f"{i.node_namespace.rstrip('/')}/{i.node_name}" for i in pubs]
-        if len(pubs) > 1:
-            self.wiring_bad = True
-            self.get_logger().error(
-                f"wiring problem - {self.output_topic} has {len(pubs)} publishers: {names}. "
-                f"Check that gap_follow's drive_topic is not still /drive.")
         if not pubs:
-            self.get_logger().warn(f"no publisher on {self.output_topic}")
+            if self.last_pubs is None or self.last_pubs:
+                self.get_logger().warn(f"no publisher on {self.output_topic}")
+            self.last_pubs = []
+            return
+
+        # The arbiter is supposed to be here; anything else is a co-publisher.
+        others = [n for n in names if "co_driver" not in n]
+        self.wiring_bad = len(others) > 0
+
+        # Only speak when the picture changes - this runs every 5 s, and a
+        # standing condition repeated forever is noise, not a diagnosis.
+        if self.last_pubs is not None and sorted(names) == sorted(self.last_pubs):
+            return
+        self.last_pubs = names
+
+        if not others:
+            return
+        culprits = [n for n in others if "gap_follow" in n]
+        hint = (
+            f" gap_follow is one of them - set its drive_topic to /drive_gf."
+            if culprits else
+            f" gap_follow is NOT among them, so its drive_topic is fine; these are"
+            f" whatever else publishes here (mux input, teleop, safety stop)."
+            f" If that is intended, point this monitor at the topic the arbiter"
+            f" actually owns with -p output_topic:=<topic>.")
+        self.get_logger().error(
+            f"{self.output_topic} has {len(others)} publisher(s) besides the "
+            f"arbiter: {others}.{hint}")
 
     # --- output -------------------------------------------------------
     def on_output(self, msg):
@@ -277,7 +307,8 @@ class DriveMonitor(Node):
 
         verdict = []
         if self.wiring_bad:
-            verdict.append(f"FAIL  more than one publisher on {self.output_topic}")
+            verdict.append(
+                f"FAIL  {self.output_topic} has a publisher besides the arbiter")
         if self.flaps:
             verdict.append(f"WARN  {self.flaps} flap(s) detected")
         short = [d for d in self.dwells if d < self.flap_dwell_s]
