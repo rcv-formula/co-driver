@@ -373,7 +373,32 @@
         // handovers per run alongside the 3 real ones. Reacting to a wall
         // costs a little speed; deciding for ourselves that something is not
         // an obstacle risks driving into one.
-        "max_width_m": 0.0,
+        // A safety cap, not a classifier. Nothing narrower than this is ever
+        // judged on its size; the cap only removes returns too wide to be an
+        // object at all. The detector measured real objects and sub-metre
+        // structure to have identical width distributions (p50 0.37, p75
+        // 0.55), so a bar at 1.0 sits clear of anything a real obstacle has
+        // measured, and 0.6 - tried earlier - cut into them.
+        //
+        // Chosen by sweeping the 0814 drive, four settings on the same run
+        // (pp_main share / share at 4-5 m/s / handovers / avoidance episodes
+        // kept out of 28):
+        //   off                49.9%  24.0%  66  28/28
+        //   width 1.0          55.1%  42.3%  52  24/28   <- this
+        //   margin 0.30        52.8%  29.6%  66  28/28
+        //   width 1.0+mgn 0.40 57.0%  42.8%  50  23/28
+        //
+        // The four episodes this drops were each inspected: all 0.24-0.38 s
+        // long, against clusters of median width 0.82-1.17 m (up to 2.82 m) at
+        // 6.2-8.1 m. Wide, far and brief - wall fragments the detector did not
+        // label as wall. Narrowing the corridor instead keeps every episode but
+        // saves no handovers at all and splits 28 encounters into 32.
+        //
+        // The 0.40 margin was rejected despite the best numbers: the extra
+        // episode it loses is a 0.31 m-wide cluster at 3.84 m, which is the
+        // shape of a real object. Buying 1.9 points of occupancy by shaving
+        // lateral clearance is not this scorer's call to make.
+        "max_width_m": 1.0,
         "min_point_count": 0,
         // Return once the path is clear - nothing was wrong with pp_main, it
         // was simply occupied. Contrast the clearance check's 5000 ms.
