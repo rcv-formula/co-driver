@@ -184,6 +184,9 @@ public:
     dynamic_delay_max_ = jnum(p, "dynamic_delay_max_m", 0.5);
     dense_full_ = jnum(p, "dense_full", 20.0);
     min_observed_ = jint(p, "min_observed", 2);
+    // What a cluster is worth before its track has matured. 1.0 disables the
+    // discount entirely; 0.0 restores the old behaviour of erasing it.
+    immature_scale_ = std::clamp(jnum(p, "immature_scale", 1.0), 0.0, 1.0);
     min_trigger_ = jnum(p, "min_trigger_m", 1.0);
     max_trigger_ = jnum(p, "max_trigger_m", 4.0);
     max_sweep_ = jnum(p, "max_sweep_deg", 90.0) * M_PI / 180.0;
@@ -468,8 +471,23 @@ public:
       if (!trust_unmeasured) {
         confidence = (dense_full_ > 0.0) ?
           std::clamp(static_cast<double>(c.max_dense_weight) / dense_full_, 0.0, 1.0) : 1.0;
-        if (min_observed_ > 0 && static_cast<int>(c.observed_count) < min_observed_) {
-          confidence = 0.0;
+        // Track age is NOT used to erase a cluster any more.
+        //
+        // observed_count resets whenever the detector loses association, and
+        // association is the first thing that breaks with speed: measured at
+        // 5-6 m/s the centroid moves up to 49.8 cm between frames against a
+        // 60 cm association gate, and the success rate falls from 90-97% to
+        // 81%. Zeroing confidence on a young track therefore made real
+        // obstacles vanish exactly when the car was going fast enough to need
+        // them - a silent failure with speed as its trigger.
+        //
+        // Flicker rejection does not need this gate. block_ms already requires
+        // the demand to persist 200 ms, which is eight frames at 40 Hz, and no
+        // spurious return survives that. A re-associated real object does.
+        // So an immature track is discounted rather than deleted, and the
+        // decision to act still rests on time.
+        if (min_observed_ > 1 && static_cast<int>(c.observed_count) < min_observed_) {
+          confidence *= immature_scale_;
         }
       } else {
         ++unmeasured;
@@ -785,6 +803,7 @@ private:
   double dynamic_delay_max_{0.5};
   double dense_full_{20.0};
   int min_observed_{2};
+  double immature_scale_{1.0};
   double min_trigger_{1.0};
   double max_trigger_{4.0};
   double max_sweep_{M_PI / 2.0};

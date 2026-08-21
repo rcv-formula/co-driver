@@ -337,7 +337,19 @@
         // off at exactly the wrong moment.
         // Drop single-frame flickers only. Higher would delay reacting to a
         // newly appeared object, which is exactly when reacting matters.
+        // A young track is discounted, not erased. observed_count resets every
+        // time the detector loses association, and association is the first
+        // thing speed breaks: at 5-6 m/s the centroid moves up to 49.8 cm
+        // between frames against a 60 cm gate and association falls from
+        // 90-97% to 81%. Erasing on track age made real obstacles disappear
+        // exactly when the car was fast enough to need them.
+        //
+        // 1.0 = no discount: rely on block_ms (200 ms, eight frames at 40 Hz)
+        // to reject flicker, which is a filter the detector's association
+        // cannot break. Lower this only with a measurement showing spurious
+        // clusters that survive 200 ms.
         "min_observed": 2,
+        "immature_scale": 1.0,
         "max_sweep_deg": 90.0,
         "min_speed": 0.2,
         // Wall-labelled clusters are skipped - but the detector only considers
