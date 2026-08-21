@@ -156,6 +156,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer_interface.h>
 
 #include "co_driver/arc_geometry.hpp"
 #include "co_driver/path_reference.hpp"
@@ -328,12 +329,27 @@ public:
     PathRef ref;
     const bool on_plan = buildPathRef(clusters->header, &ref);
 
-    // Speed that decides the geometry. The plan knows what the car will be
-    // carrying when it arrives; the current command only knows this instant,
-    // and in a braking zone those differ by several metres of lookahead.
+    // Speed that decides the geometry: the one the car is ACTUALLY carrying.
+    //
+    // The plan's speed profile is tempting here - it is right there in the z
+    // coordinate - but it answers the wrong question. What sets both the time
+    // to arrival and the room the manoeuvre needs is how fast the car is
+    // going, not how fast the plan wishes it were. Measured on the 0814
+    // recording, where the car was driven at 0.85 m/s along a line planned for
+    // up to 8.0 m/s: taking the planned speed put the commit distance at
+    // 6.75 m instead of 1.38 m, so objects five metres away all arrived at
+    // full demand, pp_main held only 48.6% of the run against the 68.6% the
+    // car itself managed, and the handovers went from 38 to 60.
+    //
+    // Nothing is lost by using the current speed. This is re-evaluated at
+    // 50 Hz, so a car that accelerates gets the longer lookahead immediately -
+    // long before it arrives anywhere. A crawling car genuinely does not need
+    // to worry about something eight metres away.
     const double v_now = std::abs(v);
-    const double v_plan = (on_plan && use_path_speed_) ?
-      std::max(v_now, ref.path->speedAt(ref.ego_station)) : v_now;
+    const double v_plan = v_now;
+    const double v_planned_here = (on_plan && use_path_speed_) ?
+      ref.path->speedAt(ref.ego_station) : 0.0;
+    (void)v_planned_here;
 
     const double trigger = std::clamp(
       trigger_time_ * v_plan, min_trigger_, max_trigger_);
@@ -475,13 +491,14 @@ private:
     if (!tf_buffer_) {return false;}
     geometry_msgs::msg::TransformStamped tf_cluster, tf_ego;
     try {
-      // Cluster frame -> path frame, at the scan's own stamp.
-      tf_cluster = tf_buffer_->lookupTransform(
-        path->frame(), header.frame_id, header.stamp,
-        tf2::durationFromSec(tf_timeout_));
-      // Where the car is on the plan, same instant.
-      tf_ego = tf_buffer_->lookupTransform(
-        path->frame(), base_frame_, header.stamp, tf2::durationFromSec(tf_timeout_));
+      // Zero timeout, deliberately. A blocking lookup here waits for data that
+      // this node's own executor has to deliver, which tf2 warns about and
+      // which would stall the evaluation tick. /tf runs an order of magnitude
+      // faster than the scan, so the stamp is normally already in the buffer;
+      // when it is not, fall back to the newest transform available and judge
+      // it on age rather than blocking.
+      tf_cluster = lookupOrLatest(path->frame(), header.frame_id, header.stamp);
+      tf_ego = lookupOrLatest(path->frame(), base_frame_, header.stamp);
     } catch (const tf2::TransformException & e) {
       RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 5000,
@@ -504,6 +521,29 @@ private:
     if (!ego.valid) {return false;}
     out->ego_station = ego.station;
     return true;
+  }
+
+  // Transform at `stamp` if the buffer has it, otherwise the newest one, and
+  // only if that is fresh enough to still describe where the car is. Anything
+  // older is worse than no answer: it would place the obstacle against a
+  // stale pose and report a confident, wrong verdict.
+  geometry_msgs::msg::TransformStamped lookupOrLatest(
+    const std::string & target, const std::string & source,
+    const builtin_interfaces::msg::Time & stamp) const
+  {
+    try {
+      return tf_buffer_->lookupTransform(target, source, tf2_ros::fromMsg(stamp));
+    } catch (const tf2::TransformException &) {
+      const auto latest = tf_buffer_->lookupTransform(target, source, tf2::TimePointZero);
+      const double age =
+        (rclcpp::Time(stamp) - rclcpp::Time(latest.header.stamp)).seconds();
+      if (std::abs(age) > tf_timeout_) {
+        throw tf2::ExtrapolationException(
+          "newest " + target + "<-" + source + " is " + std::to_string(age) +
+          "s from the scan");
+      }
+      return latest;
+    }
   }
 
   // Closest approach of a cluster's footprint to the PLANNED line. Same

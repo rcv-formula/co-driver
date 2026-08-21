@@ -180,7 +180,11 @@
         "path_frame": "map",
         "base_frame": "base_link",
         "tf_timeout_ms": 200,
-        "use_path_speed": true,
+        // Diagnostics only. The geometry uses the speed the car is actually
+        // carrying - see obstacle_avoid.cpp for the measurement that settled
+        // this. Using the planned speed on a car driven below its plan makes
+        // every distant object urgent.
+        "use_path_speed": false,
 
         // Commit distance is derived from the manoeuvre, not tuned:
         //   speed x (reaction + sqrt(2 x lateral_need / lateral_accel))
