@@ -107,6 +107,9 @@
       "type": "path_clearance",
       "params": {
         "topic": "/scan",
+        // Measured speed, same reasoning as the obstacle scorer.
+        "speed_topic": "/odom",
+        "speed_timeout_ms": 300,
         "wheelbase": 0.324,
         "vehicle_half_width": 0.18,
         // how far ahead to look: lookahead_time x speed, bounded
@@ -175,6 +178,18 @@
         // the standby for a car whose planner is not running - same three
         // columns, x, y, speed. Losing both falls back to the commanded arc
         // and says so loudly in the note rather than reporting a clear path.
+        // Speed for the geometry comes from MEASURED odometry, not from the
+        // drive command. On the 0814 recording the map-frame pose says /odom
+        // is exact (ratio 1.00) while the command runs 2.24x low at the median
+        // and anywhere from 1.15x to 3.50x - a request the car tracks loosely,
+        // not a scaled truth, so no constant factor repairs it. Believing the
+        // command made every lookahead short by that much.
+        //
+        // Use /odom, NOT /odom_wheel: the wheel odometry on this car reads
+        // 2.66x slow (measured against the same pose), and /odom is the
+        // corrected one.
+        "speed_topic": "/odom",
+        "speed_timeout_ms": 300,
         "path_topic": "/global_path",
         "path_csv": "",
         "path_frame": "map",

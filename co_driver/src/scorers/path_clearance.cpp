@@ -91,6 +91,8 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 
 #include "co_driver/arc_geometry.hpp"
+#include <nav_msgs/msg/odometry.hpp>
+
 #include "co_driver/scorer.hpp"
 
 namespace co_driver
@@ -110,6 +112,24 @@ public:
     max_lookahead_ = jnum(p, "max_lookahead_m", 3.0);
     step_ = std::max(0.02, jnum(p, "step_m", 0.05));
     min_clearance_ = jnum(p, "min_clearance_m", 0.8);
+    // Speed for the geometry: MEASURED, not commanded.
+    //
+    // Every distance here is derived from speed, so the source matters. On the
+    // 0814 recording, differentiating the map-frame pose gives the truth, and:
+    //     pose / odom        = 1.00   (p10 0.99, p90 1.04)  <- odom is correct
+    //     pose / odom_wheel  = 2.66                          <- wheel is slow
+    //     pose / drive_main  = 2.24, spread p10 1.15 to p90 3.50
+    // The command is not a scaled version of the truth, it is a request the
+    // car tracks loosely, so no constant factor can repair it - at p99 the car
+    // was doing 5.73 m/s while commanding 2.06. Believing the command made the
+    // lookahead short by that much, which is the "it switches far too late"
+    // behaviour. Note /odom_wheel is the 2.6x-slow one; /odom is already
+    // corrected and is what this uses.
+    //
+    // The command remains the fallback for when odometry is silent, because a
+    // wrong lookahead beats none, and the note says which one is in use.
+    speed_topic_ = jstr(p, "speed_topic", "/odom");
+    speed_timeout_ = jms(p, "speed_timeout_ms", 300.0);
     min_speed_ = jnum(p, "min_speed", 0.2);
     max_sweep_ = jnum(p, "max_sweep_deg", 90.0) * M_PI / 180.0;
     block_ = jms(p, "block_ms", 200.0);
@@ -125,6 +145,16 @@ public:
     // subscription here would silently receive nothing.
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = group();
+    if (!speed_topic_.empty()) {
+      speed_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
+        speed_topic_, rclcpp::SensorDataQoS(),
+        [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(mtx_);
+          measured_speed_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+          speed_stamp_ = node_->now();
+          has_speed_ = true;
+        }, opts);
+    }
     sub_ = node->create_subscription<sensor_msgs::msg::LaserScan>(
       topic_, rclcpp::SensorDataQoS(),
       [this](const sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
@@ -154,7 +184,9 @@ public:
       scan = scan_;
     }
 
-    const double v = drive.cmd.drive.speed;
+    bool speed_from_odom = false;
+    const double v = geometrySpeed(drive.cmd.drive.speed, ctx, &speed_from_odom);
+    (void)speed_from_odom;
     const double delta = drive.cmd.drive.steering_angle;
     if (!std::isfinite(v) || !std::isfinite(delta)) {
       return ScoreResult::unavailable("command is NaN/inf");
@@ -181,6 +213,20 @@ public:
 private:
   // Arc length at which the commanded path first meets a scan return that is
   // within half a vehicle width of it.
+  // Measured speed if it is fresh, otherwise the command. `from_odom` tells the
+  // caller which, so the note can say so rather than quietly using the worse one.
+  double geometrySpeed(double commanded, const Context & ctx, bool * from_odom) const
+  {
+    if (has_speed_ &&
+      (speed_timeout_ <= 0.0 || (ctx.now - speed_stamp_).seconds() <= speed_timeout_))
+    {
+      *from_odom = true;
+      return std::abs(measured_speed_);
+    }
+    *from_odom = false;
+    return std::abs(commanded);
+  }
+
   double freeDistance(
     const sensor_msgs::msg::LaserScan & scan, double delta, double horizon) const
   {
@@ -243,6 +289,12 @@ private:
   };
 
   rclcpp::Node * node_{nullptr};
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr speed_sub_;
+  std::string speed_topic_;
+  double speed_timeout_{0.3};
+  bool has_speed_{false};
+  double measured_speed_{0.0};
+  rclcpp::Time speed_stamp_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_;
 
   std::string topic_;
@@ -254,6 +306,7 @@ private:
   double step_{0.05};
   double min_clearance_{0.8};
   double min_speed_{0.2};
+
   double max_sweep_{M_PI / 2.0};
   double block_{0.2};
   double clear_{5.0};

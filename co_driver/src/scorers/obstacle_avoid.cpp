@@ -160,6 +160,8 @@
 
 #include "co_driver/arc_geometry.hpp"
 #include "co_driver/path_reference.hpp"
+#include <nav_msgs/msg/odometry.hpp>
+
 #include "co_driver/scorer.hpp"
 
 namespace co_driver
@@ -209,6 +211,24 @@ public:
     //
     // reaction covers detection confirmation plus the handover blend; the
     // square root is the time to translate sideways far enough to miss.
+    // Speed for the geometry: MEASURED, not commanded.
+    //
+    // Every distance here is derived from speed, so the source matters. On the
+    // 0814 recording, differentiating the map-frame pose gives the truth, and:
+    //     pose / odom        = 1.00   (p10 0.99, p90 1.04)  <- odom is correct
+    //     pose / odom_wheel  = 2.66                          <- wheel is slow
+    //     pose / drive_main  = 2.24, spread p10 1.15 to p90 3.50
+    // The command is not a scaled version of the truth, it is a request the
+    // car tracks loosely, so no constant factor can repair it - at p99 the car
+    // was doing 5.73 m/s while commanding 2.06. Believing the command made the
+    // lookahead short by that much, which is the "it switches far too late"
+    // behaviour. Note /odom_wheel is the 2.6x-slow one; /odom is already
+    // corrected and is what this uses.
+    //
+    // The command remains the fallback for when odometry is silent, because a
+    // wrong lookahead beats none, and the note says which one is in use.
+    speed_topic_ = jstr(p, "speed_topic", "/odom");
+    speed_timeout_ = jms(p, "speed_timeout_ms", 300.0);
     reaction_time_ = jnum(p, "reaction_time", 0.5);
     lateral_accel_ = std::max(0.5, jnum(p, "lateral_accel", 5.0));
     commit_margin_ = jnum(p, "commit_margin_m", 0.5);
@@ -241,6 +261,16 @@ public:
     // match it and would receive nothing at all.
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = group();
+    if (!speed_topic_.empty()) {
+      speed_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
+        speed_topic_, rclcpp::SensorDataQoS(),
+        [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(mtx_);
+          measured_speed_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+          speed_stamp_ = node_->now();
+          has_speed_ = true;
+        }, opts);
+    }
     sub_ = node->create_subscription<obstacle_context_msgs::msg::ObstacleClusterArray>(
       topic_, rclcpp::SensorDataQoS(),
       [this](const obstacle_context_msgs::msg::ObstacleClusterArray::ConstSharedPtr msg) {
@@ -345,7 +375,8 @@ public:
     // 50 Hz, so a car that accelerates gets the longer lookahead immediately -
     // long before it arrives anywhere. A crawling car genuinely does not need
     // to worry about something eight metres away.
-    const double v_now = std::abs(v);
+    bool speed_from_odom = false;
+    const double v_now = geometrySpeed(v, ctx, &speed_from_odom);
     const double v_plan = v_now;
     const double v_planned_here = (on_plan && use_path_speed_) ?
       ref.path->speedAt(ref.ego_station) : 0.0;
@@ -457,6 +488,20 @@ public:
   }
 
 private:
+  // Measured speed if it is fresh, otherwise the command. `from_odom` tells the
+  // caller which, so the note can say so rather than quietly using the worse one.
+  double geometrySpeed(double commanded, const Context & ctx, bool * from_odom) const
+  {
+    if (has_speed_ &&
+      (speed_timeout_ <= 0.0 || (ctx.now - speed_stamp_).seconds() <= speed_timeout_))
+    {
+      *from_odom = true;
+      return std::abs(measured_speed_);
+    }
+    *from_odom = false;
+    return std::abs(commanded);
+  }
+
   // Everything needed to place a cluster on the plan: which path, where we are
   // on it, and how to get from the cluster's frame into the path's.
   struct PathRef
@@ -705,6 +750,12 @@ private:
   };
 
   rclcpp::Node * node_{nullptr};
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr speed_sub_;
+  std::string speed_topic_;
+  double speed_timeout_{0.3};
+  bool has_speed_{false};
+  double measured_speed_{0.0};
+  rclcpp::Time speed_stamp_;
   rclcpp::Subscription<obstacle_context_msgs::msg::ObstacleClusterArray>::SharedPtr sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -716,6 +767,7 @@ private:
   double tf_timeout_{0.2};
   bool use_path_speed_{true};
   double reaction_time_{0.5};
+
   double lateral_accel_{5.0};
   double commit_margin_{0.5};
   double commit_demand_{0.85};
