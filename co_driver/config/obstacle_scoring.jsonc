@@ -303,6 +303,21 @@
           // cooldown floor, so the return is once again driven by the obstacle
           // having gone past - 2.4-4.8 m of travel at 2-4 m/s, comfortably
           // clear of anything the detector reports as a cluster.
+          // Presence is judged across a window of scans rather than on the
+          // current one: a real object is reported lap after lap, while corner
+          // structure thrown onto the line by map distortion comes and goes.
+          // 600 ms is 24 scans at 40 Hz; it must be seen in 65% of them to
+          // count, and fall under 25% to stop counting.
+          "presence_window_ms": 900,
+          "presence_enter": 0.55,
+          "presence_exit": 0.20,
+          // A sample counts only if it names the same place on the line as the
+          // rest of the window. A fixed object does; structure thrown onto the
+          // line by map distortion does not, because a different piece of wall
+          // is reported each time. This is what makes a longer window worth
+          // having - lengthening it alone would only delay the commit, and at
+          // 7 m/s there is no range to spare for that.
+          "presence_station_tolerance_m": 1.0,
           "block_ms": 200,
           "clear_ms": 700,
           "timeout_ms": 500
@@ -343,21 +358,6 @@
           // against the obstacle detour's 2.25 s - the intended asymmetry did
           // not exist. This is the knob that separates the two roles, so it has
           // to be above the floor to do anything.
-          // Presence is judged across a window of scans rather than on the
-          // current one: a real object is reported lap after lap, while corner
-          // structure thrown onto the line by map distortion comes and goes.
-          // 600 ms is 24 scans at 40 Hz; it must be seen in 65% of them to
-          // count, and fall under 25% to stop counting.
-          "presence_window_ms": 900,
-          "presence_enter": 0.55,
-          "presence_exit": 0.20,
-          // A sample counts only if it names the same place on the line as the
-          // rest of the window. A fixed object does; structure thrown onto the
-          // line by map distortion does not, because a different piece of wall
-          // is reported each time. This is what makes a longer window worth
-          // having - lengthening it alone would only delay the commit, and at
-          // 7 m/s there is no range to spare for that.
-          "presence_station_tolerance_m": 1.0,
           "block_ms": 200,
           "clear_ms": 5000,
           "timeout_ms": 500
