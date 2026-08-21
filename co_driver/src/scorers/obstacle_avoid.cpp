@@ -542,7 +542,18 @@ public:
         // look identical, and the prompt return fires on detection dropouts -
         // which at speed is often, since association breaks on about a quarter
         // of tracks above 5 m/s.
-        if (on_plan) {
+        // Remember where the thing that STARTED this detour sits, and stop
+        // remembering anything else until the detour is over.
+        //
+        // Updating it every cycle to whatever is most urgent now looked
+        // harmless and was not: the two objects on the 0814 track are 9.3 m
+        // apart on a 44.2 m lap, so the moment one is passed the next is
+        // already in view, the remembered place jumps forward to it, and "have
+        // I driven past it" can never become true. The detour then always ran
+        // out the full clear_ms instead of ending the moment it was behind -
+        // measured, every single obstacle veto in the stretch where there was
+        // room to spare was that tail, not a new commitment.
+        if (on_plan && !state_[drive.name].blocked) {
           block_station_[drive.name] = station_of_max_;   // absolute, on the plan
           have_block_station_[drive.name] = true;
         }
