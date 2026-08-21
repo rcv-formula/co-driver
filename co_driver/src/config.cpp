@@ -206,6 +206,7 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
   auto & sel = c->selection;
   sel.switch_margin = pnum(n, "selection.switch_margin", sel.switch_margin);
   sel.switch_cooldown = pms(n, "selection.switch_cooldown_ms", sel.switch_cooldown * 1e3);
+  sel.freeze_below_speed = pnum(n, "selection.freeze_below_speed", sel.freeze_below_speed);
   sel.fallback = pstr(n, "selection.fallback", sel.fallback);
 
   c->pipeline.clear();
@@ -315,8 +316,25 @@ bool loadTopics(
     *error = "top level of the topics file is not a JSON object.";
     return false;
   }
-  if (!tuning_path.empty() && !applyTuning(root, tuning_path, error)) {
-    return false;
+  // tuning_file may name several files, comma separated, applied in order.
+  // The scorers' own parameters are split by subject - localization in one
+  // file, obstacle geometry in another - so that changing how obstacles are
+  // judged cannot disturb a localization calibration, and so each file can be
+  // read on its own without wading through the other.
+  if (!tuning_path.empty()) {
+    std::size_t from = 0;
+    while (from <= tuning_path.size()) {
+      const std::size_t comma = tuning_path.find(',', from);
+      std::string one = tuning_path.substr(
+        from, comma == std::string::npos ? std::string::npos : comma - from);
+      // trim
+      const auto b = one.find_first_not_of(" \t");
+      const auto e = one.find_last_not_of(" \t");
+      one = (b == std::string::npos) ? "" : one.substr(b, e - b + 1);
+      if (!one.empty() && !applyTuning(root, one, error)) {return false;}
+      if (comma == std::string::npos) {break;}
+      from = comma + 1;
+    }
   }
 
   // --- inputs ---

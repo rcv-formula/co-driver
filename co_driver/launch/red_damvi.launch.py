@@ -24,7 +24,13 @@ def generate_launch_description():
     share = get_package_share_directory('co_driver')
     default_config = os.path.join(share, 'config', 'co_driver_red_damvi.yaml')
     default_topics = os.path.join(share, 'config', 'co_driver_red_damvi_topics.jsonc')
-    default_tuning = os.path.join(share, 'config', 'localization_scoring.jsonc')
+    # The scorers' own parameters, split by subject so a change to how an
+    # obstacle is measured cannot disturb a localization calibration. Both are
+    # deep-merged over the topics file, in this order.
+    default_tuning = ','.join((
+        os.path.join(share, 'config', 'localization_scoring.jsonc'),
+        os.path.join(share, 'config', 'obstacle_scoring.jsonc'),
+    ))
 
     args = [
         DeclareLaunchArgument('config', default_value=default_config),

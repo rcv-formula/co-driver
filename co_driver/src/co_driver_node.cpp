@@ -120,6 +120,27 @@ private:
     }
     const bool incumbent_ok = incumbent && incumbent->valid;
 
+    // A stopped car is not driving anywhere, so there is nothing for a
+    // handover to achieve and nothing it can protect against. Freezing the
+    // selection there is not a safety compromise - whatever is selected is
+    // commanding a standstill - and it removes churn the driver can see:
+    // localization cannot discriminate its position without motion (the
+    // producer says so itself), so the state wanders Lost/Converging while
+    // the car sits, disqualifying and releasing the map controller for no
+    // reason anyone could act on. Measured over 71 s of standstill in the
+    // 0814 recording, that accounted for 12.9% of samples.
+    //
+    // The freeze lifts on the first cycle the car is moving again, and never
+    // holds a drive whose command has gone stale.
+    if (incumbent_ok && spec_.freeze_below_speed > 0.0 &&
+      std::abs(incumbent->cmd.drive.speed) < spec_.freeze_below_speed)
+    {
+      r.has_selection = true;
+      r.name = current_;
+      r.reason = "stopped - selection frozen";
+      return r;
+    }
+
     const Drive * best = nullptr;
     for (const auto & d : drives) {
       if (!d.valid) {continue;}

@@ -98,6 +98,17 @@
       switch_cooldown_ms: 1500
       fallback: "gap_loc"
 
+      # Below this commanded speed the selection is frozen. A stopped car is not
+      # driving anywhere, so a handover achieves nothing and protects against
+      # nothing - whatever holds the car is commanding a standstill either way.
+      # What it does remove is churn: localization cannot discriminate its
+      # position without motion, so the state wanders Lost/Converging while the
+      # car sits and the map controller is disqualified and released over and
+      # over. Measured across 71 s of standstill in the 0814 recording, that was
+      # 12.9% of samples. The freeze lifts on the first cycle the car moves, and
+      # never holds a drive whose command has gone stale.
+      freeze_below_speed: 0.15
+
     # =====================================================================
     # Post-processing - the pipeline list is the order of application.
     # =====================================================================

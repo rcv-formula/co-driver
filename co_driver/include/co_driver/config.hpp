@@ -109,6 +109,9 @@ struct SelectionSpec
   // Unrelated to a drive's hold -- called cooldown to avoid confusion.
   double switch_cooldown{0.5};     // [s] (yaml: switch_cooldown_ms)
   std::string fallback;   // last-resort drive when all are disqualified (must itself be valid)
+  // Below this commanded speed the selection is frozen: a stopped car has
+  // nothing to gain from a handover. 0 disables. (yaml: freeze_below_speed)
+  double freeze_below_speed{0.0};
 };
 
 // One postprocess stage. Only the fields its type uses are filled (see compute.cpp).

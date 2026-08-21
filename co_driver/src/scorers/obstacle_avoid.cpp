@@ -146,6 +146,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -259,6 +260,33 @@ public:
     jitter_base_ = jnum(p, "jitter_base_m", 0.10);
     jitter_per_m_ = jnum(p, "jitter_per_m", 0.03);
     jitter_per_speed_ = jnum(p, "jitter_per_mps", 0.04);
+
+    // Presence is judged over a WINDOW of scans, not on the current one.
+    //
+    // A real object is reported lap after lap from every angle; what comes and
+    // goes is structure the detector did not label as wall, thrown onto the
+    // planned line by map distortion and pose jitter at the corners. Measured
+    // on 0814 over the stretch of the lap with no object on it at all, 67.8%
+    // of samples were disqualified on obstacles, against detections reported
+    // 2.6-4.0 m ahead "on the plan". Those flicker; the two placed objects do
+    // not.
+    //
+    // Judging the fraction of the window that saw something, rather than an
+    // unbroken run, also survives the detector losing association - which it
+    // does on about a quarter of tracks above 5 m/s - so the same filter
+    // handles both the false positives and the dropouts.
+    window_ = jms(p, "presence_window_ms", 900.0);
+    enter_frac_ = std::clamp(jnum(p, "presence_enter", 0.55), 0.0, 1.0);
+    exit_frac_ = std::clamp(jnum(p, "presence_exit", 0.20), 0.0, enter_frac_);
+    // Accumulating over more scans only helps if the scans have to AGREE. A
+    // fixed object keeps the same place on the planned line every time it is
+    // seen; structure thrown onto the line by map distortion moves around,
+    // because what is being reported is a different piece of wall each time.
+    // So a sample counts toward presence only if it names the same place as
+    // the rest of the window - which filters without costing reaction time,
+    // where simply lengthening the window would delay the commit and there is
+    // no range to spare for that (the detector stops at 10 m).
+    station_tol_ = jnum(p, "presence_station_tolerance_m", 1.0);
 
     block_ = jms(p, "block_ms", 200.0);
     // Once the obstacle's station is behind us it is passed, and that is a
@@ -747,8 +775,45 @@ private:
     const std::string & drive, const Context & ctx, double demand, double dist,
     int considered, const std::string & reason)
   {
-    const bool clear_now = demand <= 0.0;
     State & st = state_[drive];
+    // Rolling window of what each recent cycle saw.
+    st.seen.push_back(
+      {ctx.now, demand > 0.0, block_station_[drive], have_block_station_[drive]});
+    while (!st.seen.empty() && (ctx.now - st.seen.front().when).seconds() > window_) {
+      st.seen.pop_front();
+    }
+    // Presence counts only the samples that agree on WHERE. The reference is
+    // the median of the located ones, so a run of consistent sightings is not
+    // outvoted by a couple of wild ones.
+    std::vector<double> located;
+    for (const auto & s : st.seen) {
+      if (s.present && s.located) {located.push_back(s.station);}
+    }
+    double ref = 0.0;
+    if (!located.empty()) {
+      std::nth_element(located.begin(), located.begin() + located.size() / 2, located.end());
+      ref = located[located.size() / 2];
+    }
+    int hits = 0;
+    for (const auto & s : st.seen) {
+      if (!s.present) {continue;}
+      // Judged on the arc, with no place on the plan to compare - count it,
+      // since refusing would make the fallback path stricter than the main one.
+      if (!s.located || located.empty() || std::abs(s.station - ref) <= station_tol_) {
+        ++hits;
+      }
+    }
+    const double presence = st.seen.empty() ?
+      0.0 : static_cast<double>(hits) / static_cast<double>(st.seen.size());
+    // Hysteresis on the fraction, so a detection sitting near the bar does not
+    // toggle the latch every cycle.
+    if (presence >= enter_frac_) {
+      st.present = true;
+    } else if (presence <= exit_frac_) {
+      st.present = false;
+    }
+    st.presence = presence;
+    const bool clear_now = !st.present;
     // Commitment latch, separate from the presence latch below: presence
     // decides whether we are in a detour at all, this decides whether the
     // drive stays disqualified while we are in one.
@@ -800,8 +865,17 @@ private:
         std::snprintf(
           buf, sizeof(buf), "%s, holding %.1f/%.1fs",
           by_station ? "obstacle passed" :
-          (still_ahead ? "not past it yet" : "path clearing"), dwell, cap);
+          ((remember_cap_ > 0.0 && still_ahead) ? "not past it yet" : "path clearing"),
+          dwell, cap);
         return ScoreResult::ok(0.0, buf);        // stay committed to the detour
+      }
+      if (!std::isfinite(dist)) {
+        // The window is holding through a gap in detection - nothing is being
+        // reported this cycle, so there is no distance to quote.
+        std::snprintf(
+          buf, sizeof(buf), "holding through a gap, seen %.0f%% of %.1fs",
+          100.0 * st.presence, window_);
+        return ScoreResult::ok(std::clamp(1.0 - demand, 0.0, 1.0), buf);
       }
       std::snprintf(
         buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f%s", dist,
@@ -833,8 +907,19 @@ private:
   double station_of_max_{0.0};
   std::map<std::string, bool> last_ahead_;
 
+  struct Seen
+  {
+    rclcpp::Time when;
+    bool present{false};
+    double station{0.0};      // where on the plan it was, when present
+    bool located{false};      // false when judged on the arc, with no station
+  };
+
   struct State
   {
+    std::deque<Seen> seen;
+    bool present{false};
+    double presence{0.0};
     bool was_clear{true};
     bool valid{false};
     bool blocked{false};
@@ -890,6 +975,10 @@ private:
   int min_points_{0};
   double sample_step_{0.08};
   double block_{0.2};
+  double window_{0.9};
+  double enter_frac_{0.55};
+  double exit_frac_{0.20};
+  double station_tol_{1.0};
   double clear_{0.7};
   double timeout_{0.5};
 

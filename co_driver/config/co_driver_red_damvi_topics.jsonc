@@ -106,41 +106,9 @@
       "name": "clearance",
       "type": "path_clearance",
       "params": {
+        // Thresholds and timings live in obstacle_scoring.jsonc.
         "topic": "/scan",
-        // Measured speed, same reasoning as the obstacle scorer.
-        "speed_topic": "/odom",
-        "speed_timeout_ms": 300,
-        "wheelbase": 0.324,
-        "vehicle_half_width": 0.18,
-        // how far ahead to look: lookahead_time x speed, bounded
-        "lookahead_time": 1.0,
-        "min_lookahead_m": 0.5,
-        "max_lookahead_m": 3.0,
-        // below this much free path along the command, the drive is blocked
-        "min_clearance_m": 0.8,
-        // a crawling command cannot run into anything soon
-        "min_speed": 0.2,
-        // stop projecting after this much heading change - a command is a
-        // snapshot, not a trajectory. At full lock the arc is a 30 cm circle,
-        // and following it further curls the corridor into whatever is beside
-        // or behind the car (measured: two vetoes on the 0813 run from an
-        // object off the right flank, reached only after 140 degrees of sweep,
-        // with the path ahead open at 2.86 m). Gentle steering sweeps only a
-        // few degrees, so normal driving is unaffected.
-        "max_sweep_deg": 90.0,
-        // One noisy sweep is not evidence. Clearing is deliberately slow: a
-        // drive that commanded a path into structure keeps the veto until it
-        // has commanded a clear one for five seconds.
-        //
-        // Five, not two, because returning costs ~2.2 s anyway (switch
-        // cooldown plus selection margin) and anything under that floor is
-        // absorbed by it. Measured at 2000 ms: clearance returned in 2.11 s
-        // against the obstacle detour's 2.25 s - the intended asymmetry did
-        // not exist. This is the knob that separates the two roles, so it has
-        // to be above the floor to do anything.
-        "block_ms": 200,
-        "clear_ms": 5000,
-        "timeout_ms": 500
+        "speed_topic": "/odom"
       }
     },
 
@@ -167,269 +135,14 @@
       "name": "obstacles",
       "type": "obstacle_avoid",
       "params": {
+        // Everything else - corridor, trigger and commit geometry, jitter
+        // model, presence window, holds - lives in obstacle_scoring.jsonc.
         "topic": "/obstacle_clusters",
-        // Judged against the PLANNED line, not the current steering angle.
-        // The steering angle swings with every correction and says nothing
-        // about the corner after this one; the plan is where the car is
-        // actually going. The plan's z coordinate carries the planned speed,
-        // which is what decides how much room the manoeuvre needs.
-        //
-        // Latched (transient_local), so it arrives on subscribe. The csv is
-        // the standby for a car whose planner is not running - same three
-        // columns, x, y, speed. Losing both falls back to the commanded arc
-        // and says so loudly in the note rather than reporting a clear path.
-        // Speed for the geometry comes from MEASURED odometry, not from the
-        // drive command. On the 0814 recording the map-frame pose says /odom
-        // is exact (ratio 1.00) while the command runs 2.24x low at the median
-        // and anywhere from 1.15x to 3.50x - a request the car tracks loosely,
-        // not a scaled truth, so no constant factor repairs it. Believing the
-        // command made every lookahead short by that much.
-        //
-        // Use /odom, NOT /odom_wheel: the wheel odometry on this car reads
-        // 2.66x slow (measured against the same pose), and /odom is the
-        // corrected one.
         "speed_topic": "/odom",
-        "speed_timeout_ms": 300,
         "path_topic": "/global_path",
         "path_csv": "",
         "path_frame": "map",
-        "base_frame": "base_link",
-        "tf_timeout_ms": 200,
-        // Diagnostics only. The geometry uses the speed the car is actually
-        // carrying - see obstacle_avoid.cpp for the measurement that settled
-        // this. Using the planned speed on a car driven below its plan makes
-        // every distant object urgent.
-        "use_path_speed": false,
-
-        // Commit distance is derived from the manoeuvre, not tuned:
-        //   speed x (reaction + sqrt(2 x lateral_need / lateral_accel))
-        // reaction covers the 200 ms detection hold plus the 300 ms handover
-        // blend. At 7 m/s with a 0.73 m corridor and 5 m/s^2 that is 7.8 m.
-        // This is what "stay on the fast controller until the last moment it
-        // is still avoidable" means in numbers.
-        "reaction_time": 0.5,
-        "lateral_accel": 5.0,
-        "commit_margin_m": 0.5,
-        // Must equal veto_below on pp_main below (score = 1 - demand). Keeping
-        // them in step is what makes "commit distance" a real distance.
-        "commit_demand": 0.85,
-        // Equal to commit_demand: no extra hold. This existed to damp the
-        // handovers that appeared when the arbitration's switch_cooldown was
-        // bypassed on a gate-forced return. That bypass was measured and
-        // reverted (see co_driver_node.cpp), so the cooldown supplies the
-        // damping again and a second layer of it only costs occupancy -
-        // measured, the obstacle veto went from 32.2% to 41.7% of the drive
-        // with nothing to show for it. Lower it only if handovers ever
-        // reappear without the cooldown being involved.
-        "release_demand": 0.6,
-
-        // Reported cluster positions wander, and more so far away (fewer beams
-        // on the object, coarser angular quantisation) and fast (more ego
-        // motion between the scan and this decision). The on-path test is
-        // softened by this spread instead of pretending the lateral offset is
-        // exact, so a cluster near the corridor edge grades rather than
-        // flickering in and out.
-        //
-        // Measured on the 0814 recording by tracking each cluster by track_id
-        // and taking the frame-to-frame movement perpendicular to the line of
-        // sight - 20353 samples. The 90th percentile fits
-        //     jitter = 0.001 + 0.0358 x range
-        // almost exactly (p90 by band: 0.072 / 0.080 / 0.153 / 0.252 / 0.346
-        // at 1 / 3 / 5 / 7 / 9 m). Range is the whole story.
-        //
-        // Speed is NOT: holding range fixed, the same p90 does not rise with
-        // speed (0.089 / 0.060 / 0.106 / 0.082 across speed bands at 2-4 m).
-        // The apparent speed trend in the raw numbers is range in disguise -
-        // the car was only fast where the obstacles were far. The small speed
-        // term that remains is an allowance for ego motion between the scan
-        // stamp and this decision, not a measurement, and it is UNVERIFIED
-        // above 2.33 m/s, which is as fast as that recording ever went.
-        //
-        // The detector measured the same quantity on 0813 with ego motion
-        // removed and got roughly half the slope (lateral p90 6.0 cm at 1.2 m
-        // rising to 15.8 cm at 8.8 m). The larger figure is used, because this
-        // spread only ever widens the grey band at the corridor EDGE - an
-        // obstacle actually on the line still scores a full 1.0 however large
-        // the spread is - so overestimating costs decisiveness at the margin
-        // and nothing else.
-        "jitter_base_m": 0.02,
-        "jitter_per_m": 0.036,
-        "jitter_per_mps": 0.02,
-
-        // Once the obstacle's station on the plan is behind us it is passed,
-        // which is geometry rather than a timeout, so the return is quick.
-        "passed_clear_ms": 250,
-        // Holding the detour on memory alone while the obstacle's place on the
-        // plan is still ahead. Tried at 2500 and measured worse - 4 points of
-        // occupancy for no reduction in handovers - so the splitting it was
-        // meant to prevent was not coming from forgetting. 0 disables it.
-        "remember_cap_ms": 0,
-        "wheelbase": 0.324,
-        "vehicle_half_width": 0.18,
-        // Extra room either side of the vehicle when deciding "on the path".
-        // 0.55 m is from the 0813 recording: the three real objects on that
-        // track are only caught from 0.50 m upward, and 0.50-0.60 m all give
-        // the same result, so this sits in the middle of the verified band.
-        // Avoidance wants more room than "will just barely miss" - this is not
-        // the last-moment check, that is path_clearance.
-        "lateral_margin_m": 0.55,
-        // an obstacle anywhere on the commanded path within this much travel
-        // is reason to go around it (bounded, so it stays sane at any speed)
-        //
-        // The two bounds were widened after the 0813 joint run. They exist to
-        // keep the window sane at the speed extremes, but set too tight they
-        // close the graded band entirely, and the demand becomes a step:
-        // measured over 18337 status samples, NOT ONE fell in the graded
-        // 0.01-0.85 range - every non-zero sample was already past the veto.
-        // At that run's 0.6-1.7 m/s the old min_trigger 1.0 clamped the
-        // trigger while full urgency floated free, leaving well under half a
-        // metre between "noticed" and "committed". The old max_trigger 4.0
-        // does the same at the other end: past ~2.7 m/s the trigger stops
-        // growing while full urgency keeps up with speed, and the band closes
-        // again. 2.0 / 6.0 keeps at least ~1.2 m of graded approach from
-        // 0.5 m/s to 6 m/s.
-        //
-        // This changes nothing in the mid range: at 2.5 m/s the trigger is
-        // 1.5 x v = 3.75 m either way, so the commit distance the regression
-        // suite pins (2.0 m static / deferred dynamic) is untouched.
-        // Sized for the speeds the plan actually asks for. The raceline on
-        // this track calls for up to 8.0 m/s, and at 7 m/s a 6 m cap is 0.86 s
-        // of travel - less than the manoeuvre needs, so the car would arrive
-        // at the commit distance the same instant it first noticed anything.
-        // 2.5 s of travel, capped at 14 m, gives 17.5 m of intent at 7 m/s.
-        //
-        // NOTE the real ceiling is the detector, not this: it publishes
-        // nothing beyond max_valid_range (10.0 m as of the 0814 recording,
-        // where the furthest of 35076 clusters was exactly 10.00 m). Until
-        // that is raised, 7 m/s leaves only ~2.7 m between first sight and the
-        // commit distance. Raising the cap here costs nothing and stops
-        // co_driver being the limit once the detector's range grows.
-        "trigger_time": 2.5,
-        "min_trigger_m": 2.0,
-        "max_trigger_m": 14.0,
-        // Urgency is measured in time of travel, not metres, so speed decides
-        // what counts as close: inside this many seconds of travel the demand
-        // is full, and it fades out to the trigger distance. Seeing an
-        // obstacle is not a reason to hand over - being about to arrive at
-        // one is.
-        //
-        // full_urgency_time is deliberately NOT lowered to open the band -
-        // it sets the commit distance, and at 2.5 m/s dropping 0.8 -> 0.6
-        // would move the commit from 2.0 m to 1.5 m, i.e. 0.6 s of travel,
-        // against a 200 ms detection hold plus a 300 ms blend. The band is
-        // opened from the trigger end, where being early costs nothing but a
-        // rising bar on the status stream.
-        "full_urgency_time": 0.8,
-        "min_full_urgency_m": 0.8,
-        // DYNAMIC-labelled clusters get a shorter window, i.e. we commit to
-        // the detour later. The label is velocity-derived and not reliable,
-        // but it only appears when the relative speed is high, and something
-        // moving fast may have moved on by the time we arrive. Using it only
-        // to be MORE conservative means a wrong label costs nothing. Note the
-        // car runs the detector in STATIC_ONLY mode, where DYNAMIC is
-        // overwritten before publication - this is inert there until that
-        // changes.
-        "dynamic_urgency_scale": 0.6,
-        // and never more than this much ground, whatever the speed. The
-        // detector's false-DYNAMIC rate climbs with ego speed (5% below
-        // 1 m/s, 31% at 5-6 m/s) exactly as the cost of a late commit climbs
-        // with it. Scaling alone lets both grow together; this bounds it.
-        "dynamic_delay_max_m": 0.5,
-        // Confidence, not threat. max_dense_weight is a range-normalised
-        // spatial accumulation over ~7 frames, independent of the velocity
-        // estimates; low values are transient or noise clusters (the detector
-        // measured a spurious corridor intrusion at 0.0 with 7 points). Real
-        // objects on 0813 sit at p10 55.6 / median 80.4, so 20 is a floor that
-        // rejects noise without touching them. It is NOT a wall filter -
-        // structure scores higher on this field, not lower.
-        "dense_full": 20.0,
-        // Note: the detector zeroes max_dense_weight, observed_count,
-        // is_wall_static and track_id when its odom input is unavailable.
-        // An all-zero trust signature is read as "cannot measure" rather than
-        // "not trustworthy", and the cluster is judged on geometry alone -
-        // otherwise losing localization would quietly turn obstacle avoidance
-        // off at exactly the wrong moment.
-        // Drop single-frame flickers only. Higher would delay reacting to a
-        // newly appeared object, which is exactly when reacting matters.
-        // A young track is discounted, not erased. observed_count resets every
-        // time the detector loses association, and association is the first
-        // thing speed breaks: at 5-6 m/s the centroid moves up to 49.8 cm
-        // between frames against a 60 cm gate and association falls from
-        // 90-97% to 81%. Erasing on track age made real obstacles disappear
-        // exactly when the car was fast enough to need them.
-        //
-        // 1.0 = no discount: rely on block_ms (200 ms, eight frames at 40 Hz)
-        // to reject flicker, which is a filter the detector's association
-        // cannot break. Lower this only with a measurement showing spurious
-        // clusters that survive 200 ms.
-        "min_observed": 2,
-        "immature_scale": 1.0,
-        "max_sweep_deg": 90.0,
-        "min_speed": 0.2,
-        // Wall-labelled clusters are skipped - but the detector only considers
-        // the label at 1.0 m and wider, so a wall fragment or guard-rail
-        // section narrower than that arrives as an ordinary obstacle and will
-        // be avoided. The fixed structure 0.75 m off the right flank in the
-        // 0813 recording is 0.91 m wide and can never be labelled. This is a
-        // partial filter, not wall rejection.
-        "ignore_wall_static": true,
-        // Off. What is an obstacle and what is structure is the detector's
-        // call, not co_driver's - this node does not detect obstacles, it
-        // receives them and decides only whether they sit on the commanded
-        // path. The detector already drops anything wider than 3 m and labels
-        // what it judges to be wall; second-guessing that with a width of my
-        // own was overreach, and the measurements agreed: across five datasets
-        // real objects and sub-1 m structure share the same width distribution
-        // to two decimals, so no threshold here separates them anyway.
-        //
-        // Consequence, accepted by the user: an unlabelled wall fragment on
-        // the path is avoided like any other obstacle. On 0813 that is 2 extra
-        // handovers per run alongside the 3 real ones. Reacting to a wall
-        // costs a little speed; deciding for ourselves that something is not
-        // an obstacle risks driving into one.
-        // A safety cap, not a classifier. Nothing narrower than this is ever
-        // judged on its size; the cap only removes returns too wide to be an
-        // object at all. The detector measured real objects and sub-metre
-        // structure to have identical width distributions (p50 0.37, p75
-        // 0.55), so a bar at 1.0 sits clear of anything a real obstacle has
-        // measured, and 0.6 - tried earlier - cut into them.
-        //
-        // Chosen by sweeping the 0814 drive, four settings on the same run
-        // (pp_main share / share at 4-5 m/s / handovers / avoidance episodes
-        // kept out of 28):
-        //   off                49.9%  24.0%  66  28/28
-        //   width 1.0          55.1%  42.3%  52  24/28   <- this
-        //   margin 0.30        52.8%  29.6%  66  28/28
-        //   width 1.0+mgn 0.40 57.0%  42.8%  50  23/28
-        //
-        // The four episodes this drops were each inspected: all 0.24-0.38 s
-        // long, against clusters of median width 0.82-1.17 m (up to 2.82 m) at
-        // 6.2-8.1 m. Wide, far and brief - wall fragments the detector did not
-        // label as wall. Narrowing the corridor instead keeps every episode but
-        // saves no handovers at all and splits 28 encounters into 32.
-        //
-        // The 0.40 margin was rejected despite the best numbers: the extra
-        // episode it loses is a 0.31 m-wide cluster at 3.84 m, which is the
-        // shape of a real object. Buying 1.9 points of occupancy by shaving
-        // lateral clearance is not this scorer's call to make.
-        "max_width_m": 1.0,
-        "min_point_count": 0,
-        // Return once the path is clear - nothing was wrong with pp_main, it
-        // was simply occupied. Contrast the clearance check's 5000 ms.
-        //
-        // 1200 ms, raised from 700. On the 0813 run the five detours each ran
-        // 0.86-1.10 s of demand and every one of them returned at exactly
-        // 1.50 s - the arbitration's switch_cooldown_ms, not this hold. That
-        // is the wrong thing to be in charge of the return: the cooldown is a
-        // flap guard that knows nothing about where the obstacle is, and at
-        // 1.5 s the car can still be alongside it when pp_main resumes and
-        // steers back toward the raceline. 1200 ms puts this hold above the
-        // cooldown floor, so the return is once again driven by the obstacle
-        // having gone past - 2.4-4.8 m of travel at 2-4 m/s, comfortably
-        // clear of anything the detector reports as a cluster.
-        "block_ms": 200,
-        "clear_ms": 700,
-        "timeout_ms": 500
+        "base_frame": "base_link"
       }
     },
 
@@ -446,13 +159,9 @@
       "name": "off_path",
       "type": "path_deviation",
       "params": {
+        // Thresholds and timings live in obstacle_scoring.jsonc.
         "path_topic": "/global_path",
-        "base_frame": "base_link",
-        // The line runs 0.7-1.0 m from the walls on this track, so 1.5 m off
-        // it is outside the drivable corridor rather than a wide entry.
-        "max_deviation_m": 1.5,
-        "trip_ms": 400,
-        "clear_ms": 800
+        "base_frame": "base_link"
       }
     },
 
@@ -535,7 +244,19 @@
       "name": "gap_loc",
       "topic": "/drive_gf",
       "hold_ms": 500,
-      "keep_ms": 1500,
+      // 500, not 1500. The recovery latch already refuses to give the map
+      // controller back until localization has been healthy for 2500 ms, and
+      // that is a strictly stronger guard than a timer - it checks the thing
+      // that went wrong. Charging both meant the return after a genuine
+      // localization dip carried a tail of dead time: measured over the parts
+      // of the 0814 lap where no obstacle is even visible yet, 9.7% of samples
+      // were sitting out this cooldown with pp_main already fit to drive.
+      //
+      // For the marginal case the latch does not arm on - confidence wobbling
+      // near the threshold without dropping under 0.35 - the deadband
+      // (0.171 out, 0.226 back) and the logit EMA are the guards, as they were
+      // before this number existed.
+      "keep_ms": 500,
       "bias": 1.0,
       "enabled": true,
       "influence": {
@@ -553,8 +274,8 @@
       // on the topic, not the name).
       //
       // The obstacle input enters NEGATIVELY on clearness: a clear path is
-      // -1.5 and puts this candidate below the others, full demand is 0.0 and
-      // puts it above gap_loc's -0.5. The span is kept small deliberately -
+      // -1.7 with the bias, putting this candidate well below the others, and
+      // +0.3 at full demand, comfortably above gap_loc's -0.5. The span is kept small deliberately -
       // the logit is EMA-smoothed, so a wider one just means this candidate
       // takes longer to catch up once an obstacle appears. So it wins exactly when there is
       // something to go around and localization is fine, and yields to gap_loc
@@ -563,10 +284,16 @@
       "topic": "/drive_gf",
       "hold_ms": 500,
       "keep_ms": 400,
-      "bias": 0.0,
+      // A small positive bias so that once there IS demand this candidate is
+      // clearly ahead of gap_loc rather than a hair in front. With the two
+      // only 0.34 apart in logit, the EMA had not finished moving before the
+      // margin test ran and the localization fallback took a detour that was
+      // not about localization - same command, wrong label, and then the wrong
+      // dwell on the way back.
+      "bias": 0.3,
       "enabled": true,
       "influence": {
-        "obstacles": {"weight": -1.5, "exp_mix": 0.0}
+        "obstacles": {"weight": -2.0, "exp_mix": 0.0}
       }
     }
   ]
