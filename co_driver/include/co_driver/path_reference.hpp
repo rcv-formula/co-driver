@@ -127,7 +127,33 @@ public:
   // Closest point on the polyline to (px, py), as arc length plus perpendicular
   // distance. Segments are tested rather than vertices, so the answer does not
   // depend on how finely the path happens to be sampled.
+  // With a window: only the stretch of line from `from` forward by `span` is
+  // considered (plus a metre behind, so something just passed still reads as
+  // passed rather than jumping to the far side of the lap).
+  //
+  // This matters because a lap comes back on itself. Taking the closest point
+  // on the WHOLE line lets a thing beside the car match the leg the car will
+  // drive later, and that leg's station can land just ahead of the car's own -
+  // so something abeam is reported as being right in front. Measured on the
+  // 0821-1 run, 37 of 495 on-path judgements came from the far leg, at a
+  // median of 9.45 m away.
+  //
+  // Restricting the search is the honest fix, and it follows the line: the
+  // region considered bends with the course instead of being a fixed wedge
+  // pinned to the car's current heading.
+  Projection project(double px, double py, double from, double span) const
+  {
+    return projectImpl(px, py, true, from, span);
+  }
+
   Projection project(double px, double py) const
+  {
+    return projectImpl(px, py, false, 0.0, 0.0);
+  }
+
+private:
+  Projection projectImpl(
+    double px, double py, bool windowed, double from, double span) const
   {
     Projection r;
     if (empty()) {return r;}
@@ -135,6 +161,10 @@ public:
     const std::size_t n = points_.size();
     const std::size_t last = closed_ ? n : n - 1;
     for (std::size_t i = 0; i < last; ++i) {
+      if (windowed) {
+        const double d = forwardDistance(from, points_[i].station);
+        if (d < -1.0 || d > span) {continue;}
+      }
       const Point & a = points_[i];
       const Point & b = points_[(i + 1) % n];
       const double dx = b.x - a.x, dy = b.y - a.y;
@@ -155,6 +185,7 @@ public:
     return r;
   }
 
+public:
   // Arc length from `from` forward to `to`. On a closed path the line wraps, so
   // "behind me" and "most of a lap ahead" are the same place; anything further
   // back than behind_tolerance is reported as negative (passed) rather than as

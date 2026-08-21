@@ -240,7 +240,16 @@
           // clusters that survive 200 ms.
           "min_observed": 2,
           "immature_scale": 1.0,
-          "max_sweep_deg": 90.0,
+          // The forward test is not an angle any more. A cluster is judged
+        // against the stretch of the planned line from the car forward by the
+        // trigger distance - see path_reference.hpp - so the region considered
+        // bends with the course instead of being a wedge pinned to the car's
+        // heading. A fixed cone does not follow the steering, and the problem
+        // it was patching was never angular: it was that taking the closest
+        // point on the WHOLE lap let something abeam match the leg the car
+        // drives later. On the 0821-1 run that accounted for 37 of 495 on-path
+        // judgements, at a median of 9.45 m away.
+        "max_sweep_deg": 90.0,
           "min_speed": 0.2,
           // Wall-labelled clusters are skipped - but the detector only considers
           // the label at 1.0 m and wider, so a wall fragment or guard-rail
@@ -248,7 +257,19 @@
           // be avoided. The fixed structure 0.75 m off the right flank in the
           // 0813 recording is 0.91 m wide and can never be labelled. This is a
           // partial filter, not wall rejection.
-          "ignore_wall_static": true,
+          // A wall-labelled cluster is no longer thrown away - it is held to a
+        // tighter corridor. The detector merges an object into the barrier it
+        // is touching and labels the result wall, so anything placed against
+        // the wall vanished from this scorer completely. Differencing the two
+        // halves of the 0821-2 run finds no new scan returns at all, because
+        // the added object sits in cells the wall already occupied.
+        //
+        // The racing line runs through drivable space, so a mapped wall is
+        // never on it. Requiring a wall-labelled return to be inside the
+        // vehicle's own width of the line - margin removed - keeps barriers
+        // out while catching what is leaning on them.
+        "ignore_wall_static": true,
+        "wall_margin_cut_m": 0.10,
           // Off. What is an obstacle and what is structure is the detector's
           // call, not co_driver's - this node does not detect obstacles, it
           // receives them and decides only whether they sit on the commanded

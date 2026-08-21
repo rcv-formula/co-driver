@@ -193,6 +193,9 @@ public:
     max_sweep_ = jnum(p, "max_sweep_deg", 90.0) * M_PI / 180.0;
     min_speed_ = jnum(p, "min_speed", 0.2);
     ignore_wall_static_ = jbool(p, "ignore_wall_static", true);
+    // How much narrower the corridor is for a wall-labelled cluster. The
+    // default takes the whole margin away, leaving the vehicle's own width.
+    wall_margin_cut_ = jnum(p, "wall_margin_cut_m", 0.10);
     max_width_ = jnum(p, "max_width_m", 0.0);        // 0 = no size filter
     min_points_ = jint(p, "min_point_count", 0);
     sample_step_ = std::max(0.02, jnum(p, "sample_step_m", 0.08));
@@ -444,10 +447,27 @@ public:
     int unmeasured = 0;
     bool any_ahead = false;
     for (const auto & c : clusters->clusters) {
-      if (ignore_wall_static_ && c.is_wall_static) {continue;}
+      // A wall-labelled cluster is not discarded outright any more - it is
+      // held to a tighter corridor instead.
+      //
+      // The detector merges an object into the wall it is touching and labels
+      // the result wall, so anything placed against the barrier disappears
+      // from this scorer entirely. That is how the 0821-2 obstacles were
+      // placed: differencing the first half of that run against the second
+      // finds no new scan returns at all, because the new object is inside a
+      // cell the wall already occupied.
+      //
+      // Geometry can tell them apart where the label cannot. The racing line
+      // is drawn through drivable space, so a mapped wall is never on it; a
+      // return sitting on the line is something that was not there when the
+      // line was planned. Wall-labelled clusters therefore have to be closer
+      // to the line to count - inside the vehicle's own width, with none of
+      // the margin an unlabelled one gets.
+      const bool wall_labelled = ignore_wall_static_ && c.is_wall_static;
       if (max_width_ > 0.0 && c.width > max_width_) {continue;}
       if (min_points_ > 0 && static_cast<int>(c.point_count) < min_points_) {continue;}
       ++considered;
+
 
       double along = std::numeric_limits<double>::quiet_NaN();
       double on_path = 0.0;
@@ -457,10 +477,13 @@ public:
       // ego motion between the scan and this decision).
       const double jitter =
         jitter_base_ + jitter_per_m_ * range + jitter_per_speed_ * v_now;
+      const double corridor = wall_labelled ?
+        std::max(0.0, lateral_need - wall_margin_cut_) : lateral_need;
+      if (corridor <= 0.0) {continue;}
 
       if (on_plan) {
         double station = 0.0, lateral = 0.0;
-        if (!nearestOnPath(ref, c, &station, &lateral)) {continue;}
+        if (!nearestOnPath(ref, c, trigger, &station, &lateral)) {continue;}
         station_of_max_ = station;
         along = ref.path->forwardDistance(ref.ego_station, station);
         if (along < 0.0) {
@@ -471,8 +494,10 @@ public:
         // Graded rather than a hard edge: at the corridor edge the answer is
         // genuinely uncertain, and a hard cut there turns jitter into flapping.
         on_path = std::clamp(
-          (lateral_need + jitter - lateral) / std::max(1e-3, 2.0 * jitter), 0.0, 1.0);
+          (corridor + jitter - lateral) / std::max(1e-3, 2.0 * jitter), 0.0, 1.0);
       } else {
+        // No plan to measure against, so the label is all there is.
+        if (wall_labelled) {continue;}
         along = nearestOnArc(arc, c);
         if (!std::isfinite(along)) {continue;}
         on_path = 1.0;
@@ -690,7 +715,7 @@ private:
   // narrower than the box cannot cross it without touching the perimeter.
   bool nearestOnPath(
     const PathRef & ref, const obstacle_context_msgs::msg::ObstacleCluster & c,
-    double * station, double * lateral) const
+    double span, double * station, double * lateral) const
   {
     const double x0 = std::min(c.min_x, c.max_x), x1 = std::max(c.min_x, c.max_x);
     const double y0 = std::min(c.min_y, c.max_y), y1 = std::max(c.min_y, c.max_y);
@@ -706,7 +731,7 @@ private:
         if (!std::isfinite(px) || !std::isfinite(py)) {return;}
         const double mx = ref.tx + ref.cos_yaw * px - ref.sin_yaw * py;
         const double my = ref.ty + ref.sin_yaw * px + ref.cos_yaw * py;
-        const auto pr = ref.path->project(mx, my);
+        const auto pr = ref.path->project(mx, my, ref.ego_station, span);
         if (!pr.valid || pr.lateral >= best_lat) {return;}
         best_lat = pr.lateral;
         best_station = pr.station;
@@ -982,6 +1007,7 @@ private:
   double max_sweep_{M_PI / 2.0};
   double min_speed_{0.2};
   bool ignore_wall_static_{true};
+  double wall_margin_cut_{0.10};
   double max_width_{0.0};
   int min_points_{0};
   double sample_step_{0.08};
