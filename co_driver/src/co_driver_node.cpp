@@ -151,6 +151,7 @@ private:
 
     if (!incumbent_ok) {
       // If the incumbent died, switch immediately without hysteresis.
+      forced_ = !current_.empty();
       return commit(best->name, current_.empty() ? "initial selection" : "incumbent invalid -> immediate switch", now);
     }
 
@@ -163,6 +164,33 @@ private:
 
     const double held = switched_once_ ?
       (now - last_switch_).seconds() : spec_.switch_cooldown + 1.0;
+    // The cooldown guards against SCORE oscillation - two drives trading places
+    // because their probabilities are close. It has no business governing the
+    // return from a handover that a hard gate forced: the gate has its own
+    // hysteresis on both edges (confirm before it engages, hold before it
+    // releases), so waiting again afterwards is the same debounce charged
+    // twice, and it is charged exactly when the map controller is worth most.
+    //
+    // Measured at 4-8 m/s on the 0814 drive: 29.6% of samples had pp_main
+    // valid, un-vetoed and outscoring gap_follow 0.971 to 0.029, sitting out a
+    // cooldown started by an obstacle that was already behind the car. That is
+    // more of the run than the obstacles themselves accounted for at 5-8 m/s.
+    //
+    // MEASURED AND REVERTED. Letting a gate-forced return skip the cooldown
+    // did raise occupancy - 46.5% to 50.0% overall, 31.0% to 37.5% at
+    // 5-8 m/s - and it destroyed the thing that made those numbers worth
+    // having: handovers went from 52 to 140 over the same drive, and the
+    // median time a controller kept the car fell from 1.54 s to 0.12 s. A
+    // controller that changes ten times a second is not driving whatever the
+    // occupancy says. Widening the obstacle scorer's own hysteresis recovered
+    // part of it (94 handovers, 0.28 s) but never came close.
+    //
+    // So the cooldown stays, on every return. The damping it provides is real
+    // and nothing here replaces it; the cost is that a detour lasts at least
+    // switch_cooldown_ms, which is the price of not oscillating. The delay
+    // that WAS worth removing is in the recovery latch - see recovery_gate.cpp
+    // - because that one was making an obstacle detour wait out a proof about
+    // localization that nothing had called into question.
     if (spec_.switch_cooldown > 0.0 && held < spec_.switch_cooldown) {
       r.name = current_;
       r.reason = "waiting on switch_cooldown";
@@ -173,7 +201,10 @@ private:
       r.reason = "switch_margin not met";
       return r;
     }
-    return commit(best->name, "switched on score margin", now);
+    const bool was_forced = forced_;
+    forced_ = false;
+    return commit(
+      best->name, was_forced ? "gate cleared -> returning" : "switched on score margin", now);
   }
 
   Result commit(const std::string & name, const std::string & reason, const rclcpp::Time & now)
@@ -195,6 +226,8 @@ private:
   std::string current_;
   rclcpp::Time last_switch_;
   bool switched_once_{false};
+  // The last handover was forced by a gate, not won on score.
+  bool forced_{false};
 };
 
 // ===========================================================================

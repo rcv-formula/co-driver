@@ -162,6 +162,24 @@ public:
     was_healthy_ = healthy;
     held_ = healthy && (ctx.now - healthy_since_).seconds() >= hold_;
     held_for_ = healthy ? (ctx.now - healthy_since_).seconds() : 0.0;
+
+    // The latch ARMS on a localization failure, not on losing the selection.
+    //
+    // It used to gate every return, whatever had taken the drive away. That
+    // turned a 2.5 s localization proof into the price of any handover: an
+    // obstacle detour, with localization perfectly healthy throughout, still
+    // had to wait out a hold that exists to catch a bad global-search attach.
+    // Nothing about the pose was ever in question, so there was nothing for
+    // the dwell to verify - it was pure delay, and it landed on exactly the
+    // case the user needs to be quick: once the obstacle is behind the car,
+    // the map controller should have it back.
+    //
+    // Armed at startup, because nothing has been verified yet - a car booting
+    // mid-track still has to earn its first selection. Disarms once the hold
+    // has been served, and re-arms the moment health drops again, which is the
+    // behaviour the gate was written for.
+    if (!healthy) {armed_ = true;}
+    if (armed_ && held_) {armed_ = false;}
   }
 
   ScoreResult score(const Drive & drive, const Context & ctx) override
@@ -171,6 +189,10 @@ public:
       return ScoreResult::ok(1.0, "incumbent");
     }
     std::lock_guard<std::mutex> lock(mtx_);
+    if (!armed_) {
+      // No localization failure outstanding - this gate has no opinion.
+      return ScoreResult::ok(1.0, "clear");
+    }
     if (held_) {
       return ScoreResult::ok(1.0, "recovered");
     }
@@ -203,6 +225,8 @@ private:
   uint8_t state_{255};
   bool was_healthy_{false};
   bool held_{false};
+  // A localization failure is outstanding and still has to be proven over.
+  bool armed_{true};
   double held_for_{0.0};
   rclcpp::Time healthy_since_;
 };

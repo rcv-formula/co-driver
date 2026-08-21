@@ -213,6 +213,15 @@
         // Must equal veto_below on pp_main below (score = 1 - demand). Keeping
         // them in step is what makes "commit distance" a real distance.
         "commit_demand": 0.85,
+        // Equal to commit_demand: no extra hold. This existed to damp the
+        // handovers that appeared when the arbitration's switch_cooldown was
+        // bypassed on a gate-forced return. That bypass was measured and
+        // reverted (see co_driver_node.cpp), so the cooldown supplies the
+        // damping again and a second layer of it only costs occupancy -
+        // measured, the obstacle veto went from 32.2% to 41.7% of the drive
+        // with nothing to show for it. Lower it only if handovers ever
+        // reappear without the cooldown being involved.
+        "release_demand": 0.85,
 
         // Reported cluster positions wander, and more so far away (fewer beams
         // on the object, coarser angular quantisation) and fast (more ego
@@ -414,8 +423,31 @@
         // having gone past - 2.4-4.8 m of travel at 2-4 m/s, comfortably
         // clear of anything the detector reports as a cluster.
         "block_ms": 200,
-        "clear_ms": 1200,
+        "clear_ms": 700,
         "timeout_ms": 500
+      }
+    },
+
+    {
+      // Cross-track gate. The map controller steers toward the planned line,
+      // which is only sane while the car is near it. After hitting the
+      // obstacle that sits on the line in the 0814 recording, the car carried
+      // on through where the map says wall - and from there "drive back to the
+      // raceline" points across whatever it is stuck against. Only the
+      // reactive controller can get out of that.
+      //
+      // Not a localization check: confidence stays high while the pose is
+      // right and the car is simply in the wrong place. Nothing else notices.
+      "name": "off_path",
+      "type": "path_deviation",
+      "params": {
+        "path_topic": "/global_path",
+        "base_frame": "base_link",
+        // The line runs 0.7-1.0 m from the walls on this track, so 1.5 m off
+        // it is outside the drivable corridor rather than a wide entry.
+        "max_deviation_m": 1.5,
+        "trip_ms": 400,
+        "clear_ms": 800
       }
     },
 
@@ -460,6 +492,10 @@
         "loc_trip": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // return latch (see localization_scoring.jsonc); weight 0 = veto only
         "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
+        // Same shape as the other gates: no weight, so the calibrated
+        // localization thresholds are untouched, and a veto only on the drive
+        // that needs the line to mean anything.
+        "off_path": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // geometry veto: the commanded path runs into something solid.
         // Only pp_main carries it - vetoing every candidate at once would
         // leave nothing to drive with and fall through to timeout_stop.

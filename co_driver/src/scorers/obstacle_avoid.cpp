@@ -239,6 +239,15 @@ public:
     // Must match veto_below on that drive (score = 1 - demand), or the commit
     // distance stops being the distance the car actually commits at.
     commit_demand_ = std::clamp(jnum(p, "commit_demand", 0.85), 0.05, 1.0);
+    // Hysteresis on the commitment itself. Once the detour is on, it stays on
+    // until the demand has fallen well below the level that started it - not
+    // merely back under it. Without this the demand crossing its threshold
+    // twice near one obstacle produces two handovers, and on the 0814 drive
+    // that came to 140 of them in 200 s. This is where the damping belongs:
+    // the arbitration's switch_cooldown used to supply it by accident, at the
+    // cost of also delaying every return.
+    release_demand_ = std::clamp(
+      jnum(p, "release_demand", 0.6), 0.0, commit_demand_);
 
     // ---- measurement jitter ------------------------------------------------
     // A cluster's reported position wanders, and it wanders more the further
@@ -421,6 +430,7 @@ public:
       if (on_plan) {
         double station = 0.0, lateral = 0.0;
         if (!nearestOnPath(ref, c, &station, &lateral)) {continue;}
+        station_of_max_ = station;
         along = ref.path->forwardDistance(ref.ego_station, station);
         if (along < 0.0) {
           // Already passed. Recorded, because "has it gone by" is what makes
@@ -492,7 +502,20 @@ public:
       } else {
         ++unmeasured;
       }
-      demand = std::max(demand, urgency * confidence * on_path);
+      const double d = urgency * confidence * on_path;
+      if (d > demand) {
+        demand = d;
+        // Remember where on the plan the thing that is blocking us sits. That
+        // is what makes "it went behind me" answerable later: without it, an
+        // obstacle that stopped being reported and an obstacle that was passed
+        // look identical, and the prompt return fires on detection dropouts -
+        // which at speed is often, since association breaks on about a quarter
+        // of tracks above 5 m/s.
+        if (on_plan) {
+          block_station_[drive.name] = station_of_max_;   // absolute, on the plan
+          have_block_station_[drive.name] = true;
+        }
+      }
     }
     if (unmeasured > 0 && considered > 0) {
       RCLCPP_WARN_THROTTLE(
@@ -502,6 +525,17 @@ public:
     }
     last_on_plan_[drive.name] = on_plan;
     last_ahead_[drive.name] = any_ahead;
+    // Has the thing that blocked us actually gone by? Answerable only because
+    // its place on the plan was remembered: an obstacle that stopped being
+    // reported and one that was passed are indistinguishable from the absence
+    // of detections alone, and at speed the first happens often - association
+    // breaks on about a quarter of tracks above 5 m/s.
+    bool passed = false;
+    if (on_plan && have_block_station_[drive.name]) {
+      passed = ref.path->forwardDistance(
+        ref.ego_station, block_station_[drive.name]) < 0.0;
+    }
+    last_passed_[drive.name] = passed;
     return setState(drive.name, ctx, demand, nearest, considered, "");
   }
 
@@ -712,6 +746,14 @@ private:
   {
     const bool clear_now = demand <= 0.0;
     State & st = state_[drive];
+    // Commitment latch, separate from the presence latch below: presence
+    // decides whether we are in a detour at all, this decides whether the
+    // drive stays disqualified while we are in one.
+    if (demand >= commit_demand_) {
+      st.committed = true;
+    } else if (st.committed && demand <= release_demand_) {
+      st.committed = false;
+    }
     if (clear_now != st.was_clear || !st.valid) {
       st.edge = ctx.now;
       st.was_clear = clear_now;
@@ -724,11 +766,15 @@ private:
     // detection. The first earns a prompt return; the second still has to wait
     // out the full hold, because coming back early on a detection dropout puts
     // the map controller back in charge while the thing is still alongside.
-    const bool by_station =
-      last_on_plan_[drive] && !last_ahead_[drive];
+    // Passed means the blocking obstacle's own place on the plan is behind
+    // us - a measurement, not the absence of a detection.
+    const bool by_station = last_passed_[drive];
     const double release = by_station ? passed_clear_ : clear_;
     if (!clear_now && dwell >= block_) {st.blocked = true;}
-    if (clear_now && st.blocked && dwell >= release) {st.blocked = false;}
+    if (clear_now && st.blocked && dwell >= release) {
+      st.blocked = false;
+      have_block_station_[drive] = false;   // that encounter is over
+    }
 
     char buf[140];
     if (st.blocked) {
@@ -739,9 +785,14 @@ private:
         return ScoreResult::ok(0.0, buf);        // stay committed to the detour
       }
       std::snprintf(
-        buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f", dist,
-        last_on_plan_[drive] ? "on the plan" : "on the commanded arc", demand);
-      return ScoreResult::ok(std::clamp(1.0 - demand, 0.0, 1.0), buf);
+        buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f%s", dist,
+        last_on_plan_[drive] ? "on the plan" : "on the commanded arc", demand,
+        st.committed ? ", committed" : "");
+      // While committed the drive stays disqualified even as the demand eases,
+      // so one obstacle costs one handover rather than one per threshold
+      // crossing.
+      const double s = std::clamp(1.0 - demand, 0.0, 1.0);
+      return ScoreResult::ok(st.committed ? std::min(s, 0.0) : s, buf);
     }
     if (!clear_now) {
       std::snprintf(
@@ -757,6 +808,10 @@ private:
   }
 
   std::map<std::string, bool> last_on_plan_;
+  std::map<std::string, bool> last_passed_;
+  std::map<std::string, bool> have_block_station_;
+  std::map<std::string, double> block_station_;
+  double station_of_max_{0.0};
   std::map<std::string, bool> last_ahead_;
 
   struct State
@@ -764,6 +819,7 @@ private:
     bool was_clear{true};
     bool valid{false};
     bool blocked{false};
+    bool committed{false};
     rclcpp::Time edge;
   };
 
@@ -789,6 +845,7 @@ private:
   double lateral_accel_{5.0};
   double commit_margin_{0.5};
   double commit_demand_{0.85};
+  double release_demand_{0.6};
   double jitter_base_{0.10}, jitter_per_m_{0.03}, jitter_per_speed_{0.04};
   double passed_clear_{0.25};
 
