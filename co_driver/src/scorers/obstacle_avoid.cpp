@@ -155,12 +155,14 @@
 #include <obstacle_context_msgs/msg/obstacle_cluster_array.hpp>
 
 #include <nav_msgs/msg/path.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer_interface.h>
 
 #include "co_driver/arc_geometry.hpp"
 #include "co_driver/path_reference.hpp"
+#include "co_driver/scan_occupancy.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 
 #include "co_driver/scorer.hpp"
@@ -174,6 +176,31 @@ public:
   bool configure(rclcpp::Node * node, const std::string & name, const Json & p) override
   {
     node_ = node;
+    // Where "what is on the line" comes from.
+    //   "clusters"  the detector's ObstacleClusterArray
+    //   "scan"      the lidar directly, accumulated and voted (scan_occupancy.hpp)
+    source_ = jstr(p, "source", "clusters");
+    if (source_ != "clusters" && source_ != "scan") {
+      RCLCPP_ERROR(
+        node->get_logger(), "obstacle avoidance '%s': source '%s' is neither "
+        "\"clusters\" nor \"scan\" - falling back to clusters.",
+        name.c_str(), source_.c_str());
+      source_ = "clusters";
+    }
+    scan_topic_ = jstr(p, "scan_topic", "/scan");
+    deskew_ = jbool(p, "deskew", true);
+    {
+      ScanOccupancy::Settings s;
+      s.corridor_m = jnum(p, "scan_corridor_m", 0.28);
+      s.min_width_m = jnum(p, "min_width_m", 0.08);
+      s.confirm_window_s = jms(p, "confirm_window_ms", 150.0);
+      s.confirm_fraction = std::clamp(jnum(p, "confirm_fraction", 0.6), 0.0, 1.0);
+      s.same_place_m = jnum(p, "same_place_m", 0.30);
+      s.instant_range_m = jnum(p, "instant_range_m", 2.0);
+      s.beam_stride = std::max(1, jint(p, "beam_stride", 3));
+      scan_.configure(s);
+    }
+
     topic_ = jstr(p, "topic", "/obstacle_clusters");
     wheelbase_ = jnum(p, "wheelbase", 0.324);
     half_width_ = jnum(p, "vehicle_half_width", 0.18);
@@ -355,15 +382,34 @@ public:
         RCLCPP_WARN(node->get_logger(), "obstacle avoidance: %s", err.c_str());
       }
     }
+    if (source_ == "scan") {
+      scan_sub_ = node->create_subscription<sensor_msgs::msg::LaserScan>(
+        scan_topic_, rclcpp::SensorDataQoS(),
+        [this](const sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {onScan(msg);},
+        opts);
+    }
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, node, false);
 
-    RCLCPP_INFO(
-      node->get_logger(),
-      "obstacle avoidance '%s' <- %s (%.1fs of travel ahead, sustained %.0fms%s)",
-      name.c_str(), topic_.c_str(), trigger_time_, block_ * 1e3,
-      ignore_wall_static_ ? ", wall-labelled clusters ignored" : "");
-    if (max_width_ > 0.0) {
+    if (source_ == "scan") {
+      const auto & s = scan_.settings();
+      RCLCPP_INFO(
+        node->get_logger(),
+        "obstacle avoidance '%s' <- %s DIRECTLY: something at least %.2fm wide, "
+        "within %.2fm of the line, seen in %.0f%% of the scans over %.0fms - or "
+        "anything at all within %.1fm. Deskew %s. The detector's clusters are "
+        "NOT used.",
+        name.c_str(), scan_topic_.c_str(), s.min_width_m, s.corridor_m,
+        100.0 * s.confirm_fraction, s.confirm_window_s * 1e3, s.instant_range_m,
+        deskew_ ? "on" : "off");
+    } else {
+      RCLCPP_INFO(
+        node->get_logger(),
+        "obstacle avoidance '%s' <- %s (%.1fs of travel ahead, sustained %.0fms%s)",
+        name.c_str(), topic_.c_str(), trigger_time_, block_ * 1e3,
+        ignore_wall_static_ ? ", wall-labelled clusters held to a tighter corridor" : "");
+    }
+    if (max_width_ > 0.0 && source_ == "clusters") {
       RCLCPP_INFO(
         node->get_logger(), "obstacle avoidance '%s': clusters wider than %.2fm "
         "are treated as structure", name.c_str(), max_width_);
@@ -383,8 +429,19 @@ public:
       if (!clusters_) {
         return ScoreResult::ok(1.0, "no clusters on " + topic_);
       }
-      if (timeout_ > 0.0 && (ctx.now - rx_).seconds() > timeout_) {
+      if (source_ == "clusters" && timeout_ > 0.0 &&
+        (ctx.now - rx_).seconds() > timeout_)
+      {
         return ScoreResult::ok(1.0, "stale clusters");
+      }
+      if (source_ == "scan") {
+        if (!has_scan_) {
+          return ScoreResult::ok(1.0, "no scan yet");
+        }
+        if (timeout_ > 0.0 && (ctx.now - scan_rx_).seconds() > timeout_) {
+          scan_.clear();
+          return ScoreResult::ok(1.0, "stale scan");
+        }
       }
       clusters = clusters_;
     }
@@ -423,6 +480,7 @@ public:
     // to worry about something eight metres away.
     bool speed_from_odom = false;
     const double v_now = geometrySpeed(v, ctx, &speed_from_odom);
+    last_speed_ = v_now;
     const double v_plan = v_now;
     const double v_planned_here = (on_plan && use_path_speed_) ?
       ref.path->speedAt(ref.ego_station) : 0.0;
@@ -446,6 +504,42 @@ public:
     int considered = 0;
     int unmeasured = 0;
     bool any_ahead = false;
+
+    if (source_ == "scan") {
+      // The lidar answers directly: places on the line ahead that enough scans
+      // agree are occupied. No clustering, no labels, no reported centre - see
+      // scan_occupancy.hpp for why each of those was worth leaving out.
+      if (!on_plan) {
+        return setState(
+          drive.name, ctx, 0.0, 0.0, 0,
+          "no plan - the scan source has nothing to measure against");
+      }
+      const auto occ = scan_.occupied();
+      considered = static_cast<int>(occ.size());
+      for (const auto & o : occ) {
+        if (o.along > trigger) {continue;}
+        any_ahead = true;
+        nearest = std::min(nearest, o.along);
+        const double span = std::max(1e-3, trigger - commit);
+        const double urgency = std::clamp(
+          commit_demand_ * (trigger - o.along) / span, 0.0, 1.0);
+        if (urgency > demand) {
+          demand = urgency;
+          block_station_[drive.name] = ref.ego_station + o.along;
+          have_block_station_[drive.name] = true;
+        }
+      }
+      last_on_plan_[drive.name] = true;
+      bool passed = false;
+      if (have_block_station_[drive.name]) {
+        passed = ref.path->forwardDistance(
+          ref.ego_station, block_station_[drive.name]) < 0.0;
+      }
+      last_ahead_[drive.name] = any_ahead;
+      last_passed_[drive.name] = passed;
+      return setState(drive.name, ctx, demand, nearest, considered, "");
+    }
+
     for (const auto & c : clusters->clusters) {
       // A wall-labelled cluster is not discarded outright any more - it is
       // held to a tighter corridor instead.
@@ -620,6 +714,89 @@ private:
     *from_odom = false;
     return std::abs(commanded);
   }
+
+  // One scan, deskewed and measured against the line.
+  //
+  // A UST-10LX sweeps its 1081 beams over 25 ms. At 5 m/s that is 12 cm of
+  // travel, so placing the whole scan at one pose smears every object by that
+  // much and the accumulated scans stop agreeing with each other - which is
+  // exactly what the vote depends on. Each beam is placed at the pose for its
+  // own instant, interpolated between the transform at the start of the sweep
+  // and at the end. Two lookups per scan; a lookup per beam would cost more
+  // than the whole scorer.
+  void onScan(const sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    const PathReference * path = !path_.empty() ? &path_ :
+      (!csv_path_.empty() ? &csv_path_ : nullptr);
+    if (!path || !tf_buffer_ || msg->ranges.empty()) {return;}
+
+    const double sweep = msg->scan_time > 0.0 ? msg->scan_time :
+      msg->time_increment * static_cast<double>(msg->ranges.size());
+    geometry_msgs::msg::TransformStamped t0, t1, ego;
+    try {
+      t0 = lookupOrLatest(path->frame(), msg->header.frame_id, msg->header.stamp);
+      const rclcpp::Time end = rclcpp::Time(msg->header.stamp) +
+        rclcpp::Duration::from_seconds(std::max(0.0, sweep));
+      t1 = deskew_ ? lookupOrLatest(path->frame(), msg->header.frame_id, end.operator builtin_interfaces::msg::Time()) : t0;
+      ego = lookupOrLatest(path->frame(), base_frame_, msg->header.stamp);
+    } catch (const tf2::TransformException &) {
+      return;                 // no pose: nothing to say, see the header
+    }
+    const auto e = path->project(ego.transform.translation.x, ego.transform.translation.y);
+    if (!e.valid) {return;}
+    scan_ego_station_ = e.station;
+
+    const double span = std::clamp(
+      trigger_time_ * lastSpeed(), min_trigger_, max_trigger_);
+    const auto yaw_of = [](const geometry_msgs::msg::TransformStamped & tf) {
+        const auto & q = tf.transform.rotation;
+        return std::atan2(
+          2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+      };
+    const double x0 = t0.transform.translation.x, y0 = t0.transform.translation.y;
+    const double x1 = t1.transform.translation.x, y1 = t1.transform.translation.y;
+    const double a0 = yaw_of(t0);
+    double da = yaw_of(t1) - a0;
+    while (da > M_PI) {da -= 2.0 * M_PI;}
+    while (da < -M_PI) {da += 2.0 * M_PI;}
+
+    std::vector<ScanOccupancy::Point> pts;
+    const std::size_t n = msg->ranges.size();
+    const int stride = std::max(1, scan_.settings().beam_stride);
+    pts.reserve(n / stride);
+    for (std::size_t k = 0; k < n; k += stride) {
+      const double d = msg->ranges[k];
+      if (!std::isfinite(d) || d <= msg->range_min || d >= msg->range_max) {continue;}
+      if (d > span + 2.0) {continue;}
+      const double f = static_cast<double>(k) / static_cast<double>(std::max<std::size_t>(1, n - 1));
+      const double cx = x0 + f * (x1 - x0);
+      const double cy = y0 + f * (y1 - y0);
+      const double cyaw = a0 + f * da;
+      const double a = msg->angle_min + static_cast<double>(k) * msg->angle_increment;
+      const double bx = d * std::cos(a), by = d * std::sin(a);
+      const double mx = cx + std::cos(cyaw) * bx - std::sin(cyaw) * by;
+      const double my = cy + std::sin(cyaw) * bx + std::cos(cyaw) * by;
+      const auto pr = path->project(mx, my, e.station, span);
+      if (!pr.valid) {continue;}
+      ScanOccupancy::Point p;
+      p.lateral = pr.lateral;
+      if (p.lateral > scan_.settings().corridor_m * 2.0) {continue;}   // cheap cull
+      p.along = path->forwardDistance(e.station, pr.station);
+      p.range = d;
+      pts.push_back(p);
+    }
+    scan_.push(
+      rclcpp::Time(msg->header.stamp).seconds(),
+      std::abs(msg->angle_increment) * static_cast<double>(stride),
+      std::move(pts));
+    scan_rx_ = node_->now();
+    has_scan_ = true;
+  }
+
+  // Speed last used for the geometry, so the scan callback sizes its window the
+  // same way the decision does.
+  double lastSpeed() const {return last_speed_ > 0.0 ? last_speed_ : 1.0;}
 
   // Everything needed to place a cluster on the plan: which path, where we are
   // on it, and how to get from the cluster's frame into the path's.
@@ -972,6 +1149,15 @@ private:
   rclcpp::Time speed_stamp_;
   rclcpp::Subscription<obstacle_context_msgs::msg::ObstacleClusterArray>::SharedPtr sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  ScanOccupancy scan_;
+  std::string source_{"clusters"};
+  std::string scan_topic_{"/scan"};
+  bool deskew_{true};
+  double scan_ego_station_{0.0};
+  rclcpp::Time scan_rx_;
+  bool has_scan_{false};
+  double last_speed_{0.0};
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   PathReference path_;        // from the topic

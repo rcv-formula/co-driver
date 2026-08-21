@@ -31,7 +31,84 @@
   "inputs": {
     "obstacles": {
       "params": {
-          "topic": "/obstacle_clusters",
+          // ── 무엇을 보고 판단할지 ──────────────────────────────────────
+        //
+        //   "clusters"  the detector's ObstacleClusterArray
+        //   "scan"      the lidar directly - accumulate scans, and take a place
+        //               on the line as blocked when enough of them agree
+        //
+        // Measured offline over the 0821-1 run, against the four objects added
+        // to its second half, per decision:
+        //
+        //                              false alarms   found   hit within 1 m
+        //     clusters                      6.9%        -        91% (3 m)
+        //     scan, 3 of 5 scans agree      0.1%      23.6%     99.5%
+        //
+        // The detector layer is where the information was being lost: 70% of
+        // its clusters are not labelled wall even when they are wall, an object
+        // leaning on a barrier is merged into it and disappears, and the
+        // reported centre is unreliable. None of that reaches the scan source.
+        "source": "clusters",
+
+        // ── "scan" 을 쓸 때 ─────────────────────────────────────────
+        //
+        // 규칙 한 문장:
+        //   "confirm_window_ms 동안의 스캔 중 confirm_fraction 이상이,
+        //    경로에서 corridor_m 안에, min_width_m 이상 되는 것을 같은 자리에서
+        //    봤으면 막힌 것으로 본다. 단 instant_range_m 안이면 한 번만 봐도 된다."
+        //
+        // 파라미터가 하는 일이 그 문장에 그대로 들어 있습니다.
+        "scan_topic": "/scan",
+
+        // 경로에서 이만큼 벗어나면 내 길이 아닙니다.
+        "scan_corridor_m": 0.28,
+
+        // 이보다 좁은 것은 돌아갈 가치가 없습니다.
+        //
+        // 점 개수가 아니라 폭으로 정합니다. 점 개수는 거리마다 뜻이 달라져서,
+        // 8점이 1 m 에서는 10 cm 짜리이고 8 m 에서는 80 cm 짜리입니다. 이웃한
+        // 반환끼리는 "거리 x 각도간격" 만큼 떨어지므로, 폭을 주면 어느 거리에서든
+        // 맞는 점 개수로 환산됩니다.
+        "min_width_m": 0.08,
+
+        // 얼마 동안 모아서, 그중 얼마가 같은 말을 해야 믿을지.
+        //
+        // 장수가 아니라 시간으로 정합니다. 라이다를 바꾸거나 주기가 흔들려도
+        // 뜻이 그대로입니다. UST-10LX 는 40 Hz 이므로 150 ms 는 6장쯤 됩니다.
+        //
+        // 한 스캔은 한 자리에 대해 한 표만 던집니다. 여러 스캔의 점을 한꺼번에
+        // 세면 한 스캔의 잡음 몇 개가 혼자 임계를 넘습니다. 0821-1 에서 측정한
+        // 오검출 / 검출 / 1 m 이내 적중:
+        //     점을 한꺼번에 셈    0.9%   26.3%   93.5%
+        //     스캔당 한 표        0.1%   23.6%   99.5%
+        "confirm_window_ms": 150,
+        "confirm_fraction": 0.6,
+
+        // 이만큼 안에서 본 것은 같은 물체로 칩니다. 격자가 아니라 거리로 묶어서,
+        // 격자 경계에 걸친 물체가 둘로 갈리지 않습니다.
+        "same_place_m": 0.30,
+
+        // 이 거리 안이면 한 번만 봐도 믿습니다.
+        //
+        // 움직이는 물체는 원리적으로 같은 자리에 여러 번 안 찍히므로, 합의만
+        // 요구하면 가장 중요한 경우가 지워집니다. 그리고 코앞에 있는 것은 두 번째
+        // 의견을 기다릴 시간이 없습니다.
+        "instant_range_m": 2.0,
+
+        // 빔을 몇 개마다 쓸지. 비용만 바꾸고 판단은 안 바꿉니다 - 폭 조건이
+        // 실제로 쓰는 빔의 각도간격으로 환산되기 때문에, 빔을 줄여도 증거가
+        // 같은 비율로 줄지 않습니다.
+        "beam_stride": 3,
+
+        // 빔 하나하나를 그 빔이 찍힌 순간의 자세로 놓습니다. UST-10LX 는 1081빔을
+        // 25 ms 에 훑는데 5 m/s 면 그 사이 12 cm 를 가므로, 스캔 전체를 한 자세에
+        // 놓으면 물체가 번지고 누적한 스캔들이 서로 안 맞게 됩니다. 그 일치가
+        // 판단의 전부이므로 번지면 안 됩니다. 스윕 시작과 끝 두 번만 조회하고
+        // 사이를 보간하므로 빔마다 조회하지 않습니다.
+        "deskew": true,
+
+        // ── "clusters" 를 쓸 때의 설정 ────────────────────────────────
+        "topic": "/obstacle_clusters",
           // Judged against the PLANNED line, not the current steering angle.
           // The steering angle swings with every correction and says nothing
           // about the corner after this one; the plan is where the car is
