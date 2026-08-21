@@ -78,6 +78,17 @@ struct DriveSpec
   std::string topic;
   bool enabled{true};
   double hold{0.3};       // validity window of the last command [s] (JSON: hold_ms)
+  // How long this drive keeps the car once it has it, overriding the
+  // selection's switch_cooldown. Negative means "use the global one".
+  //
+  // The two kinds of handover this arbitration makes want opposite values and
+  // were sharing one number. Leaving the map controller because localization
+  // failed should be sticky - the confidence wanders near its threshold and
+  // flipping back and forth is the failure mode the cooldown exists for.
+  // Leaving it to go round an obstacle should end the moment the obstacle is
+  // behind the car. One number cannot be both, and the compromise was costing
+  // the second case badly.
+  double keep{-1.0};      // [s] (jsonc: keep_ms)
   double bias{0.0};       // linear-layer bias b_j
   std::map<std::string, Influence> influence;   // input name -> influence (filled for all inputs)
 };

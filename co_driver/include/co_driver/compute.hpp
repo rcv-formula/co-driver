@@ -89,6 +89,7 @@ struct Drive
   std::string topic;
   bool enabled{true};
   double hold{0.3};       // validity window of the last command [s]
+  double keep{-1.0};      // how long this drive keeps the car once selected [s]
   double bias{0.0};
   std::map<std::string, Influence> influence;
 

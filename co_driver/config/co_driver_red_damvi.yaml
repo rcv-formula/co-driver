@@ -1,4 +1,4 @@
-# co_driver base settings - red_damvi (PPcontroller + gap_follow, two candidates)
+# co_driver base settings - red_damvi (PPcontroller + gap_follow)
 #
 #   /drive_main  PPcontroller  map / raceline based; only meaningful while localization works
 #   /drive_gf    gap_follow    reactive on /scan alone; unaffected by localization
@@ -60,8 +60,12 @@
     #   switch_margin      a challenger must beat the incumbent's probability by
     #                      this much. That is the hysteresis. At 0.15 the actual
     #                      thresholds, in confidence terms, are:
-    #                        pp_main -> gap_follow  when confidence falls below 0.171
-    #                        gap_follow -> pp_main  when confidence rises above 0.226
+    #                        pp_main -> gap_loc  when confidence falls below 0.171
+    #                        gap_loc -> pp_main  when confidence rises above 0.226
+    #                      Splitting the fallback into two candidates moved these
+    #                      by less than 0.0005 - the third logit takes 0.24% of
+    #                      the distribution when the path is clear - so the
+    #                      calibration carries over unchanged.
     #                      0.171 .. 0.226 is a deadband where whatever is already
     #                      driving keeps driving.
     #   switch_cooldown_ms no second switch within this window, so gap_follow keeps
@@ -78,14 +82,21 @@
     #                      have kept the car on a broken localization for 1.6 s longer
     #                      at t=63.5 s.
     #
-    # fallback is gap_follow. "everything is disqualified" usually means localization
+    # switch_cooldown_ms is the DEFAULT. Each drive may override it with its own
+    # keep_ms, and the red_damvi drives do: the fallback appears twice, once per
+    # reason it can be chosen, because the two reasons want opposite dwell.
+    # Leaving the map controller because localization failed should be sticky
+    # (gap_loc, 1500 ms); leaving it to go round an object should end when the
+    # object is behind the car (gap_obs, 400 ms). One number could not be both.
+    #
+    # fallback is gap_loc. "everything is disqualified" usually means localization
     # went with it, and the controller that only needs /scan is the last one worth
     # trusting.
     # =====================================================================
     selection:
       switch_margin: 0.15
       switch_cooldown_ms: 1500
-      fallback: "gap_follow"
+      fallback: "gap_loc"
 
     # =====================================================================
     # Post-processing - the pipeline list is the order of application.

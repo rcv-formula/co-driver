@@ -369,6 +369,7 @@ bool loadTopics(
     }
     d.enabled = jbool(e, "enabled", true);
     d.hold = jms(e, "hold_ms", 300.0);
+    d.keep = e.contains("keep_ms") ? jms(e, "keep_ms", 0.0) : -1.0;
     d.bias = jnum(e, "bias", 0.0);
     if (d.hold <= 0.0) {
       *error = "drive '" + d.name + "': hold_ms must be greater than 0.";

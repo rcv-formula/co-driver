@@ -162,8 +162,14 @@ private:
       return r;
     }
 
+    // The cooldown belongs to whoever HAS the car, not to the arbitration as a
+    // whole: it is that drive saying how long it keeps what it was given. A
+    // localization fallback wants to be sticky, an obstacle detour wants to end
+    // the moment the obstacle is behind - and they were sharing one number.
+    const double cooldown = (incumbent && incumbent->keep >= 0.0) ?
+      incumbent->keep : spec_.switch_cooldown;
     const double held = switched_once_ ?
-      (now - last_switch_).seconds() : spec_.switch_cooldown + 1.0;
+      (now - last_switch_).seconds() : cooldown + 1.0;
     // The cooldown guards against SCORE oscillation - two drives trading places
     // because their probabilities are close. It has no business governing the
     // return from a handover that a hard gate forced: the gate has its own
@@ -191,7 +197,16 @@ private:
     // that WAS worth removing is in the recovery latch - see recovery_gate.cpp
     // - because that one was making an obstacle detour wait out a proof about
     // localization that nothing had called into question.
-    if (spec_.switch_cooldown > 0.0 && held < spec_.switch_cooldown) {
+    // Two candidates reading the same topic are the same command wearing two
+    // labels - the fallback appears once per reason it can be chosen. Moving
+    // between them changes nothing the car can feel, so there is no flapping to
+    // guard against and the cooldown does not apply. Without this the label
+    // that happened to be reached first held the car for its own dwell: an
+    // obstacle detour would be booked under the localization fallback, and
+    // released on that one's 1500 ms instead of its own 400 ms, which is the
+    // entire thing splitting them was meant to fix.
+    const bool same_source = incumbent && incumbent->topic == best->topic;
+    if (!same_source && cooldown > 0.0 && held < cooldown) {
       r.name = current_;
       r.reason = "waiting on switch_cooldown";
       return r;
@@ -621,6 +636,7 @@ private:
       d.topic = spec.topic;
       d.enabled = spec.enabled;
       d.hold = spec.hold;
+      d.keep = spec.keep;
       d.bias = spec.bias;
       d.influence = spec.influence;
       d.last_rx = rclcpp::Time(0, 0, get_clock()->get_clock_type());
@@ -783,7 +799,18 @@ private:
       sel = selector_.select(drives_, t);
       have_command_ = sel.has_selection;
       selected_ = sel.name;
-      if (sel.switched) {switch_pending_ = true;}
+      // Two candidates may read the same topic - the fallback appears once per
+      // reason it can be chosen. Swapping between those is a bookkeeping
+      // change, not a change of command, so blending across it would drag a
+      // 300 ms ramp through an output that did not move.
+      if (sel.switched) {
+        std::string topic;
+        for (const auto & d : drives_) {
+          if (d.name == sel.name) {topic = d.topic; break;}
+        }
+        if (topic != last_output_topic_) {switch_pending_ = true;}
+        last_output_topic_ = topic;
+      }
     }
 
     publishStatus(sel);
@@ -986,6 +1013,8 @@ private:
   bool has_output_{false};
   bool have_command_{false};
   bool switch_pending_{false};
+  // Topic behind the last selection, so the blend arms on a real source change.
+  std::string last_output_topic_;
   std::string selected_;
   rclcpp::Time last_eval_, last_out_;
   bool eval_t_valid_{false}, out_t_valid_{false};

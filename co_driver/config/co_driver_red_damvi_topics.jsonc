@@ -221,7 +221,7 @@
         // measured, the obstacle veto went from 32.2% to 41.7% of the drive
         // with nothing to show for it. Lower it only if handovers ever
         // reappear without the cooldown being involved.
-        "release_demand": 0.85,
+        "release_demand": 0.6,
 
         // Reported cluster positions wander, and more so far away (fewer beams
         // on the object, coarser angular quantisation) and fast (more ego
@@ -259,6 +259,11 @@
         // Once the obstacle's station on the plan is behind us it is passed,
         // which is geometry rather than a timeout, so the return is quick.
         "passed_clear_ms": 250,
+        // Holding the detour on memory alone while the obstacle's place on the
+        // plan is still ahead. Tried at 2500 and measured worse - 4 points of
+        // occupancy for no reduction in handovers - so the splitting it was
+        // meant to prevent was not coming from forgetting. 0 disables it.
+        "remember_cap_ms": 0,
         "wheelbase": 0.324,
         "vehicle_half_width": 0.18,
         // Extra room either side of the vehicle when deciding "on the path".
@@ -478,10 +483,12 @@
       // by ~115 ms and still catches a genuinely dead controller inside half a
       // second.
       "hold_ms": 450,
-      // -4.5 cancels the obstacle input's +4.5 when the path is clear, so this
-      // drive's logit is unchanged from the calibrated 3.0*phi(confidence).
-      // Changing one without the other moves every localization threshold.
-      "bias": -4.5,
+      // 0.0, and it stays 0.0. It was -4.5 to cancel what the obstacle input
+      // added when the path was clear, which welded obstacle tuning to the
+      // localization calibration: touching either number moved every handover
+      // threshold. The obstacle demand now drives its own candidate instead,
+      // so this drive's logit is 3.0 x phi(confidence) and nothing else.
+      "bias": 0.0,
       "enabled": true,
       "influence": {
         // W = +3.0: full confidence -> z = 3.0, zero confidence -> z = 0.0
@@ -513,41 +520,53 @@
         // car actually did. It just cannot disqualify a drive until the
         // geometry is fixed AND validated against a vehicle recording.
         "clearance": {"weight": 0.0, "exp_mix": 0.0, "veto_below": -1.0},
-        // Obstacles enter as a SCORE, not a gate. The input reports how clear
-        // the commanded path is (1 = nothing to avoid, 0 = must avoid), and
-        // the weight turns that into a contribution the softmax weighs.
-        //
-        // The bias below is -4.5 to match: with a clear path the contribution
-        // is +4.5 and the two cancel, so z_pp_main is exactly 3.0*phi(conf)
-        // as before and every calibrated localization threshold is untouched.
-        // Only an actual obstacle moves the balance, by up to -4.5. Against
-        // gap_follow's floor that flips the selection at a demand of about
-        // 0.85, which is why veto_below sits at 0.15 - the same point,
-        // expressed as a hard gate so a certain obstacle also gets the
-        // immediate-handover path instead of waiting on margin and cooldown.
-        "obstacles": {"weight": 4.5, "exp_mix": 0.0, "veto_below": 0.15}
+        // A gate here, nothing more. "There is an object on the line I am
+        // about to drive" is a fact, and facts are not put to a vote against
+        // how well the car knows where it is - which is what giving this a
+        // weight did. The preference for going around it lives on gap_obs.
+        "obstacles": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.15}
       }
     },
     {
-      // gap_follow - reactive on /scan alone; unaffected by localization.
-      // bias 1.0 is its floor score when localization is gone; W = -1.5 makes
-      // it step aside once confidence recovers (z = 1.0 - 1.5*phi).
-      "name": "gap_follow",
+      // The fallback, entered because localization is not good enough to
+      // follow a map. Sticky on purpose: confidence wanders near its
+      // threshold, and trading the car back and forth across that is the
+      // failure the cooldown exists to prevent.
+      "name": "gap_loc",
       "topic": "/drive_gf",
-      // The fallback needs the LOOSEST hold in the config, not the tightest.
-      // It was 200 ms while pp_main sat at 450, so the drive that exists to
-      // catch every other failure was the first to be disqualified by a
-      // dropped message. gap_follow is reactive on /scan: on a 10-20 Hz lidar
-      // 200 ms is two to four publish periods, and the same jitter that forced
-      // pp_main up from 300 ms takes it out. Whenever that coincided with
-      // pp_main being vetoed - which is the normal state during a handover -
-      // there was no valid drive at all, /co_driver_node/selected went empty
-      // and timeout_stop braked the car.
       "hold_ms": 500,
+      "keep_ms": 1500,
       "bias": 1.0,
       "enabled": true,
       "influence": {
         "localization": {"weight": -1.5, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35}
+      }
+    },
+    {
+      // The same fallback, entered for a completely different reason: an
+      // object on the planned line. Short, because the detour should end when
+      // the obstacle is behind the car - which one shared cooldown could never
+      // express while also keeping the localization handover sticky.
+      //
+      // Reads the same topic as gap_loc, so swapping between the two changes
+      // no command at all and the output blend does not arm (the node keys it
+      // on the topic, not the name).
+      //
+      // The obstacle input enters NEGATIVELY on clearness: a clear path is
+      // -1.5 and puts this candidate below the others, full demand is 0.0 and
+      // puts it above gap_loc's -0.5. The span is kept small deliberately -
+      // the logit is EMA-smoothed, so a wider one just means this candidate
+      // takes longer to catch up once an obstacle appears. So it wins exactly when there is
+      // something to go around and localization is fine, and yields to gap_loc
+      // when localization is the real problem.
+      "name": "gap_obs",
+      "topic": "/drive_gf",
+      "hold_ms": 500,
+      "keep_ms": 400,
+      "bias": 0.0,
+      "enabled": true,
+      "influence": {
+        "obstacles": {"weight": -1.5, "exp_mix": 0.0}
       }
     }
   ]

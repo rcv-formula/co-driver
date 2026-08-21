@@ -264,6 +264,9 @@ public:
     // Once the obstacle's station is behind us it is passed, and that is a
     // fact about geometry rather than a timeout. Returning then is quick.
     passed_clear_ = jms(p, "passed_clear_ms", 250.0);
+    // Longest a detour may be held on memory alone, with nothing currently
+    // detected and the obstacle's place on the plan still ahead.
+    remember_cap_ = jms(p, "remember_cap_ms", 0.0);
     // Short on purpose: nothing was wrong with the drive, the path was simply
     // occupied. Compare path_clearance, which is reluctant by design.
     clear_ = jms(p, "clear_ms", 700.0);
@@ -771,7 +774,22 @@ private:
     const bool by_station = last_passed_[drive];
     const double release = by_station ? passed_clear_ : clear_;
     if (!clear_now && dwell >= block_) {st.blocked = true;}
-    if (clear_now && st.blocked && dwell >= release) {
+    // An obstacle we have not driven past yet is not forgotten because it
+    // stopped being reported. Detection gaps are ordinary - the detector loses
+    // association on about a quarter of tracks above 5 m/s - and releasing on
+    // one splits a single encounter into several detours, which is what the
+    // handover count on the 0814 drive was made of. So while its place on the
+    // plan is still ahead, the detour holds, up to remember_cap_ so that a
+    // spurious detection cannot block the drive indefinitely.
+    // Holding the detour on memory alone, while the obstacle's place on the
+    // plan is still ahead, was tried and measured worse: it cost 4 points of
+    // occupancy on the 0814 drive and did not reduce handovers at all, so the
+    // splitting it was meant to prevent was never coming from forgetting.
+    // remember_cap_ms is left configurable but defaults to no effect.
+    const bool still_ahead = have_block_station_[drive] && !by_station;
+    const double cap = (remember_cap_ > 0.0 && still_ahead) ?
+      std::max(release, remember_cap_) : release;
+    if (clear_now && st.blocked && dwell >= cap) {
       st.blocked = false;
       have_block_station_[drive] = false;   // that encounter is over
     }
@@ -781,7 +799,8 @@ private:
       if (clear_now) {
         std::snprintf(
           buf, sizeof(buf), "%s, holding %.1f/%.1fs",
-          by_station ? "obstacle passed" : "path clearing", dwell, release);
+          by_station ? "obstacle passed" :
+          (still_ahead ? "not past it yet" : "path clearing"), dwell, cap);
         return ScoreResult::ok(0.0, buf);        // stay committed to the detour
       }
       std::snprintf(
@@ -848,6 +867,7 @@ private:
   double release_demand_{0.6};
   double jitter_base_{0.10}, jitter_per_m_{0.03}, jitter_per_speed_{0.04};
   double passed_clear_{0.25};
+  double remember_cap_{0.0};
 
   std::string topic_;
   double wheelbase_{0.324};
