@@ -120,14 +120,23 @@
     },
 
     {
-      // Obstacle avoidance, from the detector's clustered output rather than
-      // the raw scan. Same question as clearance, better evidence: clusters
-      // wider than 3 m (long walls) are dropped by the detector and never
-      // arrive here, which /scan alone cannot do.
+      // Obstacle avoidance. Which evidence it reads is set by `source` in
+      // obstacle_scoring.jsonc, and it now defaults to the raw scan rather
+      // than the detector's clusters - see that file for the measurement.
       //
-      // Requires obstacle_context_msgs at build time and /obstacle_clusters at
-      // run time. Without either, the input reports unavailable and, at
-      // weight 0, the arbitration behaves exactly as if it were not configured.
+      // On the scan source nothing is required of the detector at run time,
+      // and obstacle_context_msgs is still needed at build time because the
+      // cluster source is still there to fall back to.
+      //
+      // Whatever the source, silence NEVER reports unavailable: it reports a
+      // clear path, and says so in the log. Unavailable would drop the input
+      // out of the score, and with missing:mask that rescales the logit by the
+      // weights that were usable - silently moving the calibrated localization
+      // thresholds every time a producer is not running.
+      //
+      // The weights below are not 0 any more either: gap_obs carries this at
+      // -2.0 so that a detour is its own candidate, and pp_main carries a
+      // veto_below at 0.15.
       //
       // Trusted fields only: the detector measures its cluster geometry at
       // 0.77 cm inter-scan residual, but its motion estimates read 1-4 m/s on
@@ -219,14 +228,34 @@
                       // the exact opposite of what the line below claims, and
                       // the failure mode a gate exists to prevent. `required`
                       // is the one that acts on absence.
-                      "required": true},
+                      "required": true,
+                      // `required` covers only what on_missing above does not:
+                      // an out-of-range state byte, which is still reported as
+                      // unavailable. Absence is handled by on_missing now, so
+                      // veto_below is what actually closes the gate on silence.
+                      //
+                      // The last resort may drive past this one. It says the
+                      // map controller is not the right choice, not that its
+                      // command is unsafe - and with no localization there is
+                      // usually nothing else left to choose.
+                      "last_resort_ok": true},
         // early-degradation trip (see localization_scoring.jsonc); veto only
-        "loc_trip": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
+        "loc_trip": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5,
+                     "last_resort_ok": true},
         // return latch (see localization_scoring.jsonc); weight 0 = veto only
-        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
+        // Steppable for the same reason as loc_state: it is waiting for
+        // localization to prove itself, and if localization never starts there
+        // is nothing to wait for and nothing else to drive.
+        "recovery": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5,
+                     "last_resort_ok": true},
         // Same shape as the other gates: no weight, so the calibrated
         // localization thresholds are untouched, and a veto only on the drive
         // that needs the line to mean anything.
+        // NOT steppable, and neither is obstacles below. These two do not say
+        // "another drive would be better", they say this command drives at
+        // something - into an object, or across whatever the car ended up
+        // against after leaving the line. Stopping is the right answer there
+        // even when it is the only command left.
         "off_path": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // geometry veto: the commanded path runs into something solid.
         // Only pp_main carries it - vetoing every candidate at once would

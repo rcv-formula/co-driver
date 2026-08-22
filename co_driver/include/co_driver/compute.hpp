@@ -88,6 +88,10 @@ struct Drive
   std::string name;
   std::string topic;
   bool enabled{true};
+  // False once a gate that is NOT marked last_resort_ok has failed: the drive
+  // is not merely un-preferred, it has been called dangerous. Recomputed every
+  // cycle by computeLogit.
+  bool forceable{true};
   double hold{0.3};       // validity window of the last command [s]
   double keep{-1.0};      // how long this drive keeps the car once selected [s]
   double bias{0.0};
@@ -120,6 +124,15 @@ struct Drive
   {
     if (!has_cmd) {return false;}
     return (now - last_rx).seconds() <= hold;
+  }
+  // A command that could be published right now, ignoring every gate: enabled,
+  // arrived, still inside its window, and a number. This must stay in step
+  // with the hard gates at the top of computeLogit, which reports the same
+  // conditions one at a time so it can name which one failed.
+  bool isLive(const rclcpp::Time & now) const
+  {
+    return enabled && isFresh(now) &&
+           std::isfinite(cmd.drive.speed) && std::isfinite(cmd.drive.steering_angle);
   }
   double age(const rclcpp::Time & now) const
   {

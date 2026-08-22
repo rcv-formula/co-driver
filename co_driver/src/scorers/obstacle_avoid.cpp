@@ -443,32 +443,35 @@ public:
   ScoreResult score(const Drive & drive, const Context & ctx) override
   {
     obstacle_context_msgs::msg::ObstacleClusterArray::ConstSharedPtr clusters;
+    std_msgs::msg::Header ref_header;   // what the path lookup is stamped with
     {
       std::lock_guard<std::mutex> lock(mtx_);
-      // Reported as "clear", never as unavailable. This input carries a real
-      // weight, and missing:mask rescales the logit by the weights that were
-      // usable - so dropping out would silently move the calibrated
-      // localization thresholds every time the detector is not running.
-      if (!clusters_) {
-        return ScoreResult::ok(1.0, "no clusters on " + topic_);
-      }
-      if (source_ == "clusters" && timeout_ > 0.0 &&
-        (ctx.now - rx_).seconds() > timeout_)
-      {
-        return ScoreResult::ok(1.0, "stale clusters");
-      }
+      // EVERY EXIT HERE REPORTS "clear", never unavailable. This input carries
+      // a real weight, and missing:mask rescales the logit by the weights that
+      // were usable - so dropping out would silently move the calibrated
+      // localization thresholds every time a producer is not running.
+      //
+      // Reporting a clear path because nothing can be SEEN is not the same as
+      // reporting one because nothing is THERE, and a score of 1.0 cannot tell
+      // the two apart downstream. Failing open is still right - the reactive
+      // controller needs the same lidar, so disqualifying the map controller
+      // would only hand the car to something equally blind - but it must not
+      // be silent, so each of these says so.
       if (source_ == "scan") {
+        // Deliberately before any mention of the detector. Asking for a
+        // cluster message here - which this branch never reads - meant that on
+        // a car with the detector not running, this input reported a clear
+        // path for the entire run and never once looked at the lidar.
         if (!has_scan_) {
-          return ScoreResult::ok(1.0, "no scan yet");
+          RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "obstacle avoidance: nothing has arrived on %s - reporting a clear "
+            "path because nothing can be seen, not because nothing is there.",
+            scan_topic_.c_str());
+          return ScoreResult::ok(1.0, "no scan yet on " + scan_topic_);
         }
         if (timeout_ > 0.0 && (ctx.now - scan_rx_).seconds() > timeout_) {
           scan_.clear();
-          // Reporting a clear path because the lidar stopped is not the same
-          // as reporting one because nothing is there, and downstream cannot
-          // tell the two apart from a score of 1.0. Failing open is still the
-          // right choice - the reactive controller needs the same lidar, so
-          // disqualifying the map controller would only hand the car to
-          // something equally blind - but it must not be silent.
           RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 2000,
             "obstacle avoidance: no scan on %s for %.1fs - reporting a clear "
@@ -476,8 +479,27 @@ public:
             scan_topic_.c_str(), (ctx.now - scan_rx_).seconds());
           return ScoreResult::ok(1.0, "stale scan - nothing can be seen");
         }
+        ref_header = scan_header_;
+      } else {
+        if (!clusters_) {
+          RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "obstacle avoidance: nothing has arrived on %s - reporting a clear "
+            "path because nothing can be seen, not because nothing is there.",
+            topic_.c_str());
+          return ScoreResult::ok(1.0, "no clusters on " + topic_);
+        }
+        if (timeout_ > 0.0 && (ctx.now - rx_).seconds() > timeout_) {
+          RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 2000,
+            "obstacle avoidance: no clusters on %s for %.1fs - reporting a "
+            "clear path because nothing can be seen, not because nothing is "
+            "there.", topic_.c_str(), (ctx.now - rx_).seconds());
+          return ScoreResult::ok(1.0, "stale clusters");
+        }
+        clusters = clusters_;
+        ref_header = clusters_->header;
       }
-      clusters = clusters_;
     }
 
     const double v = drive.cmd.drive.speed;
@@ -494,7 +516,7 @@ public:
     // scorer that quietly answers "clear" because it lost its reference is
     // exactly the failure mode that made path_clearance untrustworthy.
     PathRef ref;
-    const bool on_plan = buildPathRef(clusters->header, &ref);
+    const bool on_plan = buildPathRef(ref_header, &ref);
 
     // Speed that decides the geometry: the one the car is ACTUALLY carrying.
     //
@@ -889,6 +911,7 @@ private:
       pts.push_back(p);
     }
     scan_.push(std::move(pts));
+    scan_header_ = msg->header;   // what the path lookup gets stamped with
     scan_rx_ = node_->now();
     has_scan_ = true;
   }
@@ -1277,6 +1300,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   ScanOccupancy scan_;
+  std_msgs::msg::Header scan_header_;
   // What the scan source is actually looking at, per drive. Diagnostic only -
   // "obstacle at 0.24m" says how far along the line it is and nothing about
   // what it is, and on a hairpin the wall beside the car projects onto the leg

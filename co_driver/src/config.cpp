@@ -83,6 +83,7 @@ void Influence::merge(const Json & j)
   in_max = jnum(j, "in_max", in_max);
   veto_below = jnum(j, "veto_below", veto_below);
   required = jbool(j, "required", required);
+  last_resort_ok = jbool(j, "last_resort_ok", last_resort_ok);
 }
 
 // ---------------------------------------------------------------------------

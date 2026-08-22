@@ -78,7 +78,21 @@
     selection:
       switch_margin: 0.10
       switch_cooldown_ms: 500    # no second switch within this window after a switch
-      fallback: "pp_main"        # last resort when everything is disqualified; a name from the JSON drives
+      # Preferred drive when nothing clears min_valid_score; a name from the
+      # JSON drives. Not the last thing tried - see last_resort below.
+      fallback: "pp_main"
+
+      # With EVERY drive failing a gate, drive the freshest command still
+      # arriving instead of stopping the car. Off here, on deliberately in
+      # co_driver_red_damvi.yaml - it trades a controlled stop for driving a
+      # command whose gate is unhappy, which is a decision about a particular
+      # vehicle rather than a default.
+      #
+      # It only steps over gates marked "last_resort_ok": true in the topics
+      # file, so a gate that means "this command drives at something" still
+      # stops the car. It cannot revive a dead topic either: freshness is
+      # required, so silence from everything still stops through timeout_stop.
+      last_resort: false
 
     # =====================================================================
     # Post-processing - the pipeline list is the order of application.

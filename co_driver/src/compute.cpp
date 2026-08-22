@@ -77,12 +77,17 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
   d.reject.clear();
   d.active = true;
   d.valid = false;
+  d.forceable = true;
   d.score = 0.0;
 
-  // Record the deactivation reason but keep computing the score (as far as possible).
-  auto deactivate = [&d](const std::string & why) {
+  // Record the deactivation reason but keep computing the score (as far as
+  // possible). `may_force` says whether the last resort is allowed to drive
+  // past this particular reason - see Influence::last_resort_ok. One gate
+  // saying no is enough to settle it for the whole drive.
+  auto deactivate = [&d](const std::string & why, bool may_force = false) {
       if (d.active) {d.reject = why;}   // keep only the first reason
       d.active = false;
+      if (!may_force) {d.forceable = false;}
     };
   // Only when no score is possible at all (no command, or NaN) do we zero z and stop.
   auto noScore = [&d](const std::string & why) {
@@ -107,15 +112,19 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
     deactivate("disabled");
   }
   if (!d.isFresh(now)) {
-    // Past the hold window = this topic is not alive right now.
+    // Past the hold window = this topic is not alive right now. Not a verdict
+    // on the command, and the last resort tests freshness itself anyway.
     char buf[96];
     std::snprintf(
       buf, sizeof(buf), "stale %.0fms (hold %.0fms)", d.age(now) * 1e3, d.hold * 1e3);
-    deactivate(buf);
+    deactivate(buf, true);
   }
   for (const auto & kv : d.results) {
     if (kv.second.veto) {
-      deactivate("veto[" + kv.first + "]" + (kv.second.note.empty() ? "" : ": " + kv.second.note));
+      const auto inf_it = d.influence.find(kv.first);
+      deactivate(
+        "veto[" + kv.first + "]" + (kv.second.note.empty() ? "" : ": " + kv.second.note),
+        inf_it != d.influence.end() && inf_it->second.last_resort_ok);
       break;
     }
   }
@@ -135,7 +144,7 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
 
     if (it == d.results.end() || !it->second.available) {
       if (inf.required) {
-        deactivate("required[" + kv.first + "] unavailable");
+        deactivate("required[" + kv.first + "] unavailable", inf.last_resort_ok);
       }
       // missing: "zero" effectively adds phi=0; "mask" rescales below.
       continue;
@@ -145,7 +154,7 @@ void computeLogit(Drive & d, const ScoringSpec & spec, const rclcpp::Time & now)
     const double shaped = shapeInfluence(inf, x);
 
     if (inf.veto_below >= 0.0 && shaped < inf.veto_below) {
-      deactivate("veto_below[" + kv.first + "]");
+      deactivate("veto_below[" + kv.first + "]", inf.last_resort_ok);
     }
     if (std::abs(inf.weight) <= 1e-12) {continue;}   // not scored (veto check only)
 

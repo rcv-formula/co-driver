@@ -43,6 +43,18 @@ struct Influence
   double in_max{1.0};
   double veto_below{-1.0};  // disqualify the drive if the shaped value is below this (negative = off)
   bool required{false};     // disqualify the drive when this input is unavailable
+  // May the last resort drive past this gate? A gate answers one of two very
+  // different questions, and only the drive's author knows which: "another
+  // drive would be better" (localization is down, so prefer the reactive one)
+  // or "this command is dangerous" (there is an object on the line, or the car
+  // has left the line entirely). The first is worth stepping over when there
+  // is no other drive left; the second never is, and stepping over it turns a
+  // controlled stop into driving at the thing the gate was watching.
+  //
+  // Default false: a gate is assumed to mean the dangerous one until someone
+  // says otherwise, because that is the assumption whose failure mode is a
+  // stopped car rather than a crashed one.
+  bool last_resort_ok{false};
 
   // A bare number overrides weight; an object overrides field by field.
   void merge(const Json & j);
@@ -116,7 +128,10 @@ struct SelectionSpec
   // presumes another exists; when none does, the honest choice is between a
   // gated command and no command. Freshness is still required, so silence
   // still stops the car through the pipeline's timeout_stop.
-  bool last_resort{true};   // (yaml: selection.last_resort)
+  // Off by default. It trades a controlled stop for driving a command whose
+  // gate is unhappy, which is a decision about a particular vehicle, not a
+  // default that should arrive with a rebuild.
+  bool last_resort{false};  // (yaml: selection.last_resort)
   // Below this commanded speed the selection is frozen: a stopped car has
   // nothing to gain from a handover. 0 disables. (yaml: freeze_below_speed)
   double freeze_below_speed{0.0};

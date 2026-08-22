@@ -86,15 +86,15 @@ public:
   };
 
   void configure(const SelectionSpec & spec) {spec_ = spec;}
-  const std::string & current() const {return current_;}
   // Who the gates should treat as the incumbent. A last-resort pick is driving
-  // on sufferance, not holding the car, so it is nobody.
+  // on sufferance, not holding the car, so it is nobody - and reading current_
+  // instead would re-open every gate that exempts the incumbent, which is the
+  // whole reason this accessor exists. current_ itself is private.
   const std::string & incumbent() const {return last_resort_ ? none_ : current_;}
 
   Result select(const std::vector<Drive> & drives, const rclcpp::Time & now)
   {
     Result r = selectFirst(drives, now);
-    last_resort_ = r.last_resort;
 
     // Score ranking -- order valid drives by combined score only, take ranks 1 and 2.
     // The selection (r.name) carries hysteresis and may differ from rank 1; this ignores that.
@@ -167,6 +167,9 @@ private:
       //
       // This asked for `valid` before, which is exactly what is false for
       // every drive by the time we are here - the branch could not run at all.
+      // Rungs 1 and 2 only bite where min_valid_score is above 0; both shipped
+      // configs leave it at 0, which makes valid == active and sends every
+      // such case straight to rung 3.
       if (!spec_.fallback.empty()) {
         for (const auto & d : drives) {
           if (d.name == spec_.fallback && d.active) {
@@ -174,9 +177,17 @@ private:
           }
         }
       }
-      // Rung 2 - any live drive, best first.
+      // Rung 2 - any live drive, the incumbent first if it is one of them.
+      // Picking argmax(score) here would trade the car every tick between two
+      // drives whose scores cross, with none of the margin or cooldown the
+      // main path uses to stop exactly that.
       for (const auto & d : drives) {
-        if (d.active && (!best || d.score > best->score)) {best = &d;}
+        if (d.active && d.name == current_) {best = &d; break;}
+      }
+      if (!best) {
+        for (const auto & d : drives) {
+          if (d.active && (!best || d.score > best->score)) {best = &d;}
+        }
       }
       if (best) {return commit(best->name, "fallback: only live drive", now);}
 
@@ -190,24 +201,34 @@ private:
       // Freshness is still required. If no topic is talking there is nothing
       // to fall back TO, and the pipeline's timeout_stop takes the car down -
       // which is what should happen when the controllers go silent.
+      //
+      // What it may NOT step over is a gate that called the command dangerous
+      // rather than un-preferred. Driving past "there is an object on the line"
+      // or "the car is not on the line any more" replaces a controlled stop
+      // with driving at the thing the gate was watching, and by then
+      // timeout_stop cannot help either - it only acts when nothing was
+      // selected. Influence::last_resort_ok marks the gates that may be
+      // stepped over, and defaults to false.
       if (spec_.last_resort) {
         const Drive * live = nullptr;
-        for (const auto & d : drives) {
-          if (!d.has_cmd || !d.enabled || !d.isFresh(now)) {continue;}
-          if (!std::isfinite(d.cmd.drive.speed) ||
-            !std::isfinite(d.cmd.drive.steering_angle))
-          {
-            continue;
+        auto usable = [&now](const Drive & d) {return d.isLive(now) && d.forceable;};
+        for (const auto & d : drives) {                       // the incumbent first
+          if (usable(d) && d.name == current_) {live = &d; break;}
+        }
+        if (!live) {
+          for (const auto & d : drives) {                     // then the fallback
+            if (usable(d) && d.name == spec_.fallback) {live = &d; break;}
           }
-          if (d.name == spec_.fallback) {live = &d; break;}   // prefer the fallback
-          if (!live || d.age(now) < live->age(now)) {live = &d;}
+        }
+        if (!live) {
+          for (const auto & d : drives) {                     // then the freshest
+            if (usable(d) && (!live || d.age(now) < live->age(now))) {live = &d;}
+          }
         }
         if (live) {
-          Result lr = commit(
+          return commit(
             live->name, "last resort: " + live->name + " is the only command "
-            "still arriving (" + live->reject + ")", now);
-          lr.last_resort = true;
-          return lr;
+            "still arriving (" + live->reject + ")", now, true);
         }
       }
       r.reason = "no valid drive";
@@ -297,12 +318,21 @@ private:
       best->name, was_forced ? "gate cleared -> returning" : "switched on score margin", now);
   }
 
-  Result commit(const std::string & name, const std::string & reason, const rclcpp::Time & now)
+  Result commit(
+    const std::string & name, const std::string & reason, const rclcpp::Time & now,
+    bool last_resort = false)
   {
+    // The flag belongs to current_, not to this tick. Setting it from each
+    // Result meant a single tick where nothing was live - which returns "no
+    // valid drive" and does NOT clear current_ - reported false while current_
+    // still named a last-resort pick, handing it the incumbent exemption it
+    // was specifically denied.
+    last_resort_ = last_resort;
     Result r;
     r.has_selection = true;
     r.name = name;
     r.reason = reason;
+    r.last_resort = last_resort;
     r.switched = (current_ != name);
     if (r.switched) {
       current_ = name;
@@ -868,6 +898,7 @@ private:
         d.score = it->score;
         d.active = it->active;
         d.valid = it->valid;
+        d.forceable = it->forceable;
         d.reject = it->reject;
       }
       held_age_ = std::move(held_age);
@@ -900,7 +931,11 @@ private:
         "FAIL-SAFE: %s. Every drive is disqualified, so the freshest command "
         "still arriving is being used. Fix what the gate is complaining about.",
         sel.reason.c_str());
-    } else if (!sel.has_selection) {
+    } else if (!sel.has_selection && (t - last_no_drive_warn_).seconds() >= 2.0) {
+      // Throttled by hand rather than by the macro: the reason string walks
+      // every drive under the mutex, and the macro would have it built fifty
+      // times a second to discard forty-nine of them.
+      last_no_drive_warn_ = t;
       std::string why;
       {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -909,10 +944,9 @@ private:
             (d.reject.empty() ? "-" : d.reject);
         }
       }
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "no drive selected - the output is decelerating to a stop. %s",
-        why.c_str());
+      RCLCPP_WARN(
+        get_logger(), "no drive selected - the output is decelerating to a "
+        "stop. %s", why.c_str());
     }
 
     publishStatus(sel);
@@ -1119,6 +1153,8 @@ private:
   std::string last_output_topic_;
   std::string selected_;
   rclcpp::Time last_eval_, last_out_;
+  // Hand-rolled throttle for the no-drive warning; see where it is used.
+  rclcpp::Time last_no_drive_warn_{0, 0, RCL_ROS_TIME};
   bool eval_t_valid_{false}, out_t_valid_{false};
 
   std::vector<rclcpp::Subscription<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr>
