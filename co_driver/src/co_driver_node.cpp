@@ -12,6 +12,9 @@
 // Evaluation (may be slow) and output (fixed 100Hz) run on separate timers, so
 // heavy scoring cannot disturb the output rate.
 #include <algorithm>
+#include <atomic>
+#include <fstream>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -22,6 +25,7 @@
 #include <vector>
 
 #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
+#include <rclcpp/parameter_client.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -61,6 +65,79 @@ std::string num(double v)
 }
 
 }  // namespace
+
+// ===========================================================================
+// Return assist -- a short, time-limited hand on the map controller's tuning
+// at the moment it gets the car back.
+//
+// Coming back with the steering already hard over means the car is a long way
+// from the attitude the controller wants, and the derivative term is what acts
+// on how fast that error is closing. Raising it helps only while the error is
+// being taken out; left raised it amplifies noise for the rest of the lap. So
+// it goes up on the handover and comes back down on a timer, and the value it
+// comes back to is the one that was actually there, read before it was
+// touched. If that read fails, nothing is changed at all: a raised gain with
+// no way back is the worst thing this could leave behind.
+//
+// It runs on its own thread because it cannot run on the evaluation tick: a
+// parameter service round trip is tens of milliseconds and the hold is
+// seconds. It captures only values, never the node, so it cannot outlive
+// anything it points at.
+// ===========================================================================
+struct ReturnAssist
+{
+  bool enabled{false};
+  std::string node{"/pure_pursuit"};
+  std::string parameter{"K_d"};
+  double steering_above{15.0 * M_PI / 180.0};
+  double multiply_by{2.0};
+  double hold{2.0};
+  double service_timeout{0.5};
+};
+
+inline void runReturnAssist(
+  const ReturnAssist a, const double steer_deg,
+  std::shared_ptr<std::atomic<bool>> busy, const unsigned seq)
+{
+  const auto log = rclcpp::get_logger("co_driver.return_assist");
+  const auto timeout = std::chrono::milliseconds(
+    static_cast<int>(a.service_timeout * 1e3));
+  try {
+    auto helper = std::make_shared<rclcpp::Node>(
+      "co_driver_return_assist_" + std::to_string(seq));
+    auto client = std::make_shared<rclcpp::SyncParametersClient>(helper, a.node);
+    if (!client->wait_for_service(timeout)) {
+      RCLCPP_WARN(
+        log, "%s has no parameter service - leaving %s alone",
+        a.node.c_str(), a.parameter.c_str());
+      busy->store(false);
+      return;
+    }
+    const auto got = client->get_parameters({a.parameter}, timeout);
+    if (got.empty() || got[0].get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      RCLCPP_WARN(
+        log, "cannot read %s from %s as a double - not touching it, because "
+        "there would be no way back", a.parameter.c_str(), a.node.c_str());
+      busy->store(false);
+      return;
+    }
+    const double base = got[0].as_double();
+    const double raised = base * a.multiply_by;
+    client->set_parameters({rclcpp::Parameter(a.parameter, raised)}, timeout);
+    RCLCPP_INFO(
+      log, "handed back at %.0f deg of steering: %s %s %.4f -> %.4f for %.1fs",
+      steer_deg, a.node.c_str(), a.parameter.c_str(), base, raised, a.hold);
+
+    std::this_thread::sleep_for(
+      std::chrono::milliseconds(static_cast<int>(a.hold * 1e3)));
+
+    client->set_parameters({rclcpp::Parameter(a.parameter, base)}, timeout);
+    RCLCPP_INFO(log, "%s %s back to %.4f", a.node.c_str(), a.parameter.c_str(), base);
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(log, "return assist gave up: %s", e.what());
+  }
+  busy->store(false);
+}
 
 // ===========================================================================
 // Selection -- which drive to use. Hysteresis + minimum hold time against chattering.
@@ -603,6 +680,10 @@ public:
       .automatically_declare_parameters_from_overrides(true))
   {
     // Base config comes from yaml (ROS parameters); growing lists come from this JSON.
+    if (!has_parameter("return_assist_file")) {
+      declare_parameter<std::string>("return_assist_file", "");
+    }
+    loadReturnAssist(get_parameter("return_assist_file").as_string());
     if (!has_parameter("topics_file")) {declare_parameter<std::string>("topics_file", "");}
     topics_path_ = get_parameter("topics_file").as_string();
 
@@ -938,6 +1019,7 @@ private:
           get_logger(), "%s -> %s: asking %s to ramp the speed up rather than "
           "step to it", handed_from.c_str(), sel.name.c_str(),
           cfg_.ramp_on_return.topic.c_str());
+        startReturnAssist(sel.name);
       }
       // Two candidates may read the same topic - the fallback appears once per
       // reason it can be chosen. Swapping between those is a bookkeeping
@@ -1178,8 +1260,76 @@ private:
 
   ackermann_msgs::msg::AckermannDrive output_;
   bool has_output_{false};
+  // Read from its own file, so tuning that belongs to the moment of handover
+  // does not live in the arbitration's config.
+  void loadReturnAssist(const std::string & path)
+  {
+    if (path.empty()) {return;}
+    std::ifstream in(path);
+    if (!in) {
+      RCLCPP_WARN(get_logger(), "return_assist_file: cannot open %s", path.c_str());
+      return;
+    }
+    Json j;
+    try {
+      j = Json::parse(in, nullptr, true, /*ignore_comments=*/ true);
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(get_logger(), "return_assist_file %s: %s", path.c_str(), e.what());
+      return;
+    }
+    assist_.enabled = jbool(j, "enabled", true);
+    assist_.node = jstr(j, "node", assist_.node);
+    assist_.parameter = jstr(j, "parameter", assist_.parameter);
+    assist_.steering_above = jnum(j, "steering_above_deg", 15.0) * M_PI / 180.0;
+    assist_.multiply_by = jnum(j, "multiply_by", assist_.multiply_by);
+    assist_.hold = jms(j, "hold_ms", assist_.hold * 1e3);
+    assist_.service_timeout = jms(j, "service_timeout_ms", assist_.service_timeout * 1e3);
+    if (assist_.multiply_by <= 0.0 || assist_.hold <= 0.0) {
+      RCLCPP_WARN(
+        get_logger(), "return assist: multiply_by %.2f and hold %.2fs must both "
+        "be above 0 - disabled", assist_.multiply_by, assist_.hold);
+      assist_.enabled = false;
+    }
+    if (!assist_.enabled) {
+      RCLCPP_INFO(get_logger(), "return assist: off");
+      return;
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "return assist: handing back above %.0f degrees of steering multiplies "
+      "%s %s by %.2f for %.1fs",
+      assist_.steering_above * 180.0 / M_PI, assist_.node.c_str(),
+      assist_.parameter.c_str(), assist_.multiply_by, assist_.hold);
+  }
+
+  // Only when the drive taking the car back is already hard over. One at a
+  // time: overlapping handovers would each read a value the other had raised,
+  // and the second restore would put the raised one back as the baseline.
+  void startReturnAssist(const std::string & to)
+  {
+    if (!assist_.enabled) {return;}
+    double steer = 0.0;
+    for (const auto & d : drives_) {          // mtx_ is held by the caller
+      if (d.name == to) {steer = std::abs(d.cmd.drive.steering_angle); break;}
+    }
+    if (!std::isfinite(steer) || steer <= assist_.steering_above) {return;}
+    bool expected = false;
+    if (!assist_busy_->compare_exchange_strong(expected, true)) {
+      RCLCPP_WARN(
+        get_logger(), "return assist already running - skipping this handover");
+      return;
+    }
+    std::thread(
+      runReturnAssist, assist_, steer * 180.0 / M_PI, assist_busy_, ++assist_seq_)
+    .detach();
+  }
+
   bool have_command_{false};
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ramp_pub_;
+  ReturnAssist assist_;
+  std::shared_ptr<std::atomic<bool>> assist_busy_{
+    std::make_shared<std::atomic<bool>>(false)};
+  unsigned assist_seq_{0};
   bool switch_pending_{false};
   // Topic behind the last selection, so the blend arms on a real source change.
   std::string last_output_topic_;

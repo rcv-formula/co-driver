@@ -31,12 +31,17 @@ def generate_launch_description():
         os.path.join(share, 'config', 'localization_scoring.jsonc'),
         os.path.join(share, 'config', 'obstacle_scoring.jsonc'),
     ))
+    # What to do at the moment the car is handed back, which is neither a
+    # scorer threshold nor an arbitration weight and so gets its own file.
+    default_return_assist = os.path.join(share, 'config', 'return_assist.jsonc')
 
     args = [
         DeclareLaunchArgument('config', default_value=default_config),
         DeclareLaunchArgument('topics', default_value=default_topics),
         # scorer thresholds / hold times / weights, merged over the topics file
         DeclareLaunchArgument('tuning', default_value=default_tuning),
+        # the handover assist; pass an empty string to turn it off entirely
+        DeclareLaunchArgument('return_assist', default_value=default_return_assist),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('gap_follow', default_value='true'),
         DeclareLaunchArgument('monitor', default_value='true'),
@@ -61,6 +66,7 @@ def generate_launch_description():
             {
                 'topics_file': LaunchConfiguration('topics'),
                 'tuning_file': LaunchConfiguration('tuning'),
+                'return_assist_file': LaunchConfiguration('return_assist'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             },
         ],
