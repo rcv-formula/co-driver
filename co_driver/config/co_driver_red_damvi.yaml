@@ -134,6 +134,11 @@
     # speed still valid either side of it, so there is nothing to pick up from.
     # An empty topic disables it.
     # =====================================================================
+    # NOTE: return_assist.jsonc can turn on a speed hold, which does the ramp
+    # itself once it releases. While that is on, this flag is NOT sent - the
+    # controller takes the most recent of the two as the winner, so sending it
+    # would cancel the hold. Nothing here needs changing for that; it is said
+    # at startup which of the two is in use.
     ramp_on_return:
       topic: "/launch_start_reset"
       from: ["gap_loc"]

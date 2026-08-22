@@ -96,6 +96,17 @@ struct AssistState
   std::string last{"idle"};  // how the previous one ended
 };
 
+// Hold a fixed speed for the same stretch, then let the controller ramp out of
+// it by itself. Shares hold with the gain assist deliberately: it is the same
+// moment and the same two seconds, and having the number written twice is how
+// they would drift apart.
+struct SpeedHold
+{
+  bool enabled{false};
+  std::string topic{"/launch_speed_hold"};
+  double speed{1.5};
+};
+
 struct ReturnAssist
 {
   bool enabled{false};
@@ -105,6 +116,7 @@ struct ReturnAssist
   double steering_above{15.0 * M_PI / 180.0};
   double hold{2.0};
   double service_timeout{0.5};
+  SpeedHold speed_hold;
 };
 
 inline void runReturnAssist(
@@ -841,6 +853,10 @@ public:
         i, d.name.c_str(), d.topic.c_str(), d.hold * 1e3);
     }
 
+    if (assist_.speed_hold.enabled) {
+      speed_hold_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+        assist_.speed_hold.topic, rclcpp::QoS(1));
+    }
     if (!cfg_.ramp_on_return.topic.empty()) {
       ramp_pub_ = create_publisher<std_msgs::msg::Bool>(
         cfg_.ramp_on_return.topic, rclcpp::QoS(1));
@@ -1146,7 +1162,21 @@ private:
           cfg_.ramp_on_return.from.begin(), cfg_.ramp_on_return.from.end(),
           handed_from) != cfg_.ramp_on_return.from.end();
       if (handed_back) {
-        if (ramp_pub_) {
+        // One or the other, never both. The controller takes the most recent
+        // of these as the winner, so sending the ramp flag after a speed hold
+        // would cancel the hold - which is why turning the hold on turns the
+        // ramp flag off rather than leaving both to be configured.
+        if (speed_hold_pub_) {
+          std_msgs::msg::Float64MultiArray msg;
+          msg.data = {assist_.speed_hold.speed, assist_.hold};
+          speed_hold_pub_->publish(msg);
+          speed_hold_until_ = t + rclcpp::Duration::from_seconds(assist_.hold);
+          speed_hold_valid_ = true;
+          RCLCPP_INFO(
+            get_logger(), "%s -> %s: holding %.2fm/s for %.1fs, then %s ramps "
+            "out of it", handed_from.c_str(), sel.name.c_str(),
+            assist_.speed_hold.speed, assist_.hold, assist_.node.c_str());
+        } else if (ramp_pub_) {
           std_msgs::msg::Bool msg;
           msg.data = true;
           ramp_pub_->publish(msg);
@@ -1264,13 +1294,21 @@ private:
       hold = assist_state_->hold;
       if (active) {left = std::max(0.0, (assist_state_->until - now()).seconds());}
     }
+    double hold_left = 0.0;
+    if (speed_hold_valid_) {
+      hold_left = std::max(0.0, (speed_hold_until_ - now()).seconds());
+    }
     os << "{\"active\":" << (active ? "true" : "false")
        << ",\"enabled\":" << (assist_.enabled ? "true" : "false")
        << ",\"node\":\"" << esc(assist_.node) << "\""
        << ",\"raised\":\"" << esc(what) << "\""
        << ",\"left_s\":" << num(left)
        << ",\"hold_s\":" << num(hold)
-       << ",\"last\":\"" << esc(last) << "\"}";
+       << ",\"last\":\"" << esc(last) << "\""
+       << ",\"speed_hold\":{\"enabled\":"
+       << (assist_.speed_hold.enabled ? "true" : "false")
+       << ",\"speed\":" << num(assist_.speed_hold.speed)
+       << ",\"left_s\":" << num(hold_left) << "}}";
     return os.str();
   }
 
@@ -1445,6 +1483,18 @@ private:
     assist_.steering_above = jnum(j, "steering_above_deg", 15.0) * M_PI / 180.0;
     assist_.hold = jms(j, "hold_ms", assist_.hold * 1e3);
     assist_.service_timeout = jms(j, "service_timeout_ms", assist_.service_timeout * 1e3);
+    const auto sh = j.find("speed_hold");
+    if (sh != j.end() && sh->is_object()) {
+      assist_.speed_hold.enabled = jbool(*sh, "enabled", false);
+      assist_.speed_hold.topic = jstr(*sh, "topic", assist_.speed_hold.topic);
+      assist_.speed_hold.speed = jnum(*sh, "speed", assist_.speed_hold.speed);
+      if (assist_.speed_hold.speed < 0.0 || assist_.speed_hold.topic.empty()) {
+        RCLCPP_WARN(
+          get_logger(), "return assist: speed_hold needs a topic and a speed at "
+          "or above 0 - disabled");
+        assist_.speed_hold.enabled = false;
+      }
+    }
     assist_.parameters.clear();
     const auto it = j.find("parameters");
     if (it != j.end() && it->is_object()) {
@@ -1466,8 +1516,15 @@ private:
         "multiplier above 0 and hold above 0 - disabled");
       assist_.enabled = false;
     }
+    if (assist_.speed_hold.enabled) {
+      RCLCPP_INFO(
+        get_logger(),
+        "return assist: handing back holds %.2fm/s on %s for %.1fs, and the "
+        "controller ramps out of that by itself - so the ramp flag is NOT sent",
+        assist_.speed_hold.speed, assist_.speed_hold.topic.c_str(), assist_.hold);
+    }
     if (!assist_.enabled) {
-      RCLCPP_INFO(get_logger(), "return assist: off");
+      RCLCPP_INFO(get_logger(), "return assist: gains left alone");
       return;
     }
     std::string what;
@@ -1510,6 +1567,9 @@ private:
 
   bool have_command_{false};
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ramp_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr speed_hold_pub_;
+  rclcpp::Time speed_hold_until_;
+  bool speed_hold_valid_{false};
   ReturnAssist assist_;
   std::shared_ptr<std::atomic<bool>> assist_busy_{
     std::make_shared<std::atomic<bool>>(false)};
