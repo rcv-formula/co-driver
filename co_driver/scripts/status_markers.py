@@ -130,6 +130,25 @@ class StatusMarkers(Node):
         bar = "#" * int(round(demand * 10)) + "." * (10 - int(round(demand * 10)))
         return f"obstacle [{bar}] {demand:.2f}  {note}"
 
+    @staticmethod
+    def assist_line(st):
+        """The handover assist, while it has the map controller's gains raised.
+
+        Worth a line of its own: it is the only thing here that reaches into
+        another node and changes it, and the line it leaves behind is the only
+        warning that a restore did not take.
+        """
+        a = st.get("assist")
+        if not isinstance(a, dict):
+            return None
+        last = a.get("last") or ""
+        if a.get("active"):
+            return (f"ASSIST {a.get('left_s', 0):.1f}s left  "
+                    f"{a.get('node', '')} {a.get('raised', '')}")
+        if "FAIL" in last or "REFUS" in last:
+            return f"ASSIST {last}  <- {a.get('node', '')} needs setting by hand"
+        return None
+
     def tick(self):
         if self.st is None:
             return
@@ -158,6 +177,9 @@ class StatusMarkers(Node):
         ob = self.obstacle_line(st)
         if ob:
             lines.append(ob)
+        assist = self.assist_line(st)
+        if assist:
+            lines.append(assist)
         lines.append(f"{conf}p: {probs}")
         t_now = self.now()
         for tw, frm, to, why in reversed(self.switches):

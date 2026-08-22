@@ -84,6 +84,18 @@ std::string num(double v)
 // seconds. It captures only values, never the node, so it cannot outlive
 // anything it points at.
 // ===========================================================================
+// What the assist is doing right now, for the status topic. Shared with the
+// thread, which is the only writer.
+struct AssistState
+{
+  std::mutex m;
+  bool active{false};
+  std::string what;          // "K_d 0.5000->1.0000, ..."
+  double hold{0.0};
+  rclcpp::Time until;
+  std::string last{"idle"};  // how the previous one ended
+};
+
 struct ReturnAssist
 {
   bool enabled{false};
@@ -97,11 +109,19 @@ struct ReturnAssist
 
 inline void runReturnAssist(
   const ReturnAssist a, const double steer_deg,
-  std::shared_ptr<std::atomic<bool>> busy, const unsigned seq)
+  std::shared_ptr<std::atomic<bool>> busy,
+  std::shared_ptr<std::atomic<bool>> abort,
+  std::shared_ptr<AssistState> state, const rclcpp::Time started,
+  const unsigned seq)
 {
   const auto log = rclcpp::get_logger("co_driver.return_assist");
   const auto timeout = std::chrono::milliseconds(
     static_cast<int>(a.service_timeout * 1e3));
+  const auto note = [&state](const std::string & how) {
+      std::lock_guard<std::mutex> lock(state->m);
+      state->active = false;
+      state->last = how;
+    };
   try {
     auto helper = std::make_shared<rclcpp::Node>(
       "co_driver_return_assist_" + std::to_string(seq));
@@ -110,6 +130,7 @@ inline void runReturnAssist(
       RCLCPP_WARN(
         log, "%s has no parameter service - leaving its tuning alone",
         a.node.c_str());
+      note("no parameter service");
       busy->store(false);
       return;
     }
@@ -122,6 +143,7 @@ inline void runReturnAssist(
       RCLCPP_WARN(
         log, "%s returned %zu of %zu parameters - changing none of them",
         a.node.c_str(), got.size(), names.size());
+      note("could not read them all");
       busy->store(false);
       return;
     }
@@ -132,6 +154,7 @@ inline void runReturnAssist(
         RCLCPP_WARN(
           log, "%s %s is not a double - changing none of them, because there "
           "would be no way back", a.node.c_str(), names[i].c_str());
+        note(names[i] + " is not a double");
         busy->store(false);
         return;
       }
@@ -148,22 +171,78 @@ inline void runReturnAssist(
       RCLCPP_WARN(
         log, "%s refused the change (%s) - nothing was altered",
         a.node.c_str(), set.reason.c_str());
+      note("refused: " + set.reason);
       busy->store(false);
       return;
     }
     RCLCPP_INFO(
       log, "handed back at %.0f deg of steering: %s %s for %.1fs",
       steer_deg, a.node.c_str(), summary.c_str(), a.hold);
+    {
+      std::lock_guard<std::mutex> lock(state->m);
+      state->active = true;
+      state->what = summary;
+      state->hold = a.hold;
+      state->until = started + rclcpp::Duration::from_seconds(a.hold);
+      state->last = "raised";
+    }
 
-    std::this_thread::sleep_for(
-      std::chrono::milliseconds(static_cast<int>(a.hold * 1e3)));
+    // Slice the wait so shutdown does not have to sit through it. A process
+    // that exits mid-hold leaves the gains raised with nobody left who knows
+    // what they were, which is the one outcome this whole thing must not have.
+    const auto slice = std::chrono::milliseconds(20);
+    auto left = std::chrono::milliseconds(static_cast<int>(a.hold * 1e3));
+    while (left.count() > 0 && !abort->load()) {
+      const auto step = std::min(slice, left);
+      std::this_thread::sleep_for(step);
+      left -= step;
+    }
+    const bool cut_short = left.count() > 0;
 
-    const auto back = client->set_parameters_atomically(original, timeout);
-    RCLCPP_INFO(
-      log, "%s back to what it was%s", a.node.c_str(),
-      back.successful ? "" : " - REFUSED, the raised values are still in place");
+    // Put back only what is still ours. Anything that moved underneath us in
+    // the meantime - a person tuning live, another node - belongs to whoever
+    // moved it, and writing our remembered value over theirs would be worse
+    // than leaving it.
+    std::vector<rclcpp::Parameter> restore;
+    std::string kept;
+    const auto now = client->get_parameters(names, timeout);
+    for (std::size_t i = 0; i < original.size(); ++i) {
+      const bool readable = i < now.size() &&
+        now[i].get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE;
+      if (readable && std::abs(now[i].as_double() - raised[i].as_double()) > 1e-9) {
+        kept += (kept.empty() ? "" : ", ") + names[i];
+        continue;                    // somebody else owns it now
+      }
+      restore.push_back(original[i]);
+    }
+    if (!kept.empty()) {
+      RCLCPP_WARN(
+        log, "%s changed underneath the assist and was left alone", kept.c_str());
+    }
+    // Retry: one refused call must not be the end of it, because there is no
+    // later pass that would notice and no state left anywhere else that says
+    // what these were.
+    bool restored = restore.empty();
+    for (int attempt = 0; attempt < 3 && !restored; ++attempt) {
+      if (attempt) {std::this_thread::sleep_for(std::chrono::milliseconds(100));}
+      restored = client->set_parameters_atomically(restore, timeout).successful;
+    }
+    if (restored) {
+      RCLCPP_INFO(
+        log, "%s back to what it was%s", a.node.c_str(),
+        cut_short ? " (cut short by shutdown)" : "");
+      note(cut_short ? "restored early" : "restored");
+    } else {
+      RCLCPP_ERROR(
+        log, "%s REFUSED the restore three times - %s is still raised. Set it "
+        "back by hand: ros2 param set %s ...",
+        a.node.c_str(), a.parameters.empty() ? "the tuning" :
+        a.parameters.front().first.c_str(), a.node.c_str());
+      note("RESTORE FAILED - still raised");
+    }
   } catch (const std::exception & e) {
     RCLCPP_WARN(log, "return assist gave up: %s", e.what());
+    note(std::string("gave up: ") + e.what());
   }
   busy->store(false);
 }
@@ -704,6 +783,23 @@ private:
 class CoDriverNode : public rclcpp::Node
 {
 public:
+  // Going away in the middle of a hold would leave the map controller's gains
+  // raised with nobody left who knows what they were. Ask the assist to cut
+  // the wait and put them back, and give it a moment to do it.
+  ~CoDriverNode() override
+  {
+    if (!assist_busy_->load()) {return;}
+    assist_abort_->store(true);
+    for (int i = 0; i < 200 && assist_busy_->load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (assist_busy_->load()) {
+      RCLCPP_ERROR(
+        get_logger(), "shutting down while the return assist was still "
+        "restoring %s - check its gains by hand", assist_.node.c_str());
+    }
+  }
+
   explicit CoDriverNode(const rclcpp::NodeOptions & options)
   : rclcpp::Node("co_driver_node", rclcpp::NodeOptions(options)
       .automatically_declare_parameters_from_overrides(true))
@@ -1152,6 +1248,32 @@ private:
   // -------------------------------------------------------------------------
   // Diagnostics publishing
   // -------------------------------------------------------------------------
+  // What the handover assist has done to the map controller's tuning, so it is
+  // visible while it is happening rather than only in the log afterwards.
+  std::string assistJson()
+  {
+    std::ostringstream os;
+    bool active;
+    std::string what, last;
+    double left = 0.0, hold = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(assist_state_->m);
+      active = assist_state_->active;
+      what = assist_state_->what;
+      last = assist_state_->last;
+      hold = assist_state_->hold;
+      if (active) {left = std::max(0.0, (assist_state_->until - now()).seconds());}
+    }
+    os << "{\"active\":" << (active ? "true" : "false")
+       << ",\"enabled\":" << (assist_.enabled ? "true" : "false")
+       << ",\"node\":\"" << esc(assist_.node) << "\""
+       << ",\"raised\":\"" << esc(what) << "\""
+       << ",\"left_s\":" << num(left)
+       << ",\"hold_s\":" << num(hold)
+       << ",\"last\":\"" << esc(last) << "\"}";
+    return os.str();
+  }
+
   void publishStatus(const Selector::Result & sel)
   {
     if (!cfg_.output.publish_status) {return;}
@@ -1200,6 +1322,7 @@ private:
        << ",\"selected\":\"" << esc(sel.has_selection ? sel.name : "") << "\""
        << ",\"runner_up\":\"" << esc(sel.has_runner_up ? sel.runner_up : "") << "\""
        << ",\"reason\":\"" << esc(sel.reason) << "\""
+       << ",\"assist\":" << assistJson()
        << ",\"switched\":" << (sel.switched ? "true" : "false")
        << ",\"combine\":\"" << esc(cfg_.scoring.combine) << "\""
        // Cost of the scoring pass. If eval_ms approaches the evaluation period
@@ -1378,8 +1501,10 @@ private:
         get_logger(), "return assist already running - skipping this handover");
       return;
     }
+    assist_abort_->store(false);
     std::thread(
-      runReturnAssist, assist_, steer * 180.0 / M_PI, assist_busy_, ++assist_seq_)
+      runReturnAssist, assist_, steer * 180.0 / M_PI, assist_busy_, assist_abort_,
+      assist_state_, now(), ++assist_seq_)
     .detach();
   }
 
@@ -1388,6 +1513,9 @@ private:
   ReturnAssist assist_;
   std::shared_ptr<std::atomic<bool>> assist_busy_{
     std::make_shared<std::atomic<bool>>(false)};
+  std::shared_ptr<std::atomic<bool>> assist_abort_{
+    std::make_shared<std::atomic<bool>>(false)};
+  std::shared_ptr<AssistState> assist_state_{std::make_shared<AssistState>()};
   unsigned assist_seq_{0};
   bool switch_pending_{false};
   // Topic behind the last selection, so the blend arms on a real source change.
