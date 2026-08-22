@@ -78,14 +78,23 @@ public:
     // runner-up may equal selected. (Per-drive ranks are all in status "rank".)
     std::string runner_up;
     bool has_runner_up{false};
+    // Chosen by the last rung of the fallback ladder, with every gate unhappy.
+    // It drives, but it does not become the incumbent: a gate that exempts
+    // whoever is currently selected would be permanently opened by one such
+    // pick, which is the opposite of what a last resort is for.
+    bool last_resort{false};
   };
 
   void configure(const SelectionSpec & spec) {spec_ = spec;}
   const std::string & current() const {return current_;}
+  // Who the gates should treat as the incumbent. A last-resort pick is driving
+  // on sufferance, not holding the car, so it is nobody.
+  const std::string & incumbent() const {return last_resort_ ? none_ : current_;}
 
   Result select(const std::vector<Drive> & drives, const rclcpp::Time & now)
   {
     Result r = selectFirst(drives, now);
+    last_resort_ = r.last_resort;
 
     // Score ranking -- order valid drives by combined score only, take ranks 1 and 2.
     // The selection (r.name) carries hysteresis and may differ from rank 1; this ignores that.
@@ -148,12 +157,57 @@ private:
     }
 
     if (!best) {
-      // nothing usable -> try the fallback
+      // NOTHING CLEARED THE BAR. What follows is the only part of this file
+      // that runs when the car would otherwise be stopped, so it is written as
+      // a ladder: each rung gives up one more thing, and says which one.
+      //
+      // Rung 1 - the configured fallback, if it is live. A score floor is a
+      // preference between drives, not a safety gate; being under it is not a
+      // reason to stop a car that has a controller talking to it.
+      //
+      // This asked for `valid` before, which is exactly what is false for
+      // every drive by the time we are here - the branch could not run at all.
       if (!spec_.fallback.empty()) {
         for (const auto & d : drives) {
-          if (d.name != spec_.fallback) {continue;}
-          // The fallback must itself be valid (= active); never revive a dead command.
-          if (d.valid) {return commit(d.name, "fallback", now);}
+          if (d.name == spec_.fallback && d.active) {
+            return commit(d.name, "fallback", now);
+          }
+        }
+      }
+      // Rung 2 - any live drive, best first.
+      for (const auto & d : drives) {
+        if (d.active && (!best || d.score > best->score)) {best = &d;}
+      }
+      if (best) {return commit(best->name, "fallback: only live drive", now);}
+
+      // Rung 3 - every drive failed a gate, and a gate says "not this one",
+      // which presumes there is another. There is not. The choice left is
+      // between stopping the car and driving it with a command whose gate is
+      // unhappy, and on a cold start the unhappy gate is usually just
+      // localization never having started: nothing is wrong with the command,
+      // there is only nothing to check it against.
+      //
+      // Freshness is still required. If no topic is talking there is nothing
+      // to fall back TO, and the pipeline's timeout_stop takes the car down -
+      // which is what should happen when the controllers go silent.
+      if (spec_.last_resort) {
+        const Drive * live = nullptr;
+        for (const auto & d : drives) {
+          if (!d.has_cmd || !d.enabled || !d.isFresh(now)) {continue;}
+          if (!std::isfinite(d.cmd.drive.speed) ||
+            !std::isfinite(d.cmd.drive.steering_angle))
+          {
+            continue;
+          }
+          if (d.name == spec_.fallback) {live = &d; break;}   // prefer the fallback
+          if (!live || d.age(now) < live->age(now)) {live = &d;}
+        }
+        if (live) {
+          Result lr = commit(
+            live->name, "last resort: " + live->name + " is the only command "
+            "still arriving (" + live->reject + ")", now);
+          lr.last_resort = true;
+          return lr;
         }
       }
       r.reason = "no valid drive";
@@ -264,6 +318,9 @@ private:
   bool switched_once_{false};
   // The last handover was forced by a gate, not won on score.
   bool forced_{false};
+  // Set when the current selection came from the last rung of the ladder.
+  bool last_resort_{false};
+  const std::string none_;
 };
 
 // ===========================================================================
@@ -764,7 +821,7 @@ private:
       eval_t_valid_ = true;
       ctx_.has_last_output = has_output_;
       ctx_.last_output = output_;
-      ctx_.last_selected = selector_.current();
+      ctx_.last_selected = selector_.incumbent();
       snap = drives_;
       ctx = ctx_;
     }
@@ -832,6 +889,30 @@ private:
         if (topic != last_output_topic_) {switch_pending_ = true;}
         last_output_topic_ = topic;
       }
+    }
+
+    // Neither of these is visible from the car without being said out loud.
+    // The status topic carries the reason, but the person watching a car that
+    // will not move is reading the console.
+    if (sel.last_resort) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "FAIL-SAFE: %s. Every drive is disqualified, so the freshest command "
+        "still arriving is being used. Fix what the gate is complaining about.",
+        sel.reason.c_str());
+    } else if (!sel.has_selection) {
+      std::string why;
+      {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (const auto & d : drives_) {
+          why += (why.empty() ? "" : ", ") + d.name + ": " +
+            (d.reject.empty() ? "-" : d.reject);
+        }
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "no drive selected - the output is decelerating to a stop. %s",
+        why.c_str());
     }
 
     publishStatus(sel);

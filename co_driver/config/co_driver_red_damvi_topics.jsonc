@@ -53,7 +53,14 @@
       // loud and safe, never silently disabled.
       "name": "loc_state",
       "type": "localization_state",
-      "params": {"topic": "/localization_pf/state"}
+      // on_missing "value" is what makes the line above true. Left at its
+      // default, silence returns UNAVAILABLE, and an unavailable input is
+      // masked out of the drive's score before veto_below is ever tested - so
+      // a wrong topic name here deleted the gate instead of closing it. Read
+      // as a value, no state yet means the producer never reached map-ready,
+      // which is Lost, which is exactly what the gate is for.
+      "params": {"topic": "/localization_pf/state", "on_missing": "value",
+                 "default_score": 0.0}
     },
 
     {
@@ -203,7 +210,16 @@
         // W = +3.0: full confidence -> z = 3.0, zero confidence -> z = 0.0
         "localization": {"weight": 3.0, "exp_mix": 1.0, "exp_k": 3.0, "in_min": 0.02, "in_max": 0.35},
         // Lost (or silence) disqualifies pp_main outright; weight 0 = veto only
-        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25},
+        "loc_state": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.25,
+                      // Silence has to CLOSE this gate, and veto_below alone
+                      // cannot do it: an input with no message is unavailable,
+                      // and an unavailable input is masked out before the
+                      // veto_below test is ever reached. So a wrong topic name
+                      // here used to delete the gate rather than close it -
+                      // the exact opposite of what the line below claims, and
+                      // the failure mode a gate exists to prevent. `required`
+                      // is the one that acts on absence.
+                      "required": true},
         // early-degradation trip (see localization_scoring.jsonc); veto only
         "loc_trip": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // return latch (see localization_scoring.jsonc); weight 0 = veto only

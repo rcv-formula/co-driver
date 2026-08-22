@@ -208,6 +208,7 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
   sel.switch_cooldown = pms(n, "selection.switch_cooldown_ms", sel.switch_cooldown * 1e3);
   sel.freeze_below_speed = pnum(n, "selection.freeze_below_speed", sel.freeze_below_speed);
   sel.fallback = pstr(n, "selection.fallback", sel.fallback);
+  sel.last_resort = pbool(n, "selection.last_resort", sel.last_resort);
 
   c->pipeline.clear();
   for (const auto & name : pstrs(n, "postprocess.pipeline")) {

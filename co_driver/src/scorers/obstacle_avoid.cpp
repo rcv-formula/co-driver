@@ -463,7 +463,18 @@ public:
         }
         if (timeout_ > 0.0 && (ctx.now - scan_rx_).seconds() > timeout_) {
           scan_.clear();
-          return ScoreResult::ok(1.0, "stale scan");
+          // Reporting a clear path because the lidar stopped is not the same
+          // as reporting one because nothing is there, and downstream cannot
+          // tell the two apart from a score of 1.0. Failing open is still the
+          // right choice - the reactive controller needs the same lidar, so
+          // disqualifying the map controller would only hand the car to
+          // something equally blind - but it must not be silent.
+          RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 2000,
+            "obstacle avoidance: no scan on %s for %.1fs - reporting a clear "
+            "path because nothing can be seen, not because nothing is there.",
+            scan_topic_.c_str(), (ctx.now - scan_rx_).seconds());
+          return ScoreResult::ok(1.0, "stale scan - nothing can be seen");
         }
       }
       clusters = clusters_;

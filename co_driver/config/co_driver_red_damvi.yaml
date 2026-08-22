@@ -98,6 +98,23 @@
       switch_cooldown_ms: 1500
       fallback: "gap_loc"
 
+      # Last rung of the ladder: with EVERY drive failing a gate, drive the
+      # freshest command still arriving rather than stopping the car.
+      #
+      # A gate says "not this drive", which presumes another one exists. On a
+      # cold start none does - localization has never published, so the map
+      # controller is gated out and the reactive one has nothing to react to
+      # yet. Whichever controller is talking is the only thing there is, and
+      # stopping is not safer than driving it.
+      #
+      # It cannot revive a dead topic: freshness is still required, so silence
+      # from everything still takes the car down through timeout_stop. And a
+      # drive selected this way does NOT become the incumbent, so gates that
+      # exempt the incumbent stay shut on it - otherwise one such pick would
+      # hold them open for the rest of the run. It hands the car back the
+      # moment any drive passes its gates, and says so at WARN while it lasts.
+      last_resort: true
+
       # Below this commanded speed the selection is frozen. A stopped car is not
       # driving anywhere, so a handover achieves nothing and protects against
       # nothing - whatever holds the car is commanding a standstill either way.

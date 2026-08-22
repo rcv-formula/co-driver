@@ -108,7 +108,15 @@ struct SelectionSpec
   // After a switch, no further switching for this long (anti-chattering).
   // Unrelated to a drive's hold -- called cooldown to avoid confusion.
   double switch_cooldown{0.5};     // [s] (yaml: switch_cooldown_ms)
-  std::string fallback;   // last-resort drive when all are disqualified (must itself be valid)
+  // Preferred drive when nothing clears min_valid_score. It has to be live,
+  // not valid - by the time this is consulted, nothing is valid.
+  std::string fallback;
+  // With every drive failing a gate, drive the freshest command that is still
+  // arriving rather than stopping the car. A gate says "not this drive", which
+  // presumes another exists; when none does, the honest choice is between a
+  // gated command and no command. Freshness is still required, so silence
+  // still stops the car through the pipeline's timeout_stop.
+  bool last_resort{true};   // (yaml: selection.last_resort)
   // Below this commanded speed the selection is frozen: a stopped car has
   // nothing to gain from a handover. 0 disables. (yaml: freeze_below_speed)
   double freeze_below_speed{0.0};
