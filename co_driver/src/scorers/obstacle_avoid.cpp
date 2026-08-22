@@ -212,6 +212,9 @@ public:
       s.add_scan_every_m = jnum(p, "add_scan_every_m", 2.0);
       s.add_scan_every_mps = jnum(p, "add_scan_every_mps", 3.0);
       s.same_place_m = jnum(p, "same_place_m", 0.30);
+      s.biggest_thing_m = jnum(p, "biggest_thing_m", 1.5);
+      grazing_ = jnum(p, "surface_grazing_deg", 10.0) * M_PI / 180.0;
+      range_noise_ = jnum(p, "range_noise_m", 0.03);
       s.beam_stride = std::max(1, jint(p, "beam_stride", 3));
       scan_.configure(s);
     }
@@ -407,7 +410,8 @@ public:
         node->get_logger(),
         "obstacle avoidance '%s' <- %s DIRECTLY: %d returns within %.2fm of the "
         "line (the car's own %.2fm + %.2fm), closing to %.2fm by %.1fm out; "
-        "measured from the car itself inside %.1fm; in 1 "
+        "measured from the car itself inside %.1fm; surfaces bigger than %.1fm "
+        "are the track; in 1 "
         "of the last %d scans within %.1fm rising to %d by %.1fm (+1 per %.1fm/s) "
         "- or %d returns in one scan.%s Deskew %s. The detector's clusters are "
         "NOT used.",
@@ -415,7 +419,8 @@ public:
         half_width_, margin_, s.never_narrower_than_m,
         s.narrow_per_m > 0.0 ?
         (s.near_line_m - s.never_narrower_than_m) / s.narrow_per_m : 0.0,
-        s.car_width_until_m, s.scans_kept, s.one_scan_within_m, s.scans_kept,
+        s.car_width_until_m, s.biggest_thing_m, s.scans_kept, s.one_scan_within_m,
+        s.scans_kept,
         s.one_scan_within_m + s.add_scan_every_m * (s.scans_kept - 1),
         s.add_scan_every_mps, s.dense_one_scan,
         s.wall_longer_than_m > 0.0 ? " Longer than a metre along the line is wall." : "",
@@ -785,30 +790,91 @@ private:
     while (da > M_PI) {da -= 2.0 * M_PI;}
     while (da < -M_PI) {da += 2.0 * M_PI;}
 
-    std::vector<ScanOccupancy::Point> pts;
     const std::size_t n = msg->ranges.size();
     const int stride = std::max(1, scan_.settings().beam_stride);
-    pts.reserve(n / stride);
+
+    // Place every usable beam first, then cut the scan into surfaces IN BEAM
+    // ORDER. Both have to happen before anything is thrown away: a surface's
+    // size is only meaningful measured across the whole of it, and the part
+    // near the line is exactly the part that says nothing about how big it is.
+    struct Beam
+    {
+      double x, y, range, side;
+      bool usable;      // near enough to matter; a far one still holds its surface together
+    };
+    std::vector<Beam> beams;
+    std::vector<int> breaks;             // index in `beams` where a surface starts
+    beams.reserve(n / stride);
+    // Borges and Aldon: neighbouring returns are one surface while they are
+    // closer than a surface seen at `grazing_` would put them, plus noise.
+    const double dphi = std::abs(msg->angle_increment) * static_cast<double>(stride);
+    const double slope = (grazing_ > dphi + 1e-6) ?
+      std::sin(dphi) / std::sin(grazing_ - dphi) : 1.0;
+    bool have_prev = false;
     for (std::size_t k = 0; k < n; k += stride) {
       const double d = msg->ranges[k];
-      if (!std::isfinite(d) || d <= msg->range_min || d >= msg->range_max) {continue;}
-      if (d > span + 2.0) {continue;}
-      const double f = static_cast<double>(k) / static_cast<double>(std::max<std::size_t>(1, n - 1));
-      const double cx = x0 + f * (x1 - x0);
-      const double cy = y0 + f * (y1 - y0);
+      if (!std::isfinite(d) || d <= msg->range_min || d >= msg->range_max) {
+        have_prev = false;             // a real hole in the scan ends the surface
+        continue;
+      }
+      // A return beyond the lookahead is not worth judging, but it is still
+      // part of whatever surface it sits on, and dropping it here would cut
+      // that surface at the edge of the window - which is exactly how a long
+      // wall would come out looking small enough to be an obstacle.
+      const double f = static_cast<double>(k) /
+        static_cast<double>(std::max<std::size_t>(1, n - 1));
       const double cyaw = a0 + f * da;
       const double a = msg->angle_min + static_cast<double>(k) * msg->angle_increment;
       const double bx = d * std::cos(a), by = d * std::sin(a);
-      const double mx = cx + std::cos(cyaw) * bx - std::sin(cyaw) * by;
-      const double my = cy + std::sin(cyaw) * bx + std::cos(cyaw) * by;
-      const auto pr = path->project(mx, my, e.station, span);
+      Beam b;
+      b.x = x0 + f * (x1 - x0) + std::cos(cyaw) * bx - std::sin(cyaw) * by;
+      b.y = y0 + f * (y1 - y0) + std::sin(cyaw) * bx + std::cos(cyaw) * by;
+      b.range = d;
+      b.side = std::abs(by);
+      b.usable = d <= span + 2.0;
+      if (!have_prev) {
+        breaks.push_back(static_cast<int>(beams.size()));
+      } else {
+        const Beam & q = beams.back();
+        const double gap = std::hypot(b.x - q.x, b.y - q.y);
+        if (gap > q.range * slope + 3.0 * range_noise_) {
+          breaks.push_back(static_cast<int>(beams.size()));
+        }
+      }
+      beams.push_back(b);
+      have_prev = true;
+    }
+    // How big each surface is, measured ALONG it rather than end to end. A wall
+    // that wraps round a hairpin has its two ends close together, so a straight
+    // line between them says it is small when it is the largest thing in view.
+    std::vector<int> segment_of(beams.size(), -1);
+    std::vector<double> segment_size;
+    for (std::size_t sgi = 0; sgi < breaks.size(); ++sgi) {
+      const int from = breaks[sgi];
+      const int to = (sgi + 1 < breaks.size()) ?
+        breaks[sgi + 1] : static_cast<int>(beams.size());
+      double len = 0.0;
+      for (int k = from + 1; k < to; ++k) {
+        len += std::hypot(beams[k].x - beams[k - 1].x, beams[k].y - beams[k - 1].y);
+      }
+      for (int k = from; k < to; ++k) {segment_of[k] = static_cast<int>(sgi);}
+      segment_size.push_back(len);
+    }
+
+    std::vector<ScanOccupancy::Point> pts;
+    pts.reserve(beams.size());
+    for (std::size_t k = 0; k < beams.size(); ++k) {
+      if (!beams[k].usable) {continue;}
+      const auto pr = path->project(beams[k].x, beams[k].y, e.station, span);
       if (!pr.valid) {continue;}
       ScanOccupancy::Point p;
       p.lateral = pr.lateral;
-      p.side = std::abs(by);       // how far out to the side of the car it is
       if (p.lateral > scan_.settings().near_line_m * 2.0) {continue;}   // cheap cull
+      p.side = beams[k].side;      // how far out to the side of the car it is
       p.along = path->forwardDistance(e.station, pr.station);
-      p.range = d;
+      p.range = beams[k].range;
+      p.segment = segment_of[k];
+      p.segment_size = segment_size[segment_of[k]];
       pts.push_back(p);
     }
     scan_.push(std::move(pts));
@@ -1207,6 +1273,8 @@ private:
   // the length and the vote separates those cases without another replay.
   std::map<std::string, ScanOccupancy::Occupied> hit_;
   std::map<std::string, bool> have_hit_;
+  double grazing_{10.0 * M_PI / 180.0};   // most oblique a surface may be seen at
+  double range_noise_{0.03};              // lidar range noise, one sigma
   std::string source_{"clusters"};
   std::string scan_topic_{"/scan"};
   bool deskew_{true};

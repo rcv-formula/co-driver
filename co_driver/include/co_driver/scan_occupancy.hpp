@@ -68,7 +68,12 @@
 //   scans_kept         how many scans are kept
 //   points_per_scan    how many returns make one scan a witness
 //   dense_one_scan     this many in one scan is enough on its own
-//   same_place_m       how far apart two sightings can be and still be one thing
+//   same_place_m       how far apart two sightings in DIFFERENT scans can be
+//                      and still be the same place. Within one scan that
+//                      question is answered by the caller's segmentation, not
+//                      by a distance along the line - see below.
+//   biggest_thing_m    a surface bigger than this is not something to go
+//                      around, it is what the track is made of
 //   beam_stride        use every nth beam; fewer beams means fewer returns, so
 //                      the counts above are counted on the beams actually used
 //
@@ -87,6 +92,30 @@
 // case that matters most. The two ways past it are the close-range floor, where
 // there is no time to wait anyway, and a dense return in one scan, which says
 // the object is there even if it will have moved on by the next scan.
+//
+// WHAT COUNTS AS ONE THING, within a scan, is decided by the caller before the
+// returns get here, using the adaptive breakpoint detector of Borges and Aldon
+// (Line Extraction in 2D Range Images for Mobile Robotics, JIRS 2004) - the
+// same segmentation the ForzaETH F1TENTH stack finds opponents with. Two
+// neighbouring returns are the same surface when they are closer together than
+//
+//     D_max = r * sin(dphi) / sin(lambda - dphi) + 3*sigma
+//
+// A fixed distance cannot be right at both ends of the range, and measuring it
+// showed exactly that: at 0.15 m a far object split in two and its warning
+// distance fell from 7.3 m to 2.3 m, at 0.45 m detections fell by a fifth.
+//
+// Segmenting also gives the honest version of "that is a wall": the SIZE of the
+// surface the return belongs to, measured ALONG the whole surface rather than
+// across the part of it that happens to lie near the line. Along, not end to
+// end, because a wall that wraps round a hairpin brings its own two ends close
+// together; and over every valid return, not only the ones near enough to
+// judge, because cutting a surface at the edge of the lookahead is how a long
+// wall would come out small enough to look like an obstacle. Measured over 0821-1, the
+// places that were a real object sat on surfaces of 0.13 m median and 0.91 m at
+// the very largest, while the false ones included surfaces of 10.6 m. Anything
+// from 0.6 m to 3.0 m separates those equally well - there is nothing in
+// between - where the along-the-line span it replaces had a cliff at 2.5 m.
 //
 // DESKEW belongs to the caller: a UST-10LX sweeps 1081 beams over 25 ms, which
 // is 12 cm of travel at 5 m/s, so each beam has to be placed at the pose for
@@ -119,7 +148,8 @@ public:
     double one_scan_within_m{2.5};  // inside this, one scan is enough - the floor
     double add_scan_every_m{2.0};   // each further step of this asks for one more
     double add_scan_every_mps{3.0}; // each step of speed asks for one more
-    double same_place_m{0.30};      // two sightings this close are one thing
+    double same_place_m{0.30};      // same place from one scan to the next
+    double biggest_thing_m{1.5};    // a surface bigger than this is the track
     int beam_stride{3};             // use every nth beam
   };
 
@@ -142,9 +172,11 @@ public:
   struct Point
   {
     double along{0.0};
-    double lateral{0.0};   // from the line
-    double side{0.0};      // from the car's own centreline
+    double lateral{0.0};      // from the line
+    double side{0.0};         // from the car's own centreline
     double range{0.0};
+    int segment{-1};          // which surface it belongs to, in this scan
+    double segment_size{0.0}; // how big that whole surface is
   };
 
   // How near the line a return this far away has to be before it is believed.
@@ -208,28 +240,39 @@ public:
         {
           continue;
         }
+        // A surface this big is the track, not a thing on it.
+        if (s_.biggest_thing_m > 0.0 && p.segment_size > s_.biggest_thing_m) {continue;}
         in.push_back(p);
       }
+      // One thing per SURFACE, as segmented by the caller.
       std::sort(
         in.begin(), in.end(),
-        [](const Point & a, const Point & b) {return a.along < b.along;});
+        [](const Point & a, const Point & b) {
+          return a.segment != b.segment ? a.segment < b.segment : a.along < b.along;
+        });
       std::vector<Sighting> found;
       std::size_t i = 0;
       while (i < in.size()) {
         std::size_t j = i + 1;
-        while (j < in.size() && in[j].along - in[j - 1].along <= s_.same_place_m) {++j;}
+        while (j < in.size() && in[j].segment == in[i].segment) {++j;}
         const int count = static_cast<int>(j - i);
         if (count >= s_.points_per_scan) {
           double nearest = in[i].range;
           double side = in[i].lateral;
+          double lo = in[i].along, hi = in[i].along;
           for (std::size_t k = i; k < j; ++k) {
             nearest = std::min(nearest, in[k].range);
             side = std::min(side, in[k].lateral);
+            lo = std::min(lo, in[k].along);
+            hi = std::max(hi, in[k].along);
           }
-          found.push_back({in[i].along, in[j - 1].along, nearest, side, count});
+          found.push_back({lo, hi, nearest, side, count});
         }
         i = j;
       }
+      std::sort(
+        found.begin(), found.end(),
+        [](const Sighting & a, const Sighting & b) {return a.along < b.along;});
       per_scan.push_back(std::move(found));
     }
     if (per_scan.empty()) {return {};}
