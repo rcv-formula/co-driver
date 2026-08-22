@@ -1006,19 +1006,30 @@ private:
       // Handing the car back is invisible from the map controller's side - it
       // was publishing all along - so the moment has to be told to it. Not on
       // a last-resort pick: that is not a return, it is the only command left.
-      if (sel.switched && ramp_pub_ && !sel.last_resort &&
+      //
+      // Nothing fires here while the corner hold is refusing the handover,
+      // because then there is no handover - that gate keeps the reactive
+      // controller driving, and both of these are things to do at the moment
+      // the map controller starts.
+      //
+      // The edge is computed once and both actions hang off it, so they happen
+      // on the same tick without one being able to switch the other off:
+      // clearing ramp_on_return.topic used to take the assist with it.
+      const bool handed_back = sel.switched && !sel.last_resort &&
         sel.name == cfg_.ramp_on_return.to &&
         std::find(
           cfg_.ramp_on_return.from.begin(), cfg_.ramp_on_return.from.end(),
-          handed_from) != cfg_.ramp_on_return.from.end())
-      {
-        std_msgs::msg::Bool msg;
-        msg.data = true;
-        ramp_pub_->publish(msg);
-        RCLCPP_INFO(
-          get_logger(), "%s -> %s: asking %s to ramp the speed up rather than "
-          "step to it", handed_from.c_str(), sel.name.c_str(),
-          cfg_.ramp_on_return.topic.c_str());
+          handed_from) != cfg_.ramp_on_return.from.end();
+      if (handed_back) {
+        if (ramp_pub_) {
+          std_msgs::msg::Bool msg;
+          msg.data = true;
+          ramp_pub_->publish(msg);
+          RCLCPP_INFO(
+            get_logger(), "%s -> %s: asking %s to ramp the speed up rather than "
+            "step to it", handed_from.c_str(), sel.name.c_str(),
+            cfg_.ramp_on_return.topic.c_str());
+        }
         startReturnAssist(sel.name);
       }
       // Two candidates may read the same topic - the fallback appears once per
