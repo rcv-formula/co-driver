@@ -37,23 +37,25 @@
         //   "scan"      the lidar directly - accumulate scans, and take a place
         //               on the line as blocked when enough of them agree
         //
-        // Measured offline over the 0821-1 run, against the four objects added
-        // to its second half, per decision:
+        // Measured over the 0821-1 run, per decision, against gap_obs being
+        // the drive that was selected. Truth is one of the four objects added
+        // to the second half sitting on the line within 4 m ahead:
         //
-        //                              false alarms   found   hit within 1 m
-        //     clusters                      6.9%        -        91% (3 m)
-        //     scan, 3 of 5 scans agree      0.1%      23.6%     99.5%
-        //
-        // Those are per-decision figures. In the node, over the same run, the
-        // clusters still reacted to more of the passes the car actually made
-        // near an obstacle (63% of 63) than the scan source did (52%), so this
-        // stays on clusters until that gap closes.
+        //                     TP    FP    FN     TN   정밀도  재현율     F1
+        //     clusters      1359   701  1680  17658   66.0%  44.7%  53.3%
+        //     scan          1450   162  1589  18451   90.0%  47.7%  62.4%
         //
         // The detector layer is where the information was being lost: 70% of
         // its clusters are not labelled wall even when they are wall, an object
         // leaning on a barrier is merged into it and disappears, and the
         // reported centre is unreliable. None of that reaches the scan source.
-        "source": "clusters",
+        // Its largest single object, 1.80 x 0.50 m against a barrier, went from
+        // being reacted to on 7 of 15 passes to 14 of 15 once the detector was
+        // out of the way.
+        //
+        // Set this back to "clusters" to fall back to the detector; nothing
+        // else has to change with it.
+        "source": "scan",
 
         // ── "scan" 을 쓸 때 ─────────────────────────────────────────
         //

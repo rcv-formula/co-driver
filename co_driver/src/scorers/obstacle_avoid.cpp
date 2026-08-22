@@ -179,7 +179,7 @@ public:
     // Where "what is on the line" comes from.
     //   "clusters"  the detector's ObstacleClusterArray
     //   "scan"      the lidar directly, accumulated and voted (scan_occupancy.hpp)
-    source_ = jstr(p, "source", "clusters");
+    source_ = jstr(p, "source", "scan");
     if (source_ != "clusters" && source_ != "scan") {
       RCLCPP_ERROR(
         node->get_logger(), "obstacle avoidance '%s': source '%s' is neither "
