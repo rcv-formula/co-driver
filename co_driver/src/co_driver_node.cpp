@@ -88,9 +88,9 @@ struct ReturnAssist
 {
   bool enabled{false};
   std::string node{"/pure_pursuit"};
-  std::string parameter{"K_d"};
+  // name -> what to multiply it by, applied and restored together.
+  std::vector<std::pair<std::string, double>> parameters;
   double steering_above{15.0 * M_PI / 180.0};
-  double multiply_by{2.0};
   double hold{2.0};
   double service_timeout{0.5};
 };
@@ -108,31 +108,60 @@ inline void runReturnAssist(
     auto client = std::make_shared<rclcpp::SyncParametersClient>(helper, a.node);
     if (!client->wait_for_service(timeout)) {
       RCLCPP_WARN(
-        log, "%s has no parameter service - leaving %s alone",
-        a.node.c_str(), a.parameter.c_str());
+        log, "%s has no parameter service - leaving its tuning alone",
+        a.node.c_str());
       busy->store(false);
       return;
     }
-    const auto got = client->get_parameters({a.parameter}, timeout);
-    if (got.empty() || got[0].get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+    std::vector<std::string> names;
+    for (const auto & kv : a.parameters) {names.push_back(kv.first);}
+    const auto got = client->get_parameters(names, timeout);
+    // All or nothing, in both directions. Reading one and failing on the next
+    // would leave a gain raised whose original nobody wrote down.
+    if (got.size() != names.size()) {
       RCLCPP_WARN(
-        log, "cannot read %s from %s as a double - not touching it, because "
-        "there would be no way back", a.parameter.c_str(), a.node.c_str());
+        log, "%s returned %zu of %zu parameters - changing none of them",
+        a.node.c_str(), got.size(), names.size());
       busy->store(false);
       return;
     }
-    const double base = got[0].as_double();
-    const double raised = base * a.multiply_by;
-    client->set_parameters({rclcpp::Parameter(a.parameter, raised)}, timeout);
+    std::vector<rclcpp::Parameter> raised, original;
+    std::string summary;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      if (got[i].get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+        RCLCPP_WARN(
+          log, "%s %s is not a double - changing none of them, because there "
+          "would be no way back", a.node.c_str(), names[i].c_str());
+        busy->store(false);
+        return;
+      }
+      const double base = got[i].as_double();
+      const double up = base * a.parameters[i].second;
+      original.emplace_back(names[i], base);
+      raised.emplace_back(names[i], up);
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "%s %.4f->%.4f", names[i].c_str(), base, up);
+      summary += (summary.empty() ? "" : ", ") + std::string(buf);
+    }
+    const auto set = client->set_parameters_atomically(raised, timeout);
+    if (!set.successful) {
+      RCLCPP_WARN(
+        log, "%s refused the change (%s) - nothing was altered",
+        a.node.c_str(), set.reason.c_str());
+      busy->store(false);
+      return;
+    }
     RCLCPP_INFO(
-      log, "handed back at %.0f deg of steering: %s %s %.4f -> %.4f for %.1fs",
-      steer_deg, a.node.c_str(), a.parameter.c_str(), base, raised, a.hold);
+      log, "handed back at %.0f deg of steering: %s %s for %.1fs",
+      steer_deg, a.node.c_str(), summary.c_str(), a.hold);
 
     std::this_thread::sleep_for(
       std::chrono::milliseconds(static_cast<int>(a.hold * 1e3)));
 
-    client->set_parameters({rclcpp::Parameter(a.parameter, base)}, timeout);
-    RCLCPP_INFO(log, "%s %s back to %.4f", a.node.c_str(), a.parameter.c_str(), base);
+    const auto back = client->set_parameters_atomically(original, timeout);
+    RCLCPP_INFO(
+      log, "%s back to what it was%s", a.node.c_str(),
+      back.successful ? "" : " - REFUSED, the raised values are still in place");
   } catch (const std::exception & e) {
     RCLCPP_WARN(log, "return assist gave up: %s", e.what());
   }
@@ -1290,27 +1319,46 @@ private:
     }
     assist_.enabled = jbool(j, "enabled", true);
     assist_.node = jstr(j, "node", assist_.node);
-    assist_.parameter = jstr(j, "parameter", assist_.parameter);
     assist_.steering_above = jnum(j, "steering_above_deg", 15.0) * M_PI / 180.0;
-    assist_.multiply_by = jnum(j, "multiply_by", assist_.multiply_by);
     assist_.hold = jms(j, "hold_ms", assist_.hold * 1e3);
     assist_.service_timeout = jms(j, "service_timeout_ms", assist_.service_timeout * 1e3);
-    if (assist_.multiply_by <= 0.0 || assist_.hold <= 0.0) {
+    assist_.parameters.clear();
+    const auto it = j.find("parameters");
+    if (it != j.end() && it->is_object()) {
+      for (auto p = it->begin(); p != it->end(); ++p) {
+        if (!p.value().is_number()) {continue;}
+        assist_.parameters.emplace_back(p.key(), p.value().get<double>());
+      }
+    } else if (j.contains("parameter")) {          // the one-parameter shorthand
+      assist_.parameters.emplace_back(
+        jstr(j, "parameter", "K_d"), jnum(j, "multiply_by", 2.0));
+    }
+    bool sane = assist_.hold > 0.0 && !assist_.parameters.empty();
+    for (const auto & kv : assist_.parameters) {
+      if (kv.second <= 0.0) {sane = false;}
+    }
+    if (!sane) {
       RCLCPP_WARN(
-        get_logger(), "return assist: multiply_by %.2f and hold %.2fs must both "
-        "be above 0 - disabled", assist_.multiply_by, assist_.hold);
+        get_logger(), "return assist: needs at least one parameter, every "
+        "multiplier above 0 and hold above 0 - disabled");
       assist_.enabled = false;
     }
     if (!assist_.enabled) {
       RCLCPP_INFO(get_logger(), "return assist: off");
       return;
     }
+    std::string what;
+    for (const auto & kv : assist_.parameters) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%s x%.2f", kv.first.c_str(), kv.second);
+      what += (what.empty() ? "" : ", ") + std::string(buf);
+    }
     RCLCPP_INFO(
       get_logger(),
-      "return assist: handing back above %.0f degrees of steering multiplies "
-      "%s %s by %.2f for %.1fs",
+      "return assist: handing back above %.0f degrees of steering sets %s %s "
+      "for %.1fs",
       assist_.steering_above * 180.0 / M_PI, assist_.node.c_str(),
-      assist_.parameter.c_str(), assist_.multiply_by, assist_.hold);
+      what.c_str(), assist_.hold);
   }
 
   // Only when the drive taking the car back is already hard over. One at a
