@@ -189,22 +189,32 @@ public:
     }
     scan_topic_ = jstr(p, "scan_topic", "/scan");
     deskew_ = jbool(p, "deskew", true);
-    {
-      ScanOccupancy::Settings s;
-      s.corridor_m = jnum(p, "scan_corridor_m", 0.28);
-      s.min_width_m = jnum(p, "min_width_m", 0.08);
-      s.confirm_window_s = jms(p, "confirm_window_ms", 150.0);
-      s.confirm_fraction = std::clamp(jnum(p, "confirm_fraction", 0.6), 0.0, 1.0);
-      s.same_place_m = jnum(p, "same_place_m", 0.30);
-      s.instant_range_m = jnum(p, "instant_range_m", 2.0);
-      s.beam_stride = std::max(1, jint(p, "beam_stride", 3));
-      scan_.configure(s);
-    }
-
     topic_ = jstr(p, "topic", "/obstacle_clusters");
     wheelbase_ = jnum(p, "wheelbase", 0.324);
     half_width_ = jnum(p, "vehicle_half_width", 0.18);
     margin_ = jnum(p, "lateral_margin_m", 0.10);
+    {
+      ScanOccupancy::Settings s;
+      // The band around the line is the width the CAR needs, not a number of
+      // its own: the same half_width + margin the cluster path measures against.
+      // Something inside it has to be gone around; something outside it is
+      // passed. Tuning it separately would have meant two different answers to
+      // "is this in my way" depending only on where the evidence came from.
+      s.near_line_m = half_width_ + margin_;
+      s.car_width_until_m = jnum(p, "car_width_until_m", 1.5);
+      s.scans_kept = jint(p, "scans_kept", 5);
+      s.points_per_scan = jint(p, "points_per_scan", 2);
+      s.dense_one_scan = jint(p, "dense_one_scan", 8);
+      s.narrow_per_m = jnum(p, "narrow_per_m", 0.0);
+      s.never_narrower_than_m = jnum(p, "never_narrower_than_m", 0.05);
+      s.wall_longer_than_m = jnum(p, "wall_longer_than_m", 1.0);
+      s.one_scan_within_m = jnum(p, "one_scan_within_m", 2.5);
+      s.add_scan_every_m = jnum(p, "add_scan_every_m", 2.0);
+      s.add_scan_every_mps = jnum(p, "add_scan_every_mps", 3.0);
+      s.same_place_m = jnum(p, "same_place_m", 0.30);
+      s.beam_stride = std::max(1, jint(p, "beam_stride", 3));
+      scan_.configure(s);
+    }
     trigger_time_ = jnum(p, "trigger_time", 1.5);
     full_urgency_time_ = jnum(p, "full_urgency_time", 0.8);
     min_full_urgency_ = jnum(p, "min_full_urgency_m", 0.3);
@@ -395,12 +405,20 @@ public:
       const auto & s = scan_.settings();
       RCLCPP_INFO(
         node->get_logger(),
-        "obstacle avoidance '%s' <- %s DIRECTLY: something at least %.2fm wide, "
-        "within %.2fm of the line, seen in %.0f%% of the scans over %.0fms - or "
-        "anything at all within %.1fm. Deskew %s. The detector's clusters are "
+        "obstacle avoidance '%s' <- %s DIRECTLY: %d returns within %.2fm of the "
+        "line (the car's own %.2fm + %.2fm), closing to %.2fm by %.1fm out; "
+        "measured from the car itself inside %.1fm; in 1 "
+        "of the last %d scans within %.1fm rising to %d by %.1fm (+1 per %.1fm/s) "
+        "- or %d returns in one scan.%s Deskew %s. The detector's clusters are "
         "NOT used.",
-        name.c_str(), scan_topic_.c_str(), s.min_width_m, s.corridor_m,
-        100.0 * s.confirm_fraction, s.confirm_window_s * 1e3, s.instant_range_m,
+        name.c_str(), scan_topic_.c_str(), s.points_per_scan, s.near_line_m,
+        half_width_, margin_, s.never_narrower_than_m,
+        s.narrow_per_m > 0.0 ?
+        (s.near_line_m - s.never_narrower_than_m) / s.narrow_per_m : 0.0,
+        s.car_width_until_m, s.scans_kept, s.one_scan_within_m, s.scans_kept,
+        s.one_scan_within_m + s.add_scan_every_m * (s.scans_kept - 1),
+        s.add_scan_every_mps, s.dense_one_scan,
+        s.wall_longer_than_m > 0.0 ? " Longer than a metre along the line is wall." : "",
         deskew_ ? "on" : "off");
     } else {
       RCLCPP_INFO(
@@ -514,8 +532,9 @@ public:
           drive.name, ctx, 0.0, 0.0, 0,
           "no plan - the scan source has nothing to measure against");
       }
-      const auto occ = scan_.occupied();
+      const auto occ = scan_.occupied(v_now);
       considered = static_cast<int>(occ.size());
+      have_hit_[drive.name] = false;
       for (const auto & o : occ) {
         if (o.along > trigger) {continue;}
         any_ahead = true;
@@ -523,10 +542,15 @@ public:
         const double span = std::max(1e-3, trigger - commit);
         const double urgency = std::clamp(
           commit_demand_ * (trigger - o.along) / span, 0.0, 1.0);
+        // Nothing further is asked of it. Being reported at all already means
+        // the returns were within near_line_m of the line and the scans agreed,
+        // so the only thing left to decide is how soon it is reached.
         if (urgency > demand) {
           demand = urgency;
           block_station_[drive.name] = ref.ego_station + o.along;
           have_block_station_[drive.name] = true;
+          hit_[drive.name] = o;
+          have_hit_[drive.name] = true;
         }
       }
       last_on_plan_[drive.name] = true;
@@ -781,15 +805,13 @@ private:
       if (!pr.valid) {continue;}
       ScanOccupancy::Point p;
       p.lateral = pr.lateral;
-      if (p.lateral > scan_.settings().corridor_m * 2.0) {continue;}   // cheap cull
+      p.side = std::abs(by);       // how far out to the side of the car it is
+      if (p.lateral > scan_.settings().near_line_m * 2.0) {continue;}   // cheap cull
       p.along = path->forwardDistance(e.station, pr.station);
       p.range = d;
       pts.push_back(p);
     }
-    scan_.push(
-      rclcpp::Time(msg->header.stamp).seconds(),
-      std::abs(msg->angle_increment) * static_cast<double>(stride),
-      std::move(pts));
+    scan_.push(std::move(pts));
     scan_rx_ = node_->now();
     has_scan_ = true;
   }
@@ -990,8 +1012,15 @@ private:
   {
     State & st = state_[drive];
     // Rolling window of what each recent cycle saw.
+    // The scan source has already required a range- and speed-dependent number
+    // of scans to agree before reporting anything - see scan_occupancy.hpp.
+    // Running this second window on top of it asks the same question twice and
+    // only delays the answer, so for that source the test is the current cycle.
     st.seen.push_back(
       {ctx.now, demand > 0.0, block_station_[drive], have_block_station_[drive]});
+    if (source_ == "scan") {
+      while (st.seen.size() > 1) {st.seen.pop_front();}
+    }
     while (!st.seen.empty() && (ctx.now - st.seen.front().when).seconds() > window_) {
       st.seen.pop_front();
     }
@@ -1072,7 +1101,7 @@ private:
       have_block_station_[drive] = false;   // that encounter is over
     }
 
-    char buf[140];
+    char buf[180];
     if (st.blocked) {
       if (clear_now) {
         std::snprintf(
@@ -1090,10 +1119,20 @@ private:
           100.0 * st.presence, window_);
         return ScoreResult::ok(std::clamp(1.0 - demand, 0.0, 1.0), buf);
       }
-      std::snprintf(
-        buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f%s", dist,
-        last_on_plan_[drive] ? "on the plan" : "on the commanded arc", demand,
-        st.committed ? ", committed" : "");
+      if (source_ == "scan" && have_hit_[drive]) {
+        const auto & h = hit_[drive];
+        std::snprintf(
+          buf, sizeof(buf),
+          "%.2fm along, %.2fm away, %.2fm off, %.2fm long, %d/%d scans, "
+          "demand %.2f%s",
+          h.along, h.range, h.lateral, h.extent, h.scans_agreed, h.scans_needed,
+          demand, st.committed ? ", committed" : "");
+      } else {
+        std::snprintf(
+          buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f%s", dist,
+          last_on_plan_[drive] ? "on the plan" : "on the commanded arc", demand,
+          st.committed ? ", committed" : "");
+      }
       // While committed the drive stays disqualified even as the demand eases,
       // so one obstacle costs one handover rather than one per threshold
       // crossing.
@@ -1101,9 +1140,19 @@ private:
       return ScoreResult::ok(st.committed ? std::min(s, 0.0) : s, buf);
     }
     if (!clear_now) {
-      std::snprintf(
-        buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f, confirming %.1f/%.1fs",
-        dist, last_on_plan_[drive] ? "on the plan" : "on the arc", demand, dwell, block_);
+      if (source_ == "scan" && have_hit_[drive]) {
+        const auto & h = hit_[drive];
+        std::snprintf(
+          buf, sizeof(buf),
+          "%.2fm along, %.2fm away, %.2fm off, %.2fm long, %d/%d scans, "
+          "demand %.2f, confirming %.1f/%.1fs",
+          h.along, h.range, h.lateral, h.extent, h.scans_agreed, h.scans_needed,
+          demand, dwell, block_);
+      } else {
+        std::snprintf(
+          buf, sizeof(buf), "obstacle at %.2fm %s, demand %.2f, confirming %.1f/%.1fs",
+          dist, last_on_plan_[drive] ? "on the plan" : "on the arc", demand, dwell, block_);
+      }
       return ScoreResult::ok(1.0, buf);          // not confirmed yet
     }
     if (!reason.empty()) {return ScoreResult::ok(1.0, reason);}
@@ -1151,6 +1200,13 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   ScanOccupancy scan_;
+  // What the scan source is actually looking at, per drive. Diagnostic only -
+  // "obstacle at 0.24m" says how far along the line it is and nothing about
+  // what it is, and on a hairpin the wall beside the car projects onto the leg
+  // ahead at exactly that sort of distance. Reporting the range, the offset,
+  // the length and the vote separates those cases without another replay.
+  std::map<std::string, ScanOccupancy::Occupied> hit_;
+  std::map<std::string, bool> have_hit_;
   std::string source_{"clusters"};
   std::string scan_topic_{"/scan"};
   bool deskew_{true};
