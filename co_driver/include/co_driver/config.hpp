@@ -153,9 +153,26 @@ struct OutputSpec
   bool publish_status{true};
 };
 
+// One-shot signal sent to the map controller when the car is handed back to
+// it, so it can pick the speed up from where the car actually is rather than
+// stepping to whatever the plan asks for here.
+//
+// The controller already knows how to do this - it is the launch-start latch,
+// which ramps from the measured wheel speed at a set acceleration and releases
+// itself once it has caught up. What it cannot know is WHEN it has just been
+// given the car back, because from its side nothing happened: it was
+// publishing all along.
+struct RampOnReturnSpec
+{
+  std::string topic;                  // empty disables it entirely
+  std::vector<std::string> from;      // handing over FROM one of these
+  std::string to;                     // ...TO this drive
+};
+
 struct Config
 {
   OutputSpec output;
+  RampOnReturnSpec ramp_on_return;
   double evaluation_rate_hz{50.0};
   ScoringSpec scoring;
   SelectionSpec selection;

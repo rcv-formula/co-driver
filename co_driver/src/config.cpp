@@ -211,6 +211,11 @@ bool loadYaml(rclcpp::Node * n, Config * c, std::string * error)
   sel.fallback = pstr(n, "selection.fallback", sel.fallback);
   sel.last_resort = pbool(n, "selection.last_resort", sel.last_resort);
 
+  auto & ramp = c->ramp_on_return;
+  ramp.topic = pstr(n, "ramp_on_return.topic", ramp.topic);
+  ramp.to = pstr(n, "ramp_on_return.to", ramp.to);
+  ramp.from = pstrs(n, "ramp_on_return.from");
+
   c->pipeline.clear();
   for (const auto & name : pstrs(n, "postprocess.pipeline")) {
     const std::string prefix = "postprocess." + name;

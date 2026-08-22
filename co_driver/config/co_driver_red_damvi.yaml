@@ -115,6 +115,30 @@
       # moment any drive passes its gates, and says so at WARN while it lasts.
       last_resort: true
 
+    # =====================================================================
+    # Ramp on return - tell the map controller when it has just been given
+    # the car back, so it picks the speed up from where the car actually is.
+    #
+    # Coming back from the localization fallback, the plan can ask for a very
+    # different speed than the one the car is carrying, and the controller has
+    # no way to know a handover just happened: from its side nothing changed,
+    # it was publishing all along. This publishes true on its launch-start
+    # topic at that moment, and the controller ramps from the measured wheel
+    # speed at its own acceleration instead of stepping to the plan.
+    #
+    # It decides for itself whether the ramp is needed - if the speed is
+    # already within launch_start_engage_diff of the target it skips and says
+    # so - which is why this can fire unconditionally on the edge.
+    #
+    # Only from gap_loc. gap_obs is a detour around an object with the plan's
+    # speed still valid either side of it, so there is nothing to pick up from.
+    # An empty topic disables it.
+    # =====================================================================
+    ramp_on_return:
+      topic: "/launch_start_reset"
+      from: ["gap_loc"]
+      to: "pp_main"
+
       # Below this commanded speed the selection is frozen. A stopped car is not
       # driving anywhere, so a handover achieves nothing and protects against
       # nothing - whatever holds the car is commanding a standstill either way.

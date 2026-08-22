@@ -24,6 +24,7 @@
 #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -634,6 +635,18 @@ public:
         i, d.name.c_str(), d.topic.c_str(), d.hold * 1e3);
     }
 
+    if (!cfg_.ramp_on_return.topic.empty()) {
+      ramp_pub_ = create_publisher<std_msgs::msg::Bool>(
+        cfg_.ramp_on_return.topic, rclcpp::QoS(1));
+      std::string from;
+      for (const auto & f : cfg_.ramp_on_return.from) {
+        from += (from.empty() ? "" : "/") + f;
+      }
+      RCLCPP_INFO(
+        get_logger(), "ramp on return: %s -> %s publishes true on %s",
+        from.empty() ? "(nothing)" : from.c_str(), cfg_.ramp_on_return.to.c_str(),
+        cfg_.ramp_on_return.topic.c_str());
+    }
     drive_pub_ = create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(
       cfg_.output.drive_topic, rclcpp::QoS(10));
     if (cfg_.output.publish_status) {
@@ -907,7 +920,25 @@ private:
 
       sel = selector_.select(drives_, t);
       have_command_ = sel.has_selection;
+      const std::string handed_from = selected_;
       selected_ = sel.name;
+      // Handing the car back is invisible from the map controller's side - it
+      // was publishing all along - so the moment has to be told to it. Not on
+      // a last-resort pick: that is not a return, it is the only command left.
+      if (sel.switched && ramp_pub_ && !sel.last_resort &&
+        sel.name == cfg_.ramp_on_return.to &&
+        std::find(
+          cfg_.ramp_on_return.from.begin(), cfg_.ramp_on_return.from.end(),
+          handed_from) != cfg_.ramp_on_return.from.end())
+      {
+        std_msgs::msg::Bool msg;
+        msg.data = true;
+        ramp_pub_->publish(msg);
+        RCLCPP_INFO(
+          get_logger(), "%s -> %s: asking %s to ramp the speed up rather than "
+          "step to it", handed_from.c_str(), sel.name.c_str(),
+          cfg_.ramp_on_return.topic.c_str());
+      }
       // Two candidates may read the same topic - the fallback appears once per
       // reason it can be chosen. Swapping between those is a bookkeeping
       // change, not a change of command, so blending across it would drag a
@@ -1148,6 +1179,7 @@ private:
   ackermann_msgs::msg::AckermannDrive output_;
   bool has_output_{false};
   bool have_command_{false};
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ramp_pub_;
   bool switch_pending_{false};
   // Topic behind the last selection, so the blend arms on a real source change.
   std::string last_output_topic_;
