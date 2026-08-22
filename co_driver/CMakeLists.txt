@@ -46,6 +46,7 @@ set(scorer_sources
   src/scorers/confidence_trip.cpp      # early handover on sustained partial degradation
   src/scorers/path_clearance.cpp       # command vs scan - catches a confidently wrong pose
   src/scorers/path_deviation.cpp       # the car is no longer near the line it follows
+  src/scorers/corner_hold.cpp          # do not hand back mid-corner
   src/scorers/example_async.cpp        # async skeleton for heavy computations
 )
 

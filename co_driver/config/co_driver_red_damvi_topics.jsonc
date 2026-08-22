@@ -182,6 +182,28 @@
     },
 
     {
+      // Corner hold - the return waits until the car is out of a slow corner.
+      //
+      // Handing the car back is a change of who is steering, and mid-corner is
+      // the worst moment for one: the two controllers disagree most where the
+      // line curves, the grip is already spoken for, and the handover blend
+      // spends 300 ms somewhere between the two commands.
+      //
+      // The plan says where it is slow (its own speed, in the z of each pose),
+      // and the map controller's command says whether it is mid-turn. Both
+      // have to be true - a slow section it would drive straight through is
+      // not a corner it can get wrong, and a big steering angle where the plan
+      // is fast is just a correction on a straight.
+      "name": "corner",
+      "type": "corner_hold",
+      "params": {
+        // Thresholds and timings live in obstacle_scoring.jsonc.
+        "path_topic": "/global_path",
+        "base_frame": "base_link"
+      }
+    },
+
+    {
       // Return latch - keeps pp_main out until localization has been fully
       // healthy for a sustained stretch (conditions in localization_scoring.jsonc).
       "name": "recovery",
@@ -251,6 +273,10 @@
         // Same shape as the other gates: no weight, so the calibrated
         // localization thresholds are untouched, and a veto only on the drive
         // that needs the line to mean anything.
+        // Steppable: it says the moment is wrong, not that the command is.
+        // With nothing else left to drive, a corner is not a reason to stop.
+        "corner": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5,
+                   "last_resort_ok": true},
         // NOT steppable, and neither is obstacles below. These two do not say
         // "another drive would be better", they say this command drives at
         // something - into an object, or across whatever the car ended up
