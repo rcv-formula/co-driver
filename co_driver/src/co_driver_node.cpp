@@ -1166,7 +1166,19 @@ private:
         // of these as the winner, so sending the ramp flag after a speed hold
         // would cancel the hold - which is why turning the hold on turns the
         // ramp flag off rather than leaving both to be configured.
-        if (speed_hold_pub_) {
+        // Not while one we asked for is still running. Measured on the 0822
+        // recording: the arbitration churned three hand-backs inside 1.4 s and
+        // each one restarted the hold, so the car sat pinned at the hold speed
+        // for 44% of the eight seconds that followed. The gain assist already
+        // refuses to stack for the same reason; this had nothing.
+        const bool holding = speed_hold_valid_ && t < speed_hold_until_;
+        if (speed_hold_pub_ && holding) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "%s -> %s again %.2fs into a %.1fs hold - not restarting it",
+            handed_from.c_str(), sel.name.c_str(),
+            assist_.hold - (speed_hold_until_ - t).seconds(), assist_.hold);
+        } else if (speed_hold_pub_) {
           std_msgs::msg::Float64MultiArray msg;
           msg.data = {assist_.speed_hold.speed, assist_.hold};
           speed_hold_pub_->publish(msg);

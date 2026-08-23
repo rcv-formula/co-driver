@@ -130,9 +130,15 @@
     # already within launch_start_engage_diff of the target it skips and says
     # so - which is why this can fire unconditionally on the edge.
     #
-    # Only from gap_loc. gap_obs is a detour around an object with the plan's
-    # speed still valid either side of it, so there is nothing to pick up from.
-    # An empty topic disables it.
+    # `from` is what counts as a return, and it is the edge ALL THREE of the
+    # hand-back actions hang off - the speed hold, this flag, and the gain
+    # assist in return_assist.jsonc. Adding a name here adds it to all of them.
+    #
+    # Both candidates. They are the same controller under two names, and the
+    # car comes off it in the same state either way; which reason took it away
+    # does not change what it needs on the way back.
+    #
+    # An empty topic disables the flag only - the other two are unaffected.
     # =====================================================================
     # NOTE: return_assist.jsonc can turn on a speed hold, which does the ramp
     # itself once it releases. While that is on, this flag is NOT sent - the
@@ -141,7 +147,7 @@
     # at startup which of the two is in use.
     ramp_on_return:
       topic: "/launch_start_reset"
-      from: ["gap_loc"]
+      from: ["gap_loc", "gap_obs"]
       to: "pp_main"
 
       # Below this commanded speed the selection is frozen. A stopped car is not
