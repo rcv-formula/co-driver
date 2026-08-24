@@ -89,11 +89,11 @@
 #include <vector>
 
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <vesc_msgs/msg/vesc_state_stamped.hpp>
 
 #include "co_driver/arc_geometry.hpp"
-#include <nav_msgs/msg/odometry.hpp>
-
 #include "co_driver/scorer.hpp"
+#include "co_driver/vesc_speed.hpp"
 
 namespace co_driver
 {
@@ -114,21 +114,37 @@ public:
     min_clearance_ = jnum(p, "min_clearance_m", 0.8);
     // Speed for the geometry: MEASURED, not commanded.
     //
-    // Every distance here is derived from speed, so the source matters. On the
-    // 0814 recording, differentiating the map-frame pose gives the truth, and:
-    //     pose / odom        = 1.00   (p10 0.99, p90 1.04)  <- odom is correct
-    //     pose / odom_wheel  = 2.66                          <- wheel is slow
-    //     pose / drive_main  = 2.24, spread p10 1.15 to p90 3.50
-    // The command is not a scaled version of the truth, it is a request the
-    // car tracks loosely, so no constant factor can repair it - at p99 the car
-    // was doing 5.73 m/s while commanding 2.06. Believing the command made the
-    // lookahead short by that much, which is the "it switches far too late"
-    // behaviour. Note /odom_wheel is the 2.6x-slow one; /odom is already
-    // corrected and is what this uses.
-    //
-    // The command remains the fallback for when odometry is silent, because a
-    // wrong lookahead beats none, and the note says which one is in use.
-    speed_topic_ = jstr(p, "speed_topic", "/odom");
+    // Keep this localization-independent just like the scan geometry itself.
+    // The conversion and the separate 2.6 correction match obstacle_avoid and
+    // PPcontroller; the command is used only while VESC telemetry is stale.
+    vesc_state_topic_ = jstr(p, "vesc_state_topic", "/sensors/core");
+    speed_calibration_.speed_to_erpm_gain =
+      jnum(p, "speed_to_erpm_gain", 3172.47);
+    speed_calibration_.speed_to_erpm_offset =
+      jnum(p, "speed_to_erpm_offset", 0.0);
+    speed_calibration_.wheel_speed_deadband =
+      jnum(p, "wheel_speed_deadband", 0.05);
+    speed_calibration_.wheel_speed_scale =
+      jnum(p, "wheel_speed_scale", 2.6);
+    if (
+      !std::isfinite(speed_calibration_.speed_to_erpm_gain) ||
+      std::abs(speed_calibration_.speed_to_erpm_gain) < 1.0e-6 ||
+      !std::isfinite(speed_calibration_.speed_to_erpm_offset) ||
+      !std::isfinite(speed_calibration_.wheel_speed_deadband) ||
+      speed_calibration_.wheel_speed_deadband < 0.0 ||
+      !std::isfinite(speed_calibration_.wheel_speed_scale) ||
+      speed_calibration_.wheel_speed_scale <= 0.0)
+    {
+      RCLCPP_ERROR(
+        node->get_logger(),
+        "path clearance '%s': invalid VESC speed calibration "
+        "(gain %.6f, offset %.6f, deadband %.3f, scale %.3f)",
+        name.c_str(), speed_calibration_.speed_to_erpm_gain,
+        speed_calibration_.speed_to_erpm_offset,
+        speed_calibration_.wheel_speed_deadband,
+        speed_calibration_.wheel_speed_scale);
+      return false;
+    }
     speed_timeout_ = jms(p, "speed_timeout_ms", 300.0);
     min_speed_ = jnum(p, "min_speed", 0.2);
     max_sweep_ = jnum(p, "max_sweep_deg", 90.0) * M_PI / 180.0;
@@ -141,20 +157,28 @@ public:
     clear_ = jms(p, "clear_ms", 5000.0);
     timeout_ = jms(p, "timeout_ms", 500.0);
 
-    // Lidar drivers and rosbag replays publish BEST_EFFORT; a RELIABLE
-    // subscription here would silently receive nothing.
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = group();
-    if (!speed_topic_.empty()) {
-      speed_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
-        speed_topic_, rclcpp::SensorDataQoS(),
-        [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+    if (!vesc_state_topic_.empty()) {
+      speed_sub_ = node->create_subscription<vesc_msgs::msg::VescStateStamped>(
+        vesc_state_topic_, rclcpp::QoS(10),
+        [this](const vesc_msgs::msg::VescStateStamped::ConstSharedPtr msg) {
+          double speed = 0.0;
+          if (!vescErpmToSpeed(msg->state.speed, speed_calibration_, &speed)) {
+            RCLCPP_WARN_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 1000,
+              "path clearance: invalid VESC speed sample on %s",
+              vesc_state_topic_.c_str());
+            return;
+          }
           std::lock_guard<std::mutex> lock(mtx_);
-          measured_speed_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+          measured_speed_ = speed;
           speed_stamp_ = node_->now();
           has_speed_ = true;
         }, opts);
     }
+    // Lidar drivers and rosbag replays publish BEST_EFFORT; a RELIABLE
+    // subscription here would silently receive nothing.
     sub_ = node->create_subscription<sensor_msgs::msg::LaserScan>(
       topic_, rclcpp::SensorDataQoS(),
       [this](const sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
@@ -169,6 +193,16 @@ public:
       "sweep capped at %.0fdeg)",
       name.c_str(), topic_.c_str(), min_clearance_, block_ * 1e3,
       max_sweep_ * 180.0 / M_PI);
+    if (!vesc_state_topic_.empty()) {
+      RCLCPP_INFO(
+        node->get_logger(),
+        "path clearance speed <- %s: (ERPM - %.2f) / %.2f, "
+        "deadband %.2fm/s, x%.2f; command fallback after %.0fms",
+        vesc_state_topic_.c_str(), speed_calibration_.speed_to_erpm_offset,
+        speed_calibration_.speed_to_erpm_gain,
+        speed_calibration_.wheel_speed_deadband,
+        speed_calibration_.wheel_speed_scale, speed_timeout_ * 1e3);
+    }
     return true;
   }
 
@@ -184,9 +218,7 @@ public:
       scan = scan_;
     }
 
-    bool speed_from_odom = false;
-    const double v = geometrySpeed(drive.cmd.drive.speed, ctx, &speed_from_odom);
-    (void)speed_from_odom;
+    const double v = geometrySpeed(drive.cmd.drive.speed, ctx);
     const double delta = drive.cmd.drive.steering_angle;
     if (!std::isfinite(v) || !std::isfinite(delta)) {
       return ScoreResult::unavailable("command is NaN/inf");
@@ -213,18 +245,22 @@ public:
 private:
   // Arc length at which the commanded path first meets a scan return that is
   // within half a vehicle width of it.
-  // Measured speed if it is fresh, otherwise the command. `from_odom` tells the
-  // caller which, so the note can say so rather than quietly using the worse one.
-  double geometrySpeed(double commanded, const Context & ctx, bool * from_odom) const
+  // Corrected VESC speed if it is fresh, otherwise the candidate command.
+  double geometrySpeed(double commanded, const Context & ctx)
   {
-    if (has_speed_ &&
-      (speed_timeout_ <= 0.0 || (ctx.now - speed_stamp_).seconds() <= speed_timeout_))
-    {
-      *from_odom = true;
-      return std::abs(measured_speed_);
+    std::lock_guard<std::mutex> lock(mtx_);
+    const double age = has_speed_ ? (ctx.now - speed_stamp_).seconds() : 0.0;
+    const bool fresh = has_speed_ &&
+      (speed_timeout_ <= 0.0 || age <= speed_timeout_);
+    if (!fresh && !vesc_state_topic_.empty()) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "path clearance: VESC speed on %s is %s; using candidate command %.2fm/s",
+        vesc_state_topic_.c_str(), has_speed_ ? "stale" : "not received",
+        std::abs(commanded));
     }
-    *from_odom = false;
-    return std::abs(commanded);
+    return selectGeometrySpeed(
+      has_speed_, age, speed_timeout_, measured_speed_, commanded);
   }
 
   double freeDistance(
@@ -289,8 +325,9 @@ private:
   };
 
   rclcpp::Node * node_{nullptr};
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr speed_sub_;
-  std::string speed_topic_;
+  rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr speed_sub_;
+  std::string vesc_state_topic_;
+  VescSpeedCalibration speed_calibration_;
   double speed_timeout_{0.3};
   bool has_speed_{false};
   double measured_speed_{0.0};

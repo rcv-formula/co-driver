@@ -1,4 +1,7 @@
-"""red_damvi - co_driver arbitrating PPcontroller (/drive_main) vs gap_follow (/drive_gf).
+"""red_damvi - co_driver arbitrating PP and reactive drive sources.
+
+This launch can start the localization fallback on /drive_gf. The
+obstacle-specific /drive_gf2 source in the default topics file is external.
 
   ros2 launch co_driver red_damvi.launch.py
 

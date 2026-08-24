@@ -159,11 +159,12 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer_interface.h>
+#include <vesc_msgs/msg/vesc_state_stamped.hpp>
 
 #include "co_driver/arc_geometry.hpp"
 #include "co_driver/path_reference.hpp"
 #include "co_driver/scan_occupancy.hpp"
-#include <nav_msgs/msg/odometry.hpp>
+#include "co_driver/vesc_speed.hpp"
 
 #include "co_driver/scorer.hpp"
 
@@ -260,21 +261,40 @@ public:
     // square root is the time to translate sideways far enough to miss.
     // Speed for the geometry: MEASURED, not commanded.
     //
-    // Every distance here is derived from speed, so the source matters. On the
-    // 0814 recording, differentiating the map-frame pose gives the truth, and:
-    //     pose / odom        = 1.00   (p10 0.99, p90 1.04)  <- odom is correct
-    //     pose / odom_wheel  = 2.66                          <- wheel is slow
-    //     pose / drive_main  = 2.24, spread p10 1.15 to p90 3.50
-    // The command is not a scaled version of the truth, it is a request the
-    // car tracks loosely, so no constant factor can repair it - at p99 the car
-    // was doing 5.73 m/s while commanding 2.06. Believing the command made the
-    // lookahead short by that much, which is the "it switches far too late"
-    // behaviour. Note /odom_wheel is the 2.6x-slow one; /odom is already
-    // corrected and is what this uses.
-    //
-    // The command remains the fallback for when odometry is silent, because a
-    // wrong lookahead beats none, and the note says which one is in use.
-    speed_topic_ = jstr(p, "speed_topic", "/odom");
+    // Read the VESC telemetry directly so a localization jump cannot become a
+    // speed spike here. f1_stack_for_damvi/red_damvi converts state.speed (ERPM)
+    // with (erpm - offset) / gain and applies a 0.05 m/s deadband. This car's
+    // result is about 2.6 times below the speed domain used by the controller,
+    // so that correction remains an explicit, independently tunable scale.
+    vesc_state_topic_ = jstr(p, "vesc_state_topic", "/sensors/core");
+    speed_calibration_.speed_to_erpm_gain =
+      jnum(p, "speed_to_erpm_gain", 3172.47);
+    speed_calibration_.speed_to_erpm_offset =
+      jnum(p, "speed_to_erpm_offset", 0.0);
+    speed_calibration_.wheel_speed_deadband =
+      jnum(p, "wheel_speed_deadband", 0.05);
+    speed_calibration_.wheel_speed_scale =
+      jnum(p, "wheel_speed_scale", 2.6);
+    if (
+      !std::isfinite(speed_calibration_.speed_to_erpm_gain) ||
+      std::abs(speed_calibration_.speed_to_erpm_gain) < 1.0e-6 ||
+      !std::isfinite(speed_calibration_.speed_to_erpm_offset) ||
+      !std::isfinite(speed_calibration_.wheel_speed_deadband) ||
+      speed_calibration_.wheel_speed_deadband < 0.0 ||
+      !std::isfinite(speed_calibration_.wheel_speed_scale) ||
+      speed_calibration_.wheel_speed_scale <= 0.0)
+    {
+      RCLCPP_ERROR(
+        node->get_logger(),
+        "obstacle avoidance '%s': invalid VESC speed calibration "
+        "(gain %.6f, offset %.6f, deadband %.3f, scale %.3f)",
+        name.c_str(), speed_calibration_.speed_to_erpm_gain,
+        speed_calibration_.speed_to_erpm_offset,
+        speed_calibration_.wheel_speed_deadband,
+        speed_calibration_.wheel_speed_scale);
+      return false;
+    }
+    // The candidate command remains the fallback when VESC telemetry is stale.
     speed_timeout_ = jms(p, "speed_timeout_ms", 300.0);
     reaction_time_ = jnum(p, "reaction_time", 0.5);
     lateral_accel_ = std::max(0.5, jnum(p, "lateral_accel", 5.0));
@@ -343,20 +363,36 @@ public:
     clear_ = jms(p, "clear_ms", 700.0);
     timeout_ = jms(p, "timeout_ms", 500.0);
 
-    // The detector publishes SensorDataQoS; a RELIABLE subscription would not
-    // match it and would receive nothing at all.
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = group();
-    if (!speed_topic_.empty()) {
-      speed_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
-        speed_topic_, rclcpp::SensorDataQoS(),
-        [this](const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+    if (!vesc_state_topic_.empty()) {
+      speed_sub_ = node->create_subscription<vesc_msgs::msg::VescStateStamped>(
+        vesc_state_topic_, rclcpp::QoS(10),
+        [this](const vesc_msgs::msg::VescStateStamped::ConstSharedPtr msg) {
+          double speed = 0.0;
+          if (!vescErpmToSpeed(msg->state.speed, speed_calibration_, &speed)) {
+            RCLCPP_WARN_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 1000,
+              "obstacle avoidance: invalid VESC speed sample on %s",
+              vesc_state_topic_.c_str());
+            return;
+          }
           std::lock_guard<std::mutex> lock(mtx_);
-          measured_speed_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+          measured_speed_ = speed;
           speed_stamp_ = node_->now();
           has_speed_ = true;
         }, opts);
+      RCLCPP_INFO(
+        node->get_logger(),
+        "obstacle avoidance speed <- %s: (ERPM - %.2f) / %.2f, "
+        "deadband %.2fm/s, x%.2f; command fallback after %.0fms",
+        vesc_state_topic_.c_str(), speed_calibration_.speed_to_erpm_offset,
+        speed_calibration_.speed_to_erpm_gain,
+        speed_calibration_.wheel_speed_deadband,
+        speed_calibration_.wheel_speed_scale, speed_timeout_ * 1e3);
     }
+    // The detector publishes SensorDataQoS; a RELIABLE subscription would not
+    // match it and would receive nothing at all.
     sub_ = node->create_subscription<obstacle_context_msgs::msg::ObstacleClusterArray>(
       topic_, rclcpp::SensorDataQoS(),
       [this](const obstacle_context_msgs::msg::ObstacleClusterArray::ConstSharedPtr msg) {
@@ -472,12 +508,18 @@ public:
         }
         if (timeout_ > 0.0 && (ctx.now - scan_rx_).seconds() > timeout_) {
           scan_.clear();
+          // Two very different faults reach here and they need different
+          // people: the lidar stopped, or it is fine and the pose that places
+          // its returns is gone. Losing localization produces the second one,
+          // and calling that "no scan" costs whoever is debugging it an hour.
+          const std::string why = scan_blocked_.empty() ?
+            ("no scan on " + scan_topic_) : scan_blocked_;
           RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 2000,
-            "obstacle avoidance: no scan on %s for %.1fs - reporting a clear "
-            "path because nothing can be seen, not because nothing is there.",
-            scan_topic_.c_str(), (ctx.now - scan_rx_).seconds());
-          return ScoreResult::ok(1.0, "stale scan - nothing can be seen");
+            "obstacle avoidance: %s for %.1fs - reporting a clear path because "
+            "nothing can be seen, not because nothing is there.",
+            why.c_str(), (ctx.now - scan_rx_).seconds());
+          return ScoreResult::ok(1.0, why + " - nothing can be seen");
         }
         ref_header = scan_header_;
       } else {
@@ -507,7 +549,8 @@ public:
     if (!std::isfinite(v) || !std::isfinite(delta)) {
       return ScoreResult::unavailable("command is NaN/inf");
     }
-    if (std::abs(v) < min_speed_) {
+    const double v_now = geometrySpeed(v, ctx);
+    if (v_now < min_speed_) {
       return setState(drive.name, ctx, 0.0, 0.0, 0, "below min_speed");
     }
 
@@ -534,9 +577,6 @@ public:
     // 50 Hz, so a car that accelerates gets the longer lookahead immediately -
     // long before it arrives anywhere. A crawling car genuinely does not need
     // to worry about something eight metres away.
-    bool speed_from_odom = false;
-    const double v_now = geometrySpeed(v, ctx, &speed_from_odom);
-    last_speed_ = v_now;
     const double v_plan = v_now;
     const double v_planned_here = (on_plan && use_path_speed_) ?
       ref.path->speedAt(ref.ego_station) : 0.0;
@@ -763,18 +803,23 @@ public:
   }
 
 private:
-  // Measured speed if it is fresh, otherwise the command. `from_odom` tells the
-  // caller which, so the note can say so rather than quietly using the worse one.
-  double geometrySpeed(double commanded, const Context & ctx, bool * from_odom) const
+  // Corrected VESC speed if it is fresh, otherwise the candidate command.
+  double geometrySpeed(double commanded, const Context & ctx)
   {
-    if (has_speed_ &&
-      (speed_timeout_ <= 0.0 || (ctx.now - speed_stamp_).seconds() <= speed_timeout_))
-    {
-      *from_odom = true;
-      return std::abs(measured_speed_);
+    std::lock_guard<std::mutex> lock(mtx_);
+    const double age = has_speed_ ? (ctx.now - speed_stamp_).seconds() : 0.0;
+    const bool fresh = has_speed_ &&
+      (speed_timeout_ <= 0.0 || age <= speed_timeout_);
+    if (!fresh && !vesc_state_topic_.empty()) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "obstacle avoidance: VESC speed on %s is %s; using candidate command %.2fm/s",
+        vesc_state_topic_.c_str(), has_speed_ ? "stale" : "not received",
+        std::abs(commanded));
     }
-    *from_odom = false;
-    return std::abs(commanded);
+    last_speed_ = selectGeometrySpeed(
+      has_speed_, age, speed_timeout_, measured_speed_, commanded);
+    return last_speed_;
   }
 
   // One scan, deskewed and measured against the line.
@@ -803,10 +848,17 @@ private:
       t1 = deskew_ ? lookupOrLatest(path->frame(), msg->header.frame_id, end.operator builtin_interfaces::msg::Time()) : t0;
       ego = lookupOrLatest(path->frame(), base_frame_, msg->header.stamp);
     } catch (const tf2::TransformException &) {
-      return;                 // no pose: nothing to say, see the header
+      // Scans ARE arriving; they cannot be placed. Saying "no scan" here sends
+      // whoever reads it to check the lidar, which is working.
+      scan_blocked_ = "cannot place the scan on the plan (no transform)";
+      return;
     }
     const auto e = path->project(ego.transform.translation.x, ego.transform.translation.y);
-    if (!e.valid) {return;}
+    if (!e.valid) {
+      scan_blocked_ = "the car does not project onto the plan";
+      return;
+    }
+    scan_blocked_.clear();
     scan_ego_station_ = e.station;
 
     const double span = std::clamp(
@@ -1290,8 +1342,9 @@ private:
   };
 
   rclcpp::Node * node_{nullptr};
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr speed_sub_;
-  std::string speed_topic_;
+  rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr speed_sub_;
+  std::string vesc_state_topic_;
+  VescSpeedCalibration speed_calibration_;
   double speed_timeout_{0.3};
   bool has_speed_{false};
   double measured_speed_{0.0};
@@ -1301,6 +1354,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   ScanOccupancy scan_;
   std_msgs::msg::Header scan_header_;
+  // Why the last scan was dropped before it reached the ring, if it was.
+  std::string scan_blocked_;
   // What the scan source is actually looking at, per drive. Diagnostic only -
   // "obstacle at 0.24m" says how far along the line it is and nothing about
   // what it is, and on a hairpin the wall beside the car projects onto the leg

@@ -115,7 +115,7 @@
       "params": {
         // Thresholds and timings live in obstacle_scoring.jsonc.
         "topic": "/scan",
-        "speed_topic": "/odom"
+        "vesc_state_topic": "/sensors/core"
       }
     },
 
@@ -154,7 +154,7 @@
         // Everything else - corridor, trigger and commit geometry, jitter
         // model, presence window, holds - lives in obstacle_scoring.jsonc.
         "topic": "/obstacle_clusters",
-        "speed_topic": "/odom",
+        "vesc_state_topic": "/sensors/core",
         "path_topic": "/global_path",
         "path_csv": "",
         "path_frame": "map",
@@ -335,14 +335,10 @@
       }
     },
     {
-      // The same fallback, entered for a completely different reason: an
-      // object on the planned line. Short, because the detour should end when
-      // the obstacle is behind the car - which one shared cooldown could never
-      // express while also keeping the localization handover sticky.
-      //
-      // Reads the same topic as gap_loc, so swapping between the two changes
-      // no command at all and the output blend does not arm (the node keys it
-      // on the topic, not the name).
+      // The obstacle-specific fallback, entered because an object is on the
+      // planned line. Its controller is launched externally on /drive_gf2;
+      // unlike gap_loc this is a real command-source change, so moving to or
+      // from it arms switch_blend and observes the incumbent's keep_ms.
       //
       // The obstacle input enters NEGATIVELY on clearness: a clear path is
       // -1.7 with the bias, putting this candidate well below the others, and
@@ -352,15 +348,13 @@
       // something to go around and localization is fine, and yields to gap_loc
       // when localization is the real problem.
       "name": "gap_obs",
-      "topic": "/drive_gf",
+      "topic": "/drive_gf2",
       "hold_ms": 500,
       "keep_ms": 400,
       // A small positive bias so that once there IS demand this candidate is
-      // clearly ahead of gap_loc rather than a hair in front. With the two
-      // only 0.34 apart in logit, the EMA had not finished moving before the
-      // margin test ran and the localization fallback took a detour that was
-      // not about localization - same command, wrong label, and then the wrong
-      // dwell on the way back.
+      // clearly ahead of gap_loc rather than a hair in front. Otherwise the
+      // localization fallback can win while the EMA catches up, delaying the
+      // move to the obstacle-specific controller.
       "bias": 0.3,
       "enabled": true,
       "influence": {

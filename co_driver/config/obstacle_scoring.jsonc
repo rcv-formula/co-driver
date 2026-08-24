@@ -231,17 +231,18 @@
           // the standby for a car whose planner is not running - same three
           // columns, x, y, speed. Losing both falls back to the commanded arc
           // and says so loudly in the note rather than reporting a clear path.
-          // Speed for the geometry comes from MEASURED odometry, not from the
-          // drive command. On the 0814 recording the map-frame pose says /odom
-          // is exact (ratio 1.00) while the command runs 2.24x low at the median
-          // and anywhere from 1.15x to 3.50x - a request the car tracks loosely,
-          // not a scaled truth, so no constant factor repairs it. Believing the
-          // command made every lookahead short by that much.
-          //
-          // Use /odom, NOT /odom_wheel: the wheel odometry on this car reads
-          // 2.66x slow (measured against the same pose), and /odom is the
-          // corrected one.
-          "speed_topic": "/odom",
+          // Current speed comes straight from the VESC, so a localization jump
+          // cannot stretch or shrink the obstacle horizon. red_damvi's
+          // vesc_to_odom conversion is:
+          //   raw_mps = (state.speed[ERPM] - offset) / gain
+          // with a 0.05 m/s deadband. On this car that raw result reads about
+          // 2.6x below the speed domain used by the controller, so the correction
+          // is deliberately a separate parameter rather than hidden in the gain.
+          "vesc_state_topic": "/sensors/core",
+          "speed_to_erpm_gain": 3172.47,
+          "speed_to_erpm_offset": 0.0,
+          "wheel_speed_deadband": 0.05,
+          "wheel_speed_scale": 2.6,
           "speed_timeout_ms": 300,
           "path_topic": "/global_path",
           "path_csv": "",
@@ -256,13 +257,13 @@
   
           // Commit distance is derived from the manoeuvre, not tuned:
           //   speed x (reaction + sqrt(2 x lateral_need / lateral_accel))
-          // reaction covers the 200 ms detection hold plus the 300 ms handover
+          // reaction covers the 150 ms detection hold plus the 300 ms handover
           // blend. At 7 m/s with a 0.73 m corridor and 5 m/s^2 that is 7.8 m.
           // This is what "stay on the fast controller until the last moment it
           // is still avoidable" means in numbers.
-          "reaction_time": 0.5,
+          "reaction_time": 0.8,
           "lateral_accel": 5.0,
-          "commit_margin_m": 0.5,
+          "commit_margin_m": 0.8,
           // Must equal veto_below on pp_main below (score = 1 - demand). Keeping
           // them in step is what makes "commit distance" a real distance.
           "commit_demand": 0.85,
@@ -370,7 +371,7 @@
           // commit distance. Raising the cap here costs nothing and stops
           // co_driver being the limit once the detector's range grows.
           "trigger_time": 2.5,
-          "min_trigger_m": 2.0,
+          "min_trigger_m": 3.0,
           "max_trigger_m": 14.0,
           // Urgency is measured in time of travel, not metres, so speed decides
           // what counts as close: inside this many seconds of travel the demand
@@ -381,7 +382,7 @@
           // full_urgency_time is deliberately NOT lowered to open the band -
           // it sets the commit distance, and at 2.5 m/s dropping 0.8 -> 0.6
           // would move the commit from 2.0 m to 1.5 m, i.e. 0.6 s of travel,
-          // against a 200 ms detection hold plus a 300 ms blend. The band is
+          // against a 150 ms detection hold plus a 300 ms blend. The band is
           // opened from the trigger end, where being early costs nothing but a
           // rising bar on the status stream.
           "full_urgency_time": 0.8,
@@ -423,10 +424,10 @@
           // 90-97% to 81%. Erasing on track age made real obstacles disappear
           // exactly when the car was fast enough to need them.
           //
-          // 1.0 = no discount: rely on block_ms (200 ms, eight frames at 40 Hz)
+          // 1.0 = no discount: rely on block_ms (150 ms, six frames at 40 Hz)
           // to reject flicker, which is a filter the detector's association
           // cannot break. Lower this only with a measurement showing spurious
-          // clusters that survive 200 ms.
+          // clusters that survive 150 ms.
           "min_observed": 2,
           "immature_scale": 1.0,
           // The forward test is not an angle any more. A cluster is judged
@@ -528,7 +529,7 @@
           // having - lengthening it alone would only delay the commit, and at
           // 7 m/s there is no range to spare for that.
           "presence_station_tolerance_m": 1.0,
-          "block_ms": 200,
+          "block_ms": 150,
           "clear_ms": 700,
           "timeout_ms": 500
         }
@@ -537,8 +538,12 @@
     "clearance": {
       "params": {
           "topic": "/scan",
-          // Measured speed, same reasoning as the obstacle scorer.
-          "speed_topic": "/odom",
+          // Same localization-independent VESC speed as the obstacle scorer.
+          "vesc_state_topic": "/sensors/core",
+          "speed_to_erpm_gain": 3172.47,
+          "speed_to_erpm_offset": 0.0,
+          "wheel_speed_deadband": 0.05,
+          "wheel_speed_scale": 2.6,
           "speed_timeout_ms": 300,
           "wheelbase": 0.324,
           "vehicle_half_width": 0.18,

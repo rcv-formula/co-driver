@@ -96,15 +96,15 @@ struct AssistState
   std::string last{"idle"};  // how the previous one ended
 };
 
-// Hold a fixed speed for the same stretch, then let the controller ramp out of
-// it by itself. Shares hold with the gain assist deliberately: it is the same
-// moment and the same two seconds, and having the number written twice is how
-// they would drift apart.
+// Hold a fixed speed, then let the controller ramp out of it by itself. The
+// duration is independent of the gain-assist hold: the two actions start on the
+// same hand-back edge, but may need different tuning on the car.
 struct SpeedHold
 {
   bool enabled{false};
   std::string topic{"/launch_speed_hold"};
   double speed{1.5};
+  double duration{2.0};
 };
 
 struct ReturnAssist
@@ -1177,17 +1177,19 @@ private:
             get_logger(), *get_clock(), 2000,
             "%s -> %s again %.2fs into a %.1fs hold - not restarting it",
             handed_from.c_str(), sel.name.c_str(),
-            assist_.hold - (speed_hold_until_ - t).seconds(), assist_.hold);
+            assist_.speed_hold.duration - (speed_hold_until_ - t).seconds(),
+            assist_.speed_hold.duration);
         } else if (speed_hold_pub_) {
           std_msgs::msg::Float64MultiArray msg;
-          msg.data = {assist_.speed_hold.speed, assist_.hold};
+          msg.data = {assist_.speed_hold.speed, assist_.speed_hold.duration};
           speed_hold_pub_->publish(msg);
-          speed_hold_until_ = t + rclcpp::Duration::from_seconds(assist_.hold);
+          speed_hold_until_ =
+            t + rclcpp::Duration::from_seconds(assist_.speed_hold.duration);
           speed_hold_valid_ = true;
           RCLCPP_INFO(
             get_logger(), "%s -> %s: holding %.2fm/s for %.1fs, then %s ramps "
             "out of it", handed_from.c_str(), sel.name.c_str(),
-            assist_.speed_hold.speed, assist_.hold, assist_.node.c_str());
+            assist_.speed_hold.speed, assist_.speed_hold.duration, assist_.node.c_str());
         } else if (ramp_pub_) {
           std_msgs::msg::Bool msg;
           msg.data = true;
@@ -1320,6 +1322,7 @@ private:
        << ",\"speed_hold\":{\"enabled\":"
        << (assist_.speed_hold.enabled ? "true" : "false")
        << ",\"speed\":" << num(assist_.speed_hold.speed)
+       << ",\"duration_s\":" << num(assist_.speed_hold.duration)
        << ",\"left_s\":" << num(hold_left) << "}}";
     return os.str();
   }
@@ -1500,10 +1503,18 @@ private:
       assist_.speed_hold.enabled = jbool(*sh, "enabled", false);
       assist_.speed_hold.topic = jstr(*sh, "topic", assist_.speed_hold.topic);
       assist_.speed_hold.speed = jnum(*sh, "speed", assist_.speed_hold.speed);
-      if (assist_.speed_hold.speed < 0.0 || assist_.speed_hold.topic.empty()) {
+      // Backward compatibility: configurations without duration_ms keep using
+      // the gain-assist hold, which was the hard-wired behaviour before this
+      // field existed.
+      assist_.speed_hold.duration =
+        jms(*sh, "duration_ms", assist_.hold * 1e3);
+      if (!std::isfinite(assist_.speed_hold.speed) || assist_.speed_hold.speed < 0.0 ||
+        !std::isfinite(assist_.speed_hold.duration) || assist_.speed_hold.duration < 0.0 ||
+        assist_.speed_hold.topic.empty())
+      {
         RCLCPP_WARN(
-          get_logger(), "return assist: speed_hold needs a topic and a speed at "
-          "or above 0 - disabled");
+          get_logger(), "return assist: speed_hold needs a topic, a finite speed "
+          "at or above 0, and a finite duration_ms at or above 0 - disabled");
         assist_.speed_hold.enabled = false;
       }
     }
@@ -1533,7 +1544,8 @@ private:
         get_logger(),
         "return assist: handing back holds %.2fm/s on %s for %.1fs, and the "
         "controller ramps out of that by itself - so the ramp flag is NOT sent",
-        assist_.speed_hold.speed, assist_.speed_hold.topic.c_str(), assist_.hold);
+        assist_.speed_hold.speed, assist_.speed_hold.topic.c_str(),
+        assist_.speed_hold.duration);
     }
     if (!assist_.enabled) {
       RCLCPP_INFO(get_logger(), "return assist: gains left alone");

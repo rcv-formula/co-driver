@@ -77,3 +77,54 @@ Setting parameter failed: K_p must be in [0, inf] (got -1)
 RF 스위치(`rf_enable_channel`)가 올라가 있는 동안에는 `/rf` 가 매 메시지마다
 `velocity_percentage` 와 `max_speed_limit_percentage` 를 덮어씁니다. 이 두 값을
 외부에서 제어하려면 스위치를 내려 두세요.
+
+
+## Launch start
+
+정지 상태에서 트리거가 들어오면, 경로 목표 속도로 바로 뛰지 않고 설정한
+가속도로만 올라가는 래치입니다. 목표 속도는 차량 위치에 따라 계속 바뀌고,
+램프가 그 목표에 `launch_start_release_diff` 이내로 붙으면 래치가 풀려
+기존 블렌딩 동작으로 돌아갑니다. 한 번 풀리면 새 트리거가 오기 전까지
+다시 걸리지 않습니다.
+
+### 휠 속도
+
+`vesc_state_topic`(기본 `sensors/core`, `vesc_msgs/VescStateStamped`)의
+전기 RPM을 vesc_to_odom과 같은 식으로 변환해 씁니다.
+
+```
+speed[m/s] = (state.speed[erpm] - speed_to_erpm_offset) / speed_to_erpm_gain
+```
+
+`wheel_speed_deadband`(0.05) 이하는 0으로 봅니다. 변환된 값은 명령 속도
+(path speed) 도메인보다 약 2.6배 작게 나오므로 `wheel_speed_scale`을 곱해
+맞춘 뒤 목표 속도와 비교합니다. **아래 diff/accel 값은 전부 이 변환 뒤의
+명령 속도 기준**이라 실제 차속으로는 약 1/2.6 수준입니다.
+`wheel_speed_timeout`(0.5초)보다 오래된 값만 있으면 래치를 걸지 않습니다.
+
+### 트리거
+
+1. **RF 채널 상승 엣지** — `launch_start_channel`(기본 6) 값이
+   `launch_start_channel_threshold`(1800) **이하였다가 초과로 올라가는 순간**
+   한 번만 발동합니다. 계속 위에 머물러 있으면 재발동하지 않고, 노드가 뜬 뒤
+   첫 메시지는 직전 값이 없어 엣지로 보지 않습니다. RF enable 스위치와는
+   무관하게 동작합니다.
+2. **토픽** — `launch_start_reset_topic`(기본 `/launch_start_reset`,
+   `std_msgs/Bool`)에 `true`가 오면 현재 휠 속도 기준으로 래치를 다시 걸고,
+   `false`면 해제합니다.
+
+트리거가 와도 `|목표 속도 - 휠 속도| < launch_start_engage_diff`(1.0)이면
+이미 속도가 붙은 것으로 보고 래치를 걸지 않습니다(로그에 `skipped`).
+
+```bash
+# 수동 발동 / 해제
+ros2 topic pub --once /launch_start_reset std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /launch_start_reset std_msgs/msg/Bool "{data: false}"
+
+# 통째로 끄기
+ros2 param set pure_pursuit launch_start_enabled false
+```
+
+래치가 걸린 동안에도 `max_speed_limit_percentage` 상한은 그대로 적용되고,
+RViz의 `/pp_runtime_params` 마커에 휠 속도와 `LAUNCH <ramp> -> <target>` 이
+표시됩니다.

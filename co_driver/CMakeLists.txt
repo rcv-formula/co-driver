@@ -18,6 +18,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(ackermann_msgs REQUIRED)
+find_package(vesc_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -31,6 +32,7 @@ set(dependencies
   nav_msgs
   sensor_msgs
   ackermann_msgs
+  vesc_msgs
   tf2
   tf2_ros
   tf2_geometry_msgs
@@ -78,6 +80,14 @@ target_include_directories(co_driver_node PUBLIC
 )
 target_link_libraries(co_driver_node nlohmann_json::nlohmann_json)
 ament_target_dependencies(co_driver_node ${dependencies})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_vesc_speed test/test_vesc_speed.cpp)
+  target_include_directories(test_vesc_speed PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+endif()
 
 install(TARGETS co_driver_node
   DESTINATION lib/${PROJECT_NAME}

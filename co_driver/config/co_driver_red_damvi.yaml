@@ -1,7 +1,8 @@
 # co_driver base settings - red_damvi (PPcontroller + gap_follow)
 #
-#   /drive_main  PPcontroller  map / raceline based; only meaningful while localization works
-#   /drive_gf    gap_follow    reactive on /scan alone; unaffected by localization
+#   /drive_main  PPcontroller     map / raceline based; only meaningful while localization works
+#   /drive_gf    gap_loc source   external gap_follow package
+#   /drive_gf2   gap_obs source   external gap_follow package, obstacle-specific instance
 #
 # One line: **when localization collapses, hand over to gap_follow.**
 # The confidence -> score mapping lives in config/co_driver_red_damvi_topics.jsonc.
@@ -20,8 +21,10 @@
     # Output - the navigation input of ackermann_mux.
     #
     # gap_follow's own default drive_topic is also /drive, so it **must** be
-    # overridden to /drive_gf (the launch file does this). Otherwise two nodes
-    # publish to the same topic and the mux sees interleaved commands.
+    # overridden to /drive_gf (this launch can optionally start that external
+    # package). The obstacle-specific instance is supplied separately on
+    # /drive_gf2. Otherwise a gap node on its default /drive would interleave
+    # commands with co_driver's output.
     # drive_monitor logs an ERROR if it ever sees two publishers here.
     # =====================================================================
     output:
