@@ -144,10 +144,13 @@
     # An empty topic disables the flag only - the other two are unaffected.
     # =====================================================================
     # NOTE: return_assist.jsonc can turn on a speed hold, which does the ramp
-    # itself once it releases. While that is on, this flag is NOT sent - the
-    # controller takes the most recent of the two as the winner, so sending it
-    # would cancel the hold. Nothing here needs changing for that; it is said
-    # at startup which of the two is in use.
+    # itself once it releases. This flag is withheld only when a hold request is
+    # actually published: the controller takes the most recent of the two as the
+    # winner, so sending both would cancel the hold. It remains the fallback when
+    # the JSON master/nested hold is off, no finite transition bound exists, or
+    # the configured receiver-duration assumption is too short. Startup shows
+    # configuration; /co_driver_node/status and the handback log show the actual
+    # per-edge decision.
     ramp_on_return:
       topic: "/launch_start_reset"
       from: ["gap_loc", "gap_obs"]
@@ -174,10 +177,12 @@
         decel: 12.0
         hold_steer: True
 
-      # PPcontroller and gap_follow can disagree sharply on steering, so blend for
-      # longer than the stock 250 ms.
+      # PPcontroller and gap_follow can disagree sharply on steering. Keep this
+      # handover short so a committed obstacle reaches gap_obs without spending
+      # unnecessary time between the two commands. This applies to every real
+      # source change, including the return from gap controllers.
       switch_blend:
-        duration_ms: 300.0
+        duration_ms: 100.0
         curve: "smooth"
         ema_alpha: 0.2
 
@@ -188,6 +193,9 @@
         max_decel: 12.0
 
       speed_scale:
+        # The speed-hold transition model snapshots this at handback. Changing
+        # it during a published request invalidates that conditional estimate;
+        # tune runtime scale between hold sessions.
         scale: 1.0
 
       deadband:

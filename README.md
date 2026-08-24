@@ -6,22 +6,29 @@ Arbitrates multiple `/drive` candidates by score, post-processes the winner, pub
 
     co_driver/               the node
     obstacle_context_msgs/   cluster message definitions, vendored
+    vesc_msgs/               VESC telemetry message definitions, vendored
 
-`obstacle_context_msgs` is owned by the obstacle detector and copied here so
-this repository builds and runs on its own. The node links its typesupport
-library, so a build made where the package exists will not start where it does
-not - it fails in the dynamic linker, before `main()`. Keep the `.msg` files
-byte-identical to the detector's, or publisher and subscriber stop matching
-with no error reported.
+The node links both message packages' typesupport libraries, so their source
+definitions live in this repository rather than depending on whichever overlay
+happened to be sourced at build time. `obstacle_context_msgs` matches the
+obstacle detector. `vesc_msgs` matches both the package used by red_damvi and
+`controller/src/vesc_msgs`; its upstream BSD license is retained alongside it.
+Keep every field, constant, type and ordering interface-identical to those
+publishers, or ROS type hashes no longer match and the topics will not connect.
 
 ## Build
 
 ```bash
 sudo apt install ros-jazzy-ackermann-msgs nlohmann-json3-dev
 cd ~/Desktop/co-driver
-colcon build --packages-select co_driver --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --packages-up-to co_driver --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
+
+`--packages-up-to` is intentional: it discovers and builds the vendored
+`vesc_msgs` and `obstacle_context_msgs` source dependencies before `co_driver`.
+`--packages-select co_driver` alone assumes those packages are already installed
+in an external underlay and is therefore not a standalone build.
 
 ## Run
 
@@ -43,21 +50,30 @@ ros2 launch co_driver red_damvi.launch.py scan_bridge:=true
 | `config/co_driver.yaml` | change output/scoring/selection/post-processing |
 | `config/co_driver_topics.jsonc` | add or remove input topics, drive candidates, weights |
 
-red_damvi splits its configuration three ways:
+red_damvi splits its configuration by responsibility:
 
 | File | Holds |
 |---|---|
 | `co_driver_red_damvi.yaml` | output / scoring / selection / post-processing |
-| `co_driver_red_damvi_topics.jsonc` | co_driver's own: wiring plus the arbitration layer (weights, bias, curves, vetoes, hold_ms) |
-| `localization_scoring.jsonc` | the scorers' own: how confidence becomes a score (timeouts, missing-topic policy, recovery conditions) |
+| `co_driver_red_damvi_topics.jsonc` | wiring plus the base arbitration layer (weights, bias, curves, vetoes, hold_ms) |
+| `localization_scoring.jsonc` | localization scorer parameters and related drive overrides |
+| `obstacle_scoring.jsonc` | obstacle/clearance scorer parameters plus the obstacle safety-veto overlay, including `gap_loc` |
+| `return_assist.jsonc` | hand-back speed hold, ramp and gain-assist settings |
 
-The scoring file is deep-merged over the topics file (`tuning_file` parameter), so
-each side can be edited without touching the other.
+The tuning files are deep-merged over the topics file in the order listed by the
+`tuning_file` parameter. Most arbitration defaults remain in the topics file;
+an override that must track a scorer parameter stays with that scorer instead.
 Reload coefficients without restarting:
 
 ```bash
 ros2 service call /co_driver_node/reload std_srvs/srv/Trigger
 ```
+
+This reload covers the YAML/topics tuning layers, not `return_assist.jsonc`,
+which is read only at startup. It also resets post-processing immediately and
+does not recompute an already-published speed-hold request. Reload or change the
+runtime speed scale between hold sessions; doing so during one invalidates its
+conditional steady-time estimate and is reported in status/logs.
 
 ## Monitor
 

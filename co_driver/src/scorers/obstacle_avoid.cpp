@@ -145,6 +145,7 @@
 //     "obstacles": {"weight": 0.0, "veto_below": 0.5}
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <deque>
 #include <map>
@@ -173,6 +174,15 @@ namespace co_driver
 
 class ObstacleAvoidScorer : public Scorer
 {
+private:
+  // Everything needed to place evidence on one immutable path snapshot.
+  struct PathRef
+  {
+    const PathReference * path{nullptr};
+    double ego_station{0.0};
+    double cos_yaw{1.0}, sin_yaw{0.0}, tx{0.0}, ty{0.0};
+  };
+
 public:
   bool configure(rclcpp::Node * node, const std::string & name, const Json & p) override
   {
@@ -250,6 +260,14 @@ public:
     tf_timeout_ = jms(p, "tf_timeout_ms", 200.0);
     use_path_speed_ = jbool(p, "use_path_speed", true);
 
+    // An obstacle is a property of the scene, not of whichever candidate is
+    // being scored.  In particular, when VESC telemetry is stale, using each
+    // candidate's own command would give a fast pp_main a long lookahead while
+    // a slow gap_loc saw the exact same obstacle as clear.  A configured live
+    // drive supplies one speed/steering snapshot to every candidate instead.
+    // Leaving this empty preserves the legacy per-candidate fallback.
+    reference_drive_ = jstr(p, "reference_drive", "");
+
     // ---- how late we may commit -------------------------------------------
     // The commit distance is derived, not tuned: it is the shortest distance in
     // which the fallback can still get around the obstacle. Staying on the
@@ -294,7 +312,8 @@ public:
         speed_calibration_.wheel_speed_scale);
       return false;
     }
-    // The candidate command remains the fallback when VESC telemetry is stale.
+    // The prepared reference command (or the candidate when no reference can
+    // be resolved) remains the fallback when VESC telemetry is stale.
     speed_timeout_ = jms(p, "speed_timeout_ms", 300.0);
     reaction_time_ = jnum(p, "reaction_time", 0.5);
     lateral_accel_ = std::max(0.5, jnum(p, "lateral_accel", 5.0));
@@ -476,10 +495,155 @@ public:
     return true;
   }
 
+  void prepare(const Context & ctx, const std::vector<Drive> & drives) override
+  {
+    have_reference_command_ = false;
+    resolved_reference_drive_.clear();
+
+    const Drive * reference = nullptr;
+    const auto usable_reference = [&ctx](const Drive & drive) {
+        // Drive::isLive currently includes these finite checks. Keep them
+        // explicit at this safety boundary so a future relaxation of command
+        // liveness cannot turn one bad named command into every obstacle input
+        // becoming unavailable.
+        return drive.isLive(ctx.now) &&
+               std::isfinite(drive.cmd.drive.speed) &&
+               std::isfinite(drive.cmd.drive.steering_angle);
+      };
+    if (!reference_drive_.empty()) {
+      for (const auto & drive : drives) {
+        if (drive.name == reference_drive_ && usable_reference(drive)) {
+          reference = &drive;
+          break;
+        }
+      }
+    }
+
+    // The named producer may be starting up or briefly stale.  Use the live
+    // command with the greatest speed magnitude as the conservative common
+    // geometry in that case.  Speed and steering stay paired: combining the
+    // speed of one command with another command's steering would describe a
+    // path that no controller actually requested.
+    if (reference == nullptr && !reference_drive_.empty()) {
+      for (const auto & drive : drives) {
+        if (!usable_reference(drive)) {continue;}
+        if (
+          reference == nullptr ||
+          std::abs(drive.cmd.drive.speed) > std::abs(reference->cmd.drive.speed))
+        {
+          reference = &drive;
+        }
+      }
+    }
+
+    if (reference == nullptr && !reference_drive_.empty()) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "obstacle avoidance: reference drive '%s' has no live command and no "
+        "live fallback exists; using each candidate command",
+        reference_drive_.c_str());
+    }
+
+    if (reference != nullptr) {
+      reference_speed_ = reference->cmd.drive.speed;
+      reference_steering_ = reference->cmd.drive.steering_angle;
+      resolved_reference_drive_ = reference->name;
+      have_reference_command_ = true;
+    }
+
+    if (reference != nullptr && reference->name != reference_drive_) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "obstacle avoidance: reference drive '%s' is not live; using fastest "
+        "live drive '%s' for common obstacle geometry",
+        reference_drive_.c_str(), resolved_reference_drive_.c_str());
+    }
+
+    // Freeze telemetry at the same evaluation boundary as the command. A
+    // VESC callback can run between score(pp_main) and score(gap_loc); letting
+    // each score read it independently would still give one scene two answers.
+    // A later sample is intentionally visible only after the next prepare().
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      geometry_snapshot_stamp_ = ctx.now;
+      geometry_snapshot_has_speed_ = has_speed_;
+      geometry_snapshot_speed_age_ = has_speed_ ?
+        (ctx.now - speed_stamp_).seconds() : 0.0;
+      geometry_snapshot_measured_speed_ = measured_speed_;
+      geometry_snapshot_valid_ = true;
+
+      // A common speed is already known here when the reference command exists,
+      // so a scan arriving before the first score in this tick sizes its horizon
+      // from the same snapshot as every candidate score.
+      if (have_reference_command_) {
+        last_speed_ = selectGeometrySpeed(
+          geometry_snapshot_has_speed_, geometry_snapshot_speed_age_, speed_timeout_,
+          geometry_snapshot_measured_speed_, reference_speed_);
+      }
+
+      // Freeze scan health, occupancy, header, invalidation generation and the
+      // selected path at the same evaluation boundary. A newer valid scan or
+      // path is intentionally first visible on the next prepare(), while an
+      // invalidation is still noticed by the generation check at commit.
+      scan_evaluation_valid_ = false;
+      if (source_ == "scan") {
+        // Expire the live ring at the prepare boundary, before it is frozen.
+        // Doing this later in score() is ambiguous: a fresh callback may have
+        // arrived after prepare, and clearing there would destroy next tick's
+        // good data. Here mtx_ proves scan_rx_ still names the ring we clear.
+        if (
+          has_scan_ && scan_usable_ && timeout_ > 0.0 &&
+          (ctx.now - scan_rx_).seconds() > timeout_)
+        {
+          const std::string why = scan_blocked_.empty() ?
+            ("no scan on " + scan_topic_) : scan_blocked_;
+          invalidateScan(why);
+        }
+        scan_evaluation_stamp_ = ctx.now;
+        scan_evaluation_has_scan_ = has_scan_;
+        scan_evaluation_usable_ = scan_usable_;
+        scan_evaluation_rx_ = scan_rx_;
+        scan_evaluation_blocked_ = scan_blocked_;
+        scan_evaluation_header_ = scan_header_;
+        scan_evaluation_invalidation_generation_ = scan_invalidation_generation_;
+        if (scan_usable_) {scan_evaluation_snapshot_ = scan_;}
+        if (!path_.empty()) {
+          scan_evaluation_path_ = path_;
+          scan_evaluation_have_path_ = true;
+        } else if (!csv_path_.empty()) {
+          scan_evaluation_path_ = csv_path_;
+          scan_evaluation_have_path_ = true;
+        } else {
+          scan_evaluation_have_path_ = false;
+        }
+      }
+    }
+
+    // Resolve TF once per evaluation as well. Keeping this outside mtx_ avoids
+    // holding the scan callback behind TF work; the path being queried is the
+    // immutable copy made above.
+    if (source_ == "scan") {
+      PathRef ref;
+      const bool on_plan = scan_evaluation_usable_ && scan_evaluation_have_path_ &&
+        resolvePathRef(scan_evaluation_header_, &scan_evaluation_path_, &ref);
+      std::lock_guard<std::mutex> lock(mtx_);
+      scan_evaluation_path_ref_ = ref;
+      scan_evaluation_on_plan_ = on_plan;
+      scan_evaluation_valid_ = true;
+    }
+  }
+
   ScoreResult score(const Drive & drive, const Context & ctx) override
   {
     obstacle_context_msgs::msg::ObstacleClusterArray::ConstSharedPtr clusters;
+    ScanOccupancy scan_snapshot;
+    std::uint64_t scan_invalidation_generation = 0;
     std_msgs::msg::Header ref_header;   // what the path lookup is stamped with
+    PathReference path_snapshot;
+    bool have_path_snapshot = false;
+    bool have_prepared_path_ref = false;
+    bool prepared_on_plan = false;
+    PathRef prepared_path_ref;
     {
       std::lock_guard<std::mutex> lock(mtx_);
       // EVERY EXIT HERE REPORTS "clear", never unavailable. This input carries
@@ -494,11 +658,22 @@ public:
       // would only hand the car to something equally blind - but it must not
       // be silent, so each of these says so.
       if (source_ == "scan") {
+        const bool use_prepared = scan_evaluation_valid_ &&
+          scan_evaluation_stamp_ == ctx.now;
+        const bool snapshot_has_scan = use_prepared ?
+          scan_evaluation_has_scan_ : has_scan_;
+        const bool snapshot_usable = use_prepared ?
+          scan_evaluation_usable_ : scan_usable_;
+        const rclcpp::Time snapshot_rx = use_prepared ?
+          scan_evaluation_rx_ : scan_rx_;
+        const std::string snapshot_blocked = use_prepared ?
+          scan_evaluation_blocked_ : scan_blocked_;
         // Deliberately before any mention of the detector. Asking for a
         // cluster message here - which this branch never reads - meant that on
         // a car with the detector not running, this input reported a clear
         // path for the entire run and never once looked at the lidar.
-        if (!has_scan_) {
+        if (!snapshot_has_scan) {
+          resetScanDecision(drive.name);
           RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "obstacle avoidance: nothing has arrived on %s - reporting a clear "
@@ -506,22 +681,51 @@ public:
             scan_topic_.c_str());
           return ScoreResult::ok(1.0, "no scan yet on " + scan_topic_);
         }
-        if (timeout_ > 0.0 && (ctx.now - scan_rx_).seconds() > timeout_) {
-          scan_.clear();
+        if (timeout_ > 0.0 && (ctx.now - snapshot_rx).seconds() > timeout_) {
           // Two very different faults reach here and they need different
           // people: the lidar stopped, or it is fine and the pose that places
           // its returns is gone. Losing localization produces the second one,
           // and calling that "no scan" costs whoever is debugging it an hour.
-          const std::string why = scan_blocked_.empty() ?
-            ("no scan on " + scan_topic_) : scan_blocked_;
+          const std::string why = snapshot_blocked.empty() ?
+            ("no scan on " + scan_topic_) : snapshot_blocked;
+          // A fresh scan may have arrived after prepare(). Do not destroy it
+          // merely because this evaluation's frozen snapshot is old.
+          if (!use_prepared) {invalidateScan(why);}
+          resetScanDecision(drive.name);
           RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 2000,
             "obstacle avoidance: %s for %.1fs - reporting a clear path because "
             "nothing can be seen, not because nothing is there.",
-            why.c_str(), (ctx.now - scan_rx_).seconds());
+            why.c_str(), (ctx.now - snapshot_rx).seconds());
           return ScoreResult::ok(1.0, why + " - nothing can be seen");
         }
-        ref_header = scan_header_;
+        if (!snapshot_usable) {
+          const std::string why = snapshot_blocked.empty() ?
+            ("latest scan on " + scan_topic_ + " could not be processed") : snapshot_blocked;
+          resetScanDecision(drive.name);
+          RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 2000,
+            "obstacle avoidance: %s - reporting a clear path because nothing "
+            "can be seen, not because nothing is there.", why.c_str());
+          return ScoreResult::ok(1.0, why + " - nothing can be seen");
+        }
+        // Prefer the evaluation-wide copy made by prepare(); direct test/tool
+        // callers that skip prepare still take one coherent live copy here.
+        scan_snapshot = use_prepared ? scan_evaluation_snapshot_ : scan_;
+        scan_invalidation_generation = use_prepared ?
+          scan_evaluation_invalidation_generation_ : scan_invalidation_generation_;
+        ref_header = use_prepared ? scan_evaluation_header_ : scan_header_;
+        if (use_prepared) {
+          have_prepared_path_ref = true;
+          prepared_on_plan = scan_evaluation_on_plan_;
+          prepared_path_ref = scan_evaluation_path_ref_;
+        } else if (!path_.empty()) {
+          path_snapshot = path_;
+          have_path_snapshot = true;
+        } else if (!csv_path_.empty()) {
+          path_snapshot = csv_path_;
+          have_path_snapshot = true;
+        }
       } else {
         if (!clusters_) {
           RCLCPP_WARN_THROTTLE(
@@ -541,16 +745,33 @@ public:
         }
         clusters = clusters_;
         ref_header = clusters_->header;
+        if (!path_.empty()) {
+          path_snapshot = path_;
+          have_path_snapshot = true;
+        } else if (!csv_path_.empty()) {
+          path_snapshot = csv_path_;
+          have_path_snapshot = true;
+        }
       }
     }
 
-    const double v = drive.cmd.drive.speed;
-    const double delta = drive.cmd.drive.steering_angle;
+    // Only the geometry command is shared.  Every presence/state update below
+    // remains keyed by drive.name, so one evaluation tick still contributes
+    // exactly one sample to each drive rather than N samples to a shared key.
+    const double v = have_reference_command_ ?
+      reference_speed_ : drive.cmd.drive.speed;
+    const double delta = have_reference_command_ ?
+      reference_steering_ : drive.cmd.drive.steering_angle;
     if (!std::isfinite(v) || !std::isfinite(delta)) {
-      return ScoreResult::unavailable("command is NaN/inf");
+      return ScoreResult::unavailable("obstacle geometry command is NaN/inf");
     }
     const double v_now = geometrySpeed(v, ctx);
     if (v_now < min_speed_) {
+      if (source_ == "scan") {
+        return setScanStateIfCurrent(
+          scan_invalidation_generation, drive.name, ctx,
+          0.0, 0.0, 0, "below min_speed");
+      }
       return setState(drive.name, ctx, 0.0, 0.0, 0, "below min_speed");
     }
 
@@ -558,8 +779,10 @@ public:
     // ourselves on it, the commanded arc if not. Falling back is loud - a
     // scorer that quietly answers "clear" because it lost its reference is
     // exactly the failure mode that made path_clearance untrustworthy.
-    PathRef ref;
-    const bool on_plan = buildPathRef(ref_header, &ref);
+    PathRef ref = have_prepared_path_ref ? prepared_path_ref : PathRef{};
+    const bool on_plan = have_prepared_path_ref ? prepared_on_plan :
+      resolvePathRef(
+        ref_header, have_path_snapshot ? &path_snapshot : nullptr, &ref);
 
     // Speed that decides the geometry: the one the car is ACTUALLY carrying.
     //
@@ -606,13 +829,15 @@ public:
       // agree are occupied. No clustering, no labels, no reported centre - see
       // scan_occupancy.hpp for why each of those was worth leaving out.
       if (!on_plan) {
-        return setState(
-          drive.name, ctx, 0.0, 0.0, 0,
+        return setScanStateIfCurrent(
+          scan_invalidation_generation, drive.name, ctx, 0.0, 0.0, 0,
           "no plan - the scan source has nothing to measure against");
       }
-      const auto occ = scan_.occupied(v_now);
+      const auto occ = scan_snapshot.occupied(v_now);
       considered = static_cast<int>(occ.size());
-      have_hit_[drive.name] = false;
+      bool have_new_hit = false;
+      ScanOccupancy::Occupied new_hit;
+      double new_block_station = 0.0;
       for (const auto & o : occ) {
         if (o.along > trigger) {continue;}
         any_ahead = true;
@@ -625,11 +850,28 @@ public:
         // so the only thing left to decide is how soon it is reached.
         if (urgency > demand) {
           demand = urgency;
-          block_station_[drive.name] = ref.ego_station + o.along;
-          have_block_station_[drive.name] = true;
-          hit_[drive.name] = o;
-          have_hit_[drive.name] = true;
+          new_block_station = ref.ego_station + o.along;
+          new_hit = o;
+          have_new_hit = true;
         }
+      }
+
+      // onScan() may invalidate the ring while occupied() works on its local
+      // copy. Recheck the invalidation generation, then publish every derived
+      // map/state update in the same mutex transaction. A failed scan can
+      // therefore never be followed by a stale snapshot resurrecting a commit.
+      std::lock_guard<std::mutex> lock(mtx_);
+      if (
+        !scan_usable_ ||
+        scan_invalidation_generation != scan_invalidation_generation_)
+      {
+        return discardStaleScanDecision(drive.name);
+      }
+      have_hit_[drive.name] = have_new_hit;
+      if (have_new_hit) {
+        block_station_[drive.name] = new_block_station;
+        have_block_station_[drive.name] = true;
+        hit_[drive.name] = new_hit;
       }
       last_on_plan_[drive.name] = true;
       bool passed = false;
@@ -803,22 +1045,33 @@ public:
   }
 
 private:
-  // Corrected VESC speed if it is fresh, otherwise the candidate command.
+  // Corrected VESC speed if it is fresh, otherwise the prepared common
+  // reference command (or the candidate command when reference_drive is off).
   double geometrySpeed(double commanded, const Context & ctx)
   {
     std::lock_guard<std::mutex> lock(mtx_);
-    const double age = has_speed_ ? (ctx.now - speed_stamp_).seconds() : 0.0;
-    const bool fresh = has_speed_ &&
+    // prepare() is the evaluation transaction boundary. Keep using that VESC
+    // sample even if a subscription callback updates the live fields between
+    // two candidate scores. Direct callers that skip prepare retain the old
+    // read-at-score behaviour.
+    const bool use_snapshot = geometry_snapshot_valid_ &&
+      geometry_snapshot_stamp_ == ctx.now;
+    const bool has_speed = use_snapshot ? geometry_snapshot_has_speed_ : has_speed_;
+    const double age = use_snapshot ? geometry_snapshot_speed_age_ :
+      (has_speed_ ? (ctx.now - speed_stamp_).seconds() : 0.0);
+    const double measured_speed = use_snapshot ?
+      geometry_snapshot_measured_speed_ : measured_speed_;
+    const bool fresh = has_speed &&
       (speed_timeout_ <= 0.0 || age <= speed_timeout_);
     if (!fresh && !vesc_state_topic_.empty()) {
       RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 5000,
-        "obstacle avoidance: VESC speed on %s is %s; using candidate command %.2fm/s",
-        vesc_state_topic_.c_str(), has_speed_ ? "stale" : "not received",
+        "obstacle avoidance: VESC speed on %s is %s; using geometry command %.2fm/s",
+        vesc_state_topic_.c_str(), has_speed ? "stale" : "not received",
         std::abs(commanded));
     }
     last_speed_ = selectGeometrySpeed(
-      has_speed_, age, speed_timeout_, measured_speed_, commanded);
+      has_speed, age, speed_timeout_, measured_speed, commanded);
     return last_speed_;
   }
 
@@ -834,9 +1087,26 @@ private:
   void onScan(const sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    // Record reception before any processing. A missing path or transform is
+    // not a silent lidar: the diagnostic must say that scans are arriving but
+    // cannot be used. scan_rx_ therefore tracks raw topic freshness, while
+    // scan_usable_ says whether the newest message produced valid occupancy.
+    has_scan_ = true;
+    scan_rx_ = node_->now();
     const PathReference * path = !path_.empty() ? &path_ :
       (!csv_path_.empty() ? &csv_path_ : nullptr);
-    if (!path || !tf_buffer_ || msg->ranges.empty()) {return;}
+    if (!path) {
+      invalidateScan("scan received but no planned path is available");
+      return;
+    }
+    if (!tf_buffer_) {
+      invalidateScan("scan received but the transform buffer is unavailable");
+      return;
+    }
+    if (msg->ranges.empty()) {
+      invalidateScan("scan received with no ranges");
+      return;
+    }
 
     const double sweep = msg->scan_time > 0.0 ? msg->scan_time :
       msg->time_increment * static_cast<double>(msg->ranges.size());
@@ -850,15 +1120,14 @@ private:
     } catch (const tf2::TransformException &) {
       // Scans ARE arriving; they cannot be placed. Saying "no scan" here sends
       // whoever reads it to check the lidar, which is working.
-      scan_blocked_ = "cannot place the scan on the plan (no transform)";
+      invalidateScan("cannot place the scan on the plan (no transform)");
       return;
     }
     const auto e = path->project(ego.transform.translation.x, ego.transform.translation.y);
     if (!e.valid) {
-      scan_blocked_ = "the car does not project onto the plan";
+      invalidateScan("the car does not project onto the plan");
       return;
     }
-    scan_blocked_.clear();
     scan_ego_station_ = e.station;
 
     const double span = std::clamp(
@@ -964,37 +1233,83 @@ private:
     }
     scan_.push(std::move(pts));
     scan_header_ = msg->header;   // what the path lookup gets stamped with
-    scan_rx_ = node_->now();
-    has_scan_ = true;
+    scan_blocked_.clear();
+    scan_usable_ = true;
+  }
+
+  // Called only with mtx_ held. A failed latest scan invalidates the complete
+  // accumulation window: keeping older occupancy would turn a fail-open input
+  // into a stale obstacle veto even though the status says the scan is blind.
+  void invalidateScan(const std::string & why)
+  {
+    scan_.clear();
+    scan_usable_ = false;
+    scan_blocked_ = why;
+    ++scan_invalidation_generation_;
+
+    // Invalidation is also a transaction boundary for every decision derived
+    // from the old ring. If it lands after a score committed, clear that state
+    // here; if it lands before commit, the generation check rejects the stale
+    // result. Both interleavings therefore end in the same fail-open state.
+    state_.clear();
+    last_on_plan_.clear();
+    last_passed_.clear();
+    have_block_station_.clear();
+    block_station_.clear();
+    last_ahead_.clear();
+    hit_.clear();
+    have_hit_.clear();
+  }
+
+  // score() calls this while mtx_ is held. Failing open must also discard the
+  // per-drive commitment latch; otherwise an obstacle seen before blindness
+  // can reappear as a held veto as soon as an empty, valid scan recovers.
+  void resetScanDecision(const std::string & drive)
+  {
+    state_.erase(drive);
+    last_on_plan_.erase(drive);
+    last_passed_.erase(drive);
+    have_block_station_.erase(drive);
+    block_station_.erase(drive);
+    last_ahead_.erase(drive);
+    hit_.erase(drive);
+    have_hit_.erase(drive);
+  }
+
+  // Called after scan geometry has been computed locally. The generation
+  // validation and setState() must share this lock with invalidateScan().
+  ScoreResult setScanStateIfCurrent(
+    std::uint64_t generation, const std::string & drive, const Context & ctx,
+    double demand, double dist, int considered, const std::string & reason)
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!scan_usable_ || generation != scan_invalidation_generation_) {
+      return discardStaleScanDecision(drive);
+    }
+    return setState(drive, ctx, demand, dist, considered, reason);
+  }
+
+  // mtx_ is held by the caller. invalidateScan() has already cleared all
+  // decisions, but erase this key as well to keep the helper correct if it is
+  // ever used for a non-usability transition that does not clear globally.
+  ScoreResult discardStaleScanDecision(const std::string & drive)
+  {
+    resetScanDecision(drive);
+    const std::string why = scan_blocked_.empty() ?
+      "scan was invalidated while scoring" : scan_blocked_;
+    return ScoreResult::ok(1.0, why + " - stale scan decision discarded");
   }
 
   // Speed last used for the geometry, so the scan callback sizes its window the
   // same way the decision does.
   double lastSpeed() const {return last_speed_ > 0.0 ? last_speed_ : 1.0;}
 
-  // Everything needed to place a cluster on the plan: which path, where we are
-  // on it, and how to get from the cluster's frame into the path's.
-  struct PathRef
-  {
-    const PathReference * path{nullptr};
-    double ego_station{0.0};
-    double cos_yaw{1.0}, sin_yaw{0.0}, tx{0.0}, ty{0.0};   // cluster frame -> path frame
-  };
-
   // Resolve the plan and the transform for this scan. Returns false - and says
   // why, throttled - whenever the plan cannot be used, so the caller falls back
   // to the commanded arc rather than silently reporting a clear path.
-  bool buildPathRef(const std_msgs::msg::Header & header, PathRef * out)
+  bool resolvePathRef(
+    const std_msgs::msg::Header & header, const PathReference * path, PathRef * out)
   {
-    const PathReference * path = nullptr;
-    {
-      // mtx_ is already held by the caller.
-      if (!path_.empty()) {
-        path = &path_;
-      } else if (!csv_path_.empty()) {
-        path = &csv_path_;
-      }
-    }
     if (!path) {
       RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 5000,
@@ -1342,6 +1657,16 @@ private:
   };
 
   rclcpp::Node * node_{nullptr};
+  std::string reference_drive_;
+  std::string resolved_reference_drive_;
+  bool have_reference_command_{false};
+  double reference_speed_{0.0};
+  double reference_steering_{0.0};
+  bool geometry_snapshot_valid_{false};
+  rclcpp::Time geometry_snapshot_stamp_;
+  bool geometry_snapshot_has_speed_{false};
+  double geometry_snapshot_speed_age_{0.0};
+  double geometry_snapshot_measured_speed_{0.0};
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr speed_sub_;
   std::string vesc_state_topic_;
   VescSpeedCalibration speed_calibration_;
@@ -1371,6 +1696,21 @@ private:
   double scan_ego_station_{0.0};
   rclcpp::Time scan_rx_;
   bool has_scan_{false};
+  bool scan_usable_{false};
+  std::uint64_t scan_invalidation_generation_{0};
+  bool scan_evaluation_valid_{false};
+  rclcpp::Time scan_evaluation_stamp_;
+  bool scan_evaluation_has_scan_{false};
+  bool scan_evaluation_usable_{false};
+  rclcpp::Time scan_evaluation_rx_;
+  std::string scan_evaluation_blocked_;
+  ScanOccupancy scan_evaluation_snapshot_;
+  std_msgs::msg::Header scan_evaluation_header_;
+  std::uint64_t scan_evaluation_invalidation_generation_{0};
+  PathReference scan_evaluation_path_;
+  bool scan_evaluation_have_path_{false};
+  PathRef scan_evaluation_path_ref_;
+  bool scan_evaluation_on_plan_{false};
   double last_speed_{0.0};
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

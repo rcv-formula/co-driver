@@ -134,9 +134,13 @@
       // weights that were usable - silently moving the calibrated localization
       // thresholds every time a producer is not running.
       //
-      // The weights below are not 0 any more either: gap_obs carries this at
-      // -2.0 so that a detour is its own candidate, and pp_main carries a
-      // veto_below at 0.15.
+      // gap_obs carries this at -2.0 so that a detour is its own candidate.
+      // pp_main carries a veto_below at 0.15 here; obstacle_scoring.jsonc adds
+      // the identical safety veto to gap_loc so a committed obstacle leaves
+      // gap_obs as the only valid reactive candidate. That tuning file also
+      // sets reference_drive=pp_main: when VESC is stale, all candidates judge
+      // obstacle geometry from one live pp command instead of changing the
+      // answer according to each candidate's commanded speed and steering.
       //
       // Trusted fields only: the detector measures its cluster geometry at
       // 0.77 cm inter-scan residual, but its motion estimates read 1-4 m/s on
@@ -187,7 +191,7 @@
       // Handing the car back is a change of who is steering, and mid-corner is
       // the worst moment for one: the two controllers disagree most where the
       // line curves, the grip is already spoken for, and the handover blend
-      // spends 300 ms somewhere between the two commands.
+      // spends 100 ms somewhere between the two commands.
       //
       // The plan says where it is slow (its own speed, in the z of each pose),
       // and the map controller's command says whether it is mid-turn. Both
@@ -284,8 +288,10 @@
         // even when it is the only command left.
         "off_path": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.5},
         // geometry veto: the commanded path runs into something solid.
-        // Only pp_main carries it - vetoing every candidate at once would
-        // leave nothing to drive with and fall through to timeout_stop.
+        // Only pp_main carries this path_clearance veto. This is separate from
+        // the obstacles safety veto shared by pp_main and gap_loc; applying
+        // path_clearance itself to every candidate would leave nothing to
+        // drive with and fall through to timeout_stop.
         // VETO DISABLED (-1 = off). Measured on the vehicle: path_clearance
         // disqualified pp_main in 216 of 522 status samples - 41% of the run -
         // while the same scorer fired ZERO times across the whole 0813 replay.

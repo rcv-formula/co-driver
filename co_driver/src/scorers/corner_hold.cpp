@@ -4,7 +4,7 @@
 // Coming back from the reactive controller is a change of who is steering, and
 // the worst moment to make one is mid-corner: the two controllers disagree
 // most where the line curves, the car is already using its grip, and the
-// handover blend spends 300 ms somewhere between the two commands. On a
+// handover blend spends 100 ms somewhere between the two commands. On a
 // straight that costs nothing. In a hairpin it is the whole margin.
 //
 // Two questions, both asked of things already on hand:

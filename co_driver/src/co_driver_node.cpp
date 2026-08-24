@@ -17,6 +17,7 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <map>
@@ -34,7 +35,9 @@
 
 #include "co_driver/compute.hpp"
 #include "co_driver/config.hpp"
+#include "co_driver/handover_state.hpp"
 #include "co_driver/scorer.hpp"
+#include "co_driver/speed_hold_timing.hpp"
 
 namespace co_driver
 {
@@ -97,19 +100,29 @@ struct AssistState
 };
 
 // Hold a fixed speed, then let the controller ramp out of it by itself. The
-// duration is independent of the gain-assist hold: the two actions start on the
-// same hand-back edge, but may need different tuning on the car.
+// configured duration is the minimum steady-time budget for the final /drive
+// output under the request-time model. The wire request is longer by a
+// conservative postprocess transition budget; receiver behaviour and later
+// runtime changes are not observable here.
 struct SpeedHold
 {
   bool enabled{false};
   std::string topic{"/launch_speed_hold"};
   double speed{1.5};
-  double duration{2.0};
+  double steady_duration{2.0};
+  // Must match pure_pursuit's speed_hold_max_duration. We never rely on the
+  // receiver's clamp because that would silently shorten steady_duration.
+  double max_request_duration{10.0};
 };
 
 struct ReturnAssist
 {
+  // Master switch for every action defined in return_assist.jsonc. The YAML
+  // ramp_on_return signal is deliberately outside this switch.
   bool enabled{false};
+  // Invalid/missing gain tuning disables only the parameter assist, not a
+  // separately valid speed hold while the master switch remains on.
+  bool gain_enabled{false};
   std::string node{"/pure_pursuit"};
   // name -> what to multiply it by, applied and restored together.
   std::vector<std::pair<std::string, double>> parameters;
@@ -433,7 +446,7 @@ private:
       // current_ is deliberately NOT cleared. It is the memory of who was
       // driving, and a gap in validity is not a handover. Clearing it made the
       // next tick re-commit the SAME drive with switched=true, which re-armed
-      // switch_blend (dragging the output through a 300 ms ramp from whatever
+      // switch_blend (dragging the output through a configured ramp from whatever
       // timeout_stop had decelerated to) and reset last_switch_, locking out a
       // genuine score-margin handover for a full switch_cooldown afterwards.
       // One missed 20 ms tick was enough. Externally that reads exactly as the
@@ -632,6 +645,77 @@ public:
     return true;
   }
 
+  SpeedTransitionBudget speedTransitionBudget(
+    double from_speed, double hold_speed, bool source_switched) const
+  {
+    std::vector<SwitchBlendTiming> blends;
+    std::vector<SpeedRateLimitTiming> rate_limits;
+    SpeedOutputBounds output_bounds;
+    for (const auto & s : stages_) {
+      switch (s.type) {
+        case Type::SwitchBlend:
+          blends.push_back({s.duration, s.curve == "ema"});
+          break;
+        case Type::RateLimit:
+          rate_limits.push_back({s.max_accel, s.max_decel});
+          break;
+        case Type::SpeedScale: {
+            const double scale = currentSpeedScale(s);
+            if (!std::isfinite(scale) || std::abs(scale - 1.0) > 1.0e-9) {
+              SpeedTransitionBudget budget;
+              budget.bounded = false;
+              budget.reason = "speed_scale '" + s.name +
+                "' changes the requested hold speed";
+              return budget;
+            }
+            break;
+          }
+        case Type::Deadband:
+          if (s.speed_deadband > 0.0 && hold_speed != 0.0 &&
+            std::abs(hold_speed) < s.speed_deadband)
+          {
+            SpeedTransitionBudget budget;
+            budget.bounded = false;
+            budget.reason = "deadband '" + s.name +
+              "' changes the requested hold speed";
+            return budget;
+          }
+          if (output_bounds.bounded && s.speed_deadband > 0.0 &&
+            output_bounds.min_speed < s.speed_deadband &&
+            output_bounds.max_speed > -s.speed_deadband)
+          {
+            output_bounds.min_speed = std::min(output_bounds.min_speed, 0.0);
+            output_bounds.max_speed = std::max(output_bounds.max_speed, 0.0);
+          }
+          break;
+        case Type::Clamp:
+          if (!std::isfinite(s.min_speed) || !std::isfinite(s.max_speed) ||
+            s.min_speed > s.max_speed || hold_speed < s.min_speed ||
+            hold_speed > s.max_speed)
+          {
+            SpeedTransitionBudget budget;
+            budget.bounded = false;
+            budget.reason = "clamp '" + s.name +
+              "' changes the requested hold speed";
+            return budget;
+          }
+          if (output_bounds.bounded) {
+            output_bounds.min_speed =
+              std::clamp(output_bounds.min_speed, s.min_speed, s.max_speed);
+            output_bounds.max_speed =
+              std::clamp(output_bounds.max_speed, s.min_speed, s.max_speed);
+          } else {
+            output_bounds = {true, s.min_speed, s.max_speed};
+          }
+          break;
+        case Type::TimeoutStop:
+          break;
+      }
+    }
+    return estimateSpeedTransitionBudget(
+      from_speed, hold_speed, source_switched, blends, rate_limits, output_bounds);
+  }
+
   void reset()
   {
     for (auto & s : stages_) {
@@ -718,16 +802,7 @@ public:
 
         case Type::SpeedScale: {
             // Read every cycle so runtime changes take effect immediately.
-            double scale = s.scale;
-            if (node_ && node_->has_parameter(s.scale_key)) {
-              const auto p = node_->get_parameter(s.scale_key);
-              if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
-                scale = p.as_double();
-              } else if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
-                scale = static_cast<double>(p.as_int());
-              }
-            }
-            cmd.speed = static_cast<float>(cmd.speed * scale);
+            cmd.speed = static_cast<float>(cmd.speed * currentSpeedScale(s));
             break;
           }
 
@@ -784,6 +859,20 @@ private:
     double blend_elapsed{0.0};
     ackermann_msgs::msg::AckermannDrive blend_from;
   };
+
+  double currentSpeedScale(const Stage & s) const
+  {
+    double scale = s.scale;
+    if (node_ && node_->has_parameter(s.scale_key)) {
+      const auto p = node_->get_parameter(s.scale_key);
+      if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+        scale = p.as_double();
+      } else if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+        scale = static_cast<double>(p.as_int());
+      }
+    }
+    return scale;
+  }
 
   rclcpp::Node * node_{nullptr};
   std::vector<Stage> stages_;
@@ -1028,6 +1117,14 @@ private:
       return false;
     }
     post_.reset();
+    if (speed_hold_valid_ && now() < speed_hold_until_) {
+      speed_hold_last_result_ =
+        "published request active; reload invalidated request-time steady model";
+      RCLCPP_WARN(
+        get_logger(), "postprocess reloaded during the local speed-hold "
+        "suppression window: the receiver request was not cancelled or resent, "
+        "but its conditional steady-time estimate is no longer valid");
+    }
     *message = "reload complete (yaml parameters + " + topics_path_ + ")";
     return true;
   }
@@ -1143,7 +1240,16 @@ private:
       sel = selector_.select(drives_, t);
       have_command_ = sel.has_selection;
       const std::string handed_from = selected_;
-      selected_ = sel.name;
+      selected_ = rememberSelectedDrive(selected_, sel.has_selection, sel.name);
+      // Resolve the source once. It is used both to arm switch_blend and to
+      // decide whether that blend time has to be included in a speed hold.
+      std::string selected_topic;
+      if (sel.switched) {
+        for (const auto & d : drives_) {
+          if (d.name == sel.name) {selected_topic = d.topic; break;}
+        }
+      }
+      const bool source_switched = sel.switched && selected_topic != last_output_topic_;
       // Handing the car back is invisible from the map controller's side - it
       // was publishing all along - so the moment has to be told to it. Not on
       // a last-resort pick: that is not a return, it is the only command left.
@@ -1156,12 +1262,26 @@ private:
       // The edge is computed once and both actions hang off it, so they happen
       // on the same tick without one being able to switch the other off:
       // clearing ramp_on_return.topic used to take the assist with it.
-      const bool handed_back = sel.switched && !sel.last_resort &&
-        sel.name == cfg_.ramp_on_return.to &&
-        std::find(
-          cfg_.ramp_on_return.from.begin(), cfg_.ramp_on_return.from.end(),
-          handed_from) != cfg_.ramp_on_return.from.end();
+      const bool handed_back = isConfiguredHandback(
+        sel.switched, sel.last_resort, handed_from, sel.name,
+        cfg_.ramp_on_return.from, cfg_.ramp_on_return.to);
       if (handed_back) {
+        const auto publish_ramp = [&](const std::string & why) {
+            if (!ramp_pub_) {
+              RCLCPP_ERROR(
+                get_logger(), "%s -> %s: cannot use speed hold (%s), and no "
+                "ramp_on_return topic is configured", handed_from.c_str(),
+                sel.name.c_str(), why.c_str());
+              return;
+            }
+            std_msgs::msg::Bool msg;
+            msg.data = true;
+            ramp_pub_->publish(msg);
+            RCLCPP_INFO(
+              get_logger(), "%s -> %s: asking %s to ramp the speed up rather "
+              "than step to it (%s)", handed_from.c_str(), sel.name.c_str(),
+              cfg_.ramp_on_return.topic.c_str(), why.c_str());
+          };
         // One or the other, never both. The controller takes the most recent
         // of these as the winner, so sending the ramp flag after a speed hold
         // would cancel the hold - which is why turning the hold on turns the
@@ -1173,45 +1293,87 @@ private:
         // refuses to stack for the same reason; this had nothing.
         const bool holding = speed_hold_valid_ && t < speed_hold_until_;
         if (speed_hold_pub_ && holding) {
+          speed_hold_last_result_ =
+            "suppressed: previous request active; steady guarantee not restarted";
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
-            "%s -> %s again %.2fs into a %.1fs hold - not restarting it",
+            "%s -> %s again %.2fs into co_driver's %.2fs local duplicate-"
+            "suppression window - not publishing again; receiver timing is not "
+            "acknowledged and the %.2fs conditional steady budget is not "
+            "restarted for this repeated handback",
             handed_from.c_str(), sel.name.c_str(),
-            assist_.speed_hold.duration - (speed_hold_until_ - t).seconds(),
-            assist_.speed_hold.duration);
+            speed_hold_sent_duration_ - (speed_hold_until_ - t).seconds(),
+            speed_hold_sent_duration_, assist_.speed_hold.steady_duration);
         } else if (speed_hold_pub_) {
-          std_msgs::msg::Float64MultiArray msg;
-          msg.data = {assist_.speed_hold.speed, assist_.speed_hold.duration};
-          speed_hold_pub_->publish(msg);
-          speed_hold_until_ =
-            t + rclcpp::Duration::from_seconds(assist_.speed_hold.duration);
-          speed_hold_valid_ = true;
-          RCLCPP_INFO(
-            get_logger(), "%s -> %s: holding %.2fm/s for %.1fs, then %s ramps "
-            "out of it", handed_from.c_str(), sel.name.c_str(),
-            assist_.speed_hold.speed, assist_.speed_hold.duration, assist_.node.c_str());
-        } else if (ramp_pub_) {
-          std_msgs::msg::Bool msg;
-          msg.data = true;
-          ramp_pub_->publish(msg);
-          RCLCPP_INFO(
-            get_logger(), "%s -> %s: asking %s to ramp the speed up rather than "
-            "step to it", handed_from.c_str(), sel.name.c_str(),
-            cfg_.ramp_on_return.topic.c_str());
+          const SpeedTransitionBudget budget = post_.speedTransitionBudget(
+            has_output_ ? output_.speed : assist_.speed_hold.speed,
+            assist_.speed_hold.speed, source_switched && has_output_);
+          speed_hold_transition_budget_ = budget.total_s();
+          speed_hold_requested_duration_ = budget.bounded ?
+            assist_.speed_hold.steady_duration + budget.total_s() :
+            std::numeric_limits<double>::infinity();
+          speed_hold_sent_duration_ = 0.0;
+
+          double request_duration = 0.0;
+          if (!budget.bounded) {
+            speed_hold_last_result_ = "fallback: " + budget.reason;
+            RCLCPP_ERROR(
+              get_logger(), "%s -> %s: speed hold cannot establish a bounded "
+              "request-time model for %.2fs of steady final /drive output: %s; "
+              "using ramp fallback",
+              handed_from.c_str(), sel.name.c_str(),
+              assist_.speed_hold.steady_duration, budget.reason.c_str());
+            publish_ramp(budget.reason);
+          } else if (!speedHoldRequestDuration(
+              assist_.speed_hold.steady_duration, budget,
+              assist_.speed_hold.max_request_duration, &request_duration))
+          {
+            speed_hold_last_result_ =
+              "fallback: configured receiver duration assumption";
+            RCLCPP_ERROR(
+              get_logger(), "%s -> %s: %.2fs steady hold + %.2fs transition "
+              "budget = %.2fs exceeds configured receiver-limit assumption "
+              "%.2fs; not sending a request that pure_pursuit may clamp, using "
+              "ramp fallback",
+              handed_from.c_str(), sel.name.c_str(),
+              assist_.speed_hold.steady_duration, budget.total_s(),
+              speed_hold_requested_duration_,
+              assist_.speed_hold.max_request_duration);
+            publish_ramp("configured receiver duration assumption");
+          } else {
+            std_msgs::msg::Float64MultiArray msg;
+            msg.data = {assist_.speed_hold.speed, request_duration};
+            speed_hold_pub_->publish(msg);
+            speed_hold_until_ = t + rclcpp::Duration::from_seconds(request_duration);
+            speed_hold_valid_ = true;
+            speed_hold_sent_duration_ = request_duration;
+            speed_hold_last_result_ =
+              "published: conditional request-time model; receiver unacknowledged";
+            RCLCPP_INFO(
+              get_logger(), "%s -> %s: published %.2fm/s for %.2fs using a "
+              "request-time transition bound of %.2fs (blend %.2fs + rate-limit "
+              "%.2fs), budgeting %.2fs steady on final /drive. This is "
+              "conditional: receiver acceptance/output clock, path or RF speed "
+              "caps, and later runtime postprocess changes are not observed; %s "
+              "is expected to ramp out afterwards",
+              handed_from.c_str(), sel.name.c_str(), assist_.speed_hold.speed,
+              request_duration, budget.total_s(), budget.blend_s,
+              budget.rate_limit_s, assist_.speed_hold.steady_duration,
+              assist_.node.c_str());
+          }
+        } else {
+          speed_hold_last_result_ = "disabled: using ramp";
+          publish_ramp("speed hold disabled");
         }
         startReturnAssist(sel.name);
       }
       // Two candidates may read the same topic - the fallback appears once per
       // reason it can be chosen. Swapping between those is a bookkeeping
       // change, not a change of command, so blending across it would drag a
-      // 300 ms ramp through an output that did not move.
+      // configured ramp through an output that did not move.
       if (sel.switched) {
-        std::string topic;
-        for (const auto & d : drives_) {
-          if (d.name == sel.name) {topic = d.topic; break;}
-        }
-        if (topic != last_output_topic_) {switch_pending_ = true;}
-        last_output_topic_ = topic;
+        if (source_switched) {switch_pending_ = true;}
+        last_output_topic_ = selected_topic;
       }
     }
 
@@ -1314,6 +1476,8 @@ private:
     }
     os << "{\"active\":" << (active ? "true" : "false")
        << ",\"enabled\":" << (assist_.enabled ? "true" : "false")
+       << ",\"gain_enabled\":" <<
+      (assist_.gain_enabled ? "true" : "false")
        << ",\"node\":\"" << esc(assist_.node) << "\""
        << ",\"raised\":\"" << esc(what) << "\""
        << ",\"left_s\":" << num(left)
@@ -1322,8 +1486,28 @@ private:
        << ",\"speed_hold\":{\"enabled\":"
        << (assist_.speed_hold.enabled ? "true" : "false")
        << ",\"speed\":" << num(assist_.speed_hold.speed)
-       << ",\"duration_s\":" << num(assist_.speed_hold.duration)
-       << ",\"left_s\":" << num(hold_left) << "}}";
+       // duration_s is kept as a compatibility alias for the configured
+       // steady time. requested/sent include the last transition budget.
+       << ",\"duration_s\":" << num(assist_.speed_hold.steady_duration)
+       << ",\"configured_steady_duration_s\":" <<
+      num(assist_.speed_hold.steady_duration)
+       << ",\"transition_budget_s\":" << num(speed_hold_transition_budget_)
+       << ",\"requested_duration_s\":" << num(speed_hold_requested_duration_)
+       << ",\"sent_duration_s\":" << num(speed_hold_sent_duration_)
+       << ",\"max_request_duration_s\":" <<
+      num(assist_.speed_hold.max_request_duration)
+       << ",\"configured_receiver_max_duration_s\":" <<
+      num(assist_.speed_hold.max_request_duration)
+       << ",\"timing_model\":\"request_time_config_snapshot\""
+       << ",\"receiver_acknowledged\":false"
+       << ",\"receiver_limits_verified\":false"
+       << ",\"unobserved\":[\"runtime_postprocess_changes\","
+      "\"pure_pursuit_output_clock\",\"receiver_speed_duration_rf_caps\"]"
+       // left_s is retained as a compatibility alias. It is co_driver's local
+       // duplicate-suppression timer, not remaining time reported by PP.
+       << ",\"left_s\":" << num(hold_left)
+       << ",\"local_suppression_left_s\":" << num(hold_left)
+       << ",\"last\":\"" << esc(speed_hold_last_result_) << "\"}}";
     return os.str();
   }
 
@@ -1494,6 +1678,7 @@ private:
       return;
     }
     assist_.enabled = jbool(j, "enabled", true);
+    assist_.gain_enabled = assist_.enabled;
     assist_.node = jstr(j, "node", assist_.node);
     assist_.steering_above = jnum(j, "steering_above_deg", 15.0) * M_PI / 180.0;
     assist_.hold = jms(j, "hold_ms", assist_.hold * 1e3);
@@ -1506,15 +1691,22 @@ private:
       // Backward compatibility: configurations without duration_ms keep using
       // the gain-assist hold, which was the hard-wired behaviour before this
       // field existed.
-      assist_.speed_hold.duration =
+      assist_.speed_hold.steady_duration =
         jms(*sh, "duration_ms", assist_.hold * 1e3);
+      assist_.speed_hold.max_request_duration =
+        jms(*sh, "max_request_duration_ms", 10000.0);
       if (!std::isfinite(assist_.speed_hold.speed) || assist_.speed_hold.speed < 0.0 ||
-        !std::isfinite(assist_.speed_hold.duration) || assist_.speed_hold.duration < 0.0 ||
+        !std::isfinite(assist_.speed_hold.steady_duration) ||
+        assist_.speed_hold.steady_duration < 0.0 ||
+        !std::isfinite(assist_.speed_hold.max_request_duration) ||
+        assist_.speed_hold.max_request_duration <= 0.0 ||
+        assist_.speed_hold.steady_duration > assist_.speed_hold.max_request_duration ||
         assist_.speed_hold.topic.empty())
       {
         RCLCPP_WARN(
           get_logger(), "return assist: speed_hold needs a topic, a finite speed "
-          "at or above 0, and a finite duration_ms at or above 0 - disabled");
+          "at or above 0, a finite duration_ms at or above 0, and a positive "
+          "max_request_duration_ms no shorter than duration_ms - disabled");
         assist_.speed_hold.enabled = false;
       }
     }
@@ -1535,19 +1727,30 @@ private:
     }
     if (!sane) {
       RCLCPP_WARN(
-        get_logger(), "return assist: needs at least one parameter, every "
-        "multiplier above 0 and hold above 0 - disabled");
-      assist_.enabled = false;
+        get_logger(), "return gain assist: needs at least one parameter, every "
+        "multiplier above 0 and hold above 0 - gain changes disabled");
+      assist_.gain_enabled = false;
+    }
+    if (!assist_.enabled) {
+      RCLCPP_INFO(
+        get_logger(), "return assist master switch is off: JSON speed hold and "
+        "gain assist disabled; YAML ramp_on_return remains available");
+      assist_.speed_hold.enabled = false;
+      assist_.gain_enabled = false;
     }
     if (assist_.speed_hold.enabled) {
       RCLCPP_INFO(
         get_logger(),
-        "return assist: handing back holds %.2fm/s on %s for %.1fs, and the "
-        "controller ramps out of that by itself - so the ramp flag is NOT sent",
-        assist_.speed_hold.speed, assist_.speed_hold.topic.c_str(),
-        assist_.speed_hold.duration);
+        "return assist: handback publishes %.2fm/s with a %.2fs conditional "
+        "steady-time budget; the request-time postprocess transition bound is "
+        "added to %s under a configured %.2fs receiver maximum. Receiver "
+        "acceptance/output clock, path or RF speed caps, and later runtime "
+        "changes are not observed",
+        assist_.speed_hold.speed, assist_.speed_hold.steady_duration,
+        assist_.speed_hold.topic.c_str(),
+        assist_.speed_hold.max_request_duration);
     }
-    if (!assist_.enabled) {
+    if (!assist_.gain_enabled) {
       RCLCPP_INFO(get_logger(), "return assist: gains left alone");
       return;
     }
@@ -1570,7 +1773,7 @@ private:
   // and the second restore would put the raised one back as the baseline.
   void startReturnAssist(const std::string & to)
   {
-    if (!assist_.enabled) {return;}
+    if (!assist_.enabled || !assist_.gain_enabled) {return;}
     double steer = 0.0;
     for (const auto & d : drives_) {          // mtx_ is held by the caller
       if (d.name == to) {steer = std::abs(d.cmd.drive.steering_angle); break;}
@@ -1594,6 +1797,12 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr speed_hold_pub_;
   rclcpp::Time speed_hold_until_;
   bool speed_hold_valid_{false};
+  // Last speed-hold decision. These are written while mtx_ is held and exposed
+  // separately so configured steady time is never confused with wire time.
+  double speed_hold_transition_budget_{0.0};
+  double speed_hold_requested_duration_{0.0};
+  double speed_hold_sent_duration_{0.0};
+  std::string speed_hold_last_result_{"idle"};
   ReturnAssist assist_;
   std::shared_ptr<std::atomic<bool>> assist_busy_{
     std::make_shared<std::atomic<bool>>(false)};

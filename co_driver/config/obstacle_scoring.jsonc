@@ -2,9 +2,11 @@
 //
 // Split out for the same reason localization_scoring.jsonc is: these belong to
 // the scorers, not to the arbitration. The topics file next door is co_driver's
-// own layer - which drives exist, what weight each input carries, where the
-// vetoes sit - and mixing the two meant a change to how an obstacle is measured
-// sat in the same file as a calibration it must not disturb.
+// own layer - which drives exist and what weight each input carries. The one
+// arbitration rule kept here is the obstacle safety gate shared by pp_main and
+// gap_loc: it must move with commit_demand so a committed obstacle cannot first
+// hand the car to the localization fallback and wait through that drive's
+// keep_ms before reaching gap_obs.
 //
 // Deep-merged over co_driver_red_damvi_topics.jsonc at load, keyed by input
 // name. tuning_file takes a comma-separated list, so this and the localization
@@ -56,6 +58,15 @@
         // Set this back to "clusters" to fall back to the detector; nothing
         // else has to change with it.
         "source": "scan",
+
+        // 장애물 유무와 commit 시점은 후보 controller마다 달라지면 안 됩니다.
+        // VESC 속도가 fresh하면 아래 설정과 무관하게 실측값을 우선하고, stale이면
+        // pp_main의 live speed/steer 한 벌로 pp_main, gap_loc, gap_obs 모두의
+        // lookahead/commit geometry를 계산합니다. pp_main이 live가 아니면 가장 빠른
+        // live drive의 명령을 공통 fallback으로 쓰고, 그것도 없을 때만 각 후보의
+        // 명령으로 돌아갑니다. 따라서 pp_main=8, gap_loc=2인 순간에도 같은 6 m
+        // 장애물을 둘이 서로 다르게 판정하지 않습니다.
+        "reference_drive": "pp_main",
 
         // ── "scan" 을 쓸 때 ─────────────────────────────────────────
         //
@@ -257,8 +268,9 @@
   
           // Commit distance is derived from the manoeuvre, not tuned:
           //   speed x (reaction + sqrt(2 x lateral_need / lateral_accel))
-          // reaction covers the 150 ms detection hold plus the 300 ms handover
-          // blend. At 7 m/s with a 0.73 m corridor and 5 m/s^2 that is 7.8 m.
+          // reaction conservatively covers the 150 ms detection hold, the
+          // 100 ms handover blend, and controller/scheduling margin. At 7 m/s
+          // with a 0.73 m corridor and 5 m/s^2 that is 7.8 m.
           // This is what "stay on the fast controller until the last moment it
           // is still avoidable" means in numbers.
           "reaction_time": 0.8,
@@ -382,7 +394,7 @@
           // full_urgency_time is deliberately NOT lowered to open the band -
           // it sets the commit distance, and at 2.5 m/s dropping 0.8 -> 0.6
           // would move the commit from 2.0 m to 1.5 m, i.e. 0.6 s of travel,
-          // against a 150 ms detection hold plus a 300 ms blend. The band is
+          // against a 150 ms detection hold plus a 100 ms blend. The band is
           // opened from the trigger end, where being early costs nothing but a
           // rising bar on the status stream.
           "full_urgency_time": 0.8,
@@ -620,6 +632,22 @@
           // 한 프레임 펴졌다고 코너 안에서 차를 돌려주지 않게 합니다.
           "clear_ms": 300
         }
+    }
+  },
+
+  // A committed obstacle must leave gap_obs as the only valid reactive drive.
+  // pp_main already has the identical veto in the base topics file. Applying it
+  // to gap_loc here prevents the score EMA from choosing /drive_gf first and
+  // then charging gap_loc.keep_ms plus a second switch_blend before /drive_gf2.
+  // reference_drive above also makes both vetoes consume the same geometry;
+  // without it, stale VESC telemetry could let a slower gap_loc command see a
+  // shorter trigger distance and remain valid even though pp_main was vetoed.
+  // Keep this equal to 1 - commit_demand above (score = 1 - demand).
+  "drives": {
+    "gap_loc": {
+      "influence": {
+        "obstacles": {"weight": 0.0, "exp_mix": 0.0, "veto_below": 0.15}
+      }
     }
   }
 }

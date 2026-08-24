@@ -27,7 +27,7 @@
   <depend>visualization_msgs</depend>
   <depend>nlohmann-json-dev</depend>
 
-  <!-- optional: enables the obstacle_avoid scorer when present -->
+  <!-- Vendored beside co_driver; obstacle_avoid is a required scorer. -->
   <depend>obstacle_context_msgs</depend>
 
   <exec_depend>ros2launch</exec_depend>

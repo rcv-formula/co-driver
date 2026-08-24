@@ -18,6 +18,8 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(ackermann_msgs REQUIRED)
+# The red_damvi-compatible interface package is vendored next to co_driver so
+# this required typesupport dependency is built by --packages-up-to co_driver.
 find_package(vesc_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -52,12 +54,7 @@ set(scorer_sources
   src/scorers/example_async.cpp        # async skeleton for heavy computations
 )
 
-# Obstacle avoidance needs the detector's message package. It is optional so
-# that this package still builds without it; the scorer type simply does not
-# exist, and a config asking for it fails at startup with the list of types
-# that do.
 # obstacle_context_msgs ships in this repository, next to this package.
-#
 # It used to be an optional find: absent -> obstacle_avoid quietly dropped. That
 # was wrong in the worst way. The node still LINKS the typesupport library once
 # it has been built against it, so a binary built on a machine that had the
@@ -85,6 +82,35 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_vesc_speed test/test_vesc_speed.cpp)
   target_include_directories(test_vesc_speed PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  ament_add_gtest(test_obstacle_handover_config
+    test/test_obstacle_handover_config.cpp
+    src/config.cpp
+  )
+  target_include_directories(test_obstacle_handover_config PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_compile_definitions(test_obstacle_handover_config PRIVATE
+    CO_DRIVER_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config"
+  )
+  target_link_libraries(test_obstacle_handover_config nlohmann_json::nlohmann_json)
+  ament_target_dependencies(test_obstacle_handover_config rclcpp)
+
+  ament_add_gtest(test_obstacle_scan_health
+    test/test_obstacle_scan_health.cpp
+    src/config.cpp
+    src/scorers/obstacle_avoid.cpp
+  )
+  target_include_directories(test_obstacle_scan_health PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_link_libraries(test_obstacle_scan_health nlohmann_json::nlohmann_json)
+  ament_target_dependencies(test_obstacle_scan_health ${dependencies})
+
+  ament_add_gtest(test_speed_hold_timing test/test_speed_hold_timing.cpp)
+  target_include_directories(test_speed_hold_timing PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
 endif()

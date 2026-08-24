@@ -124,6 +124,9 @@
         max_decel: 12.0
 
       # At runtime: ros2 param set /co_driver_node postprocess.speed_scale.scale 0.5
+      # A handback speed-hold model snapshots this value when it publishes the
+      # request. Change it between hold sessions; a mid-request change is not
+      # recomputed and invalidates the conditional steady-time estimate.
       speed_scale:
         scale: 1.0
 
