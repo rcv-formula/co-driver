@@ -117,8 +117,8 @@ struct SpeedHold
 
 struct ReturnAssist
 {
-  // Master switch for every action defined in return_assist.jsonc. The YAML
-  // ramp_on_return signal is deliberately outside this switch.
+  // Master switch for every PP hand-back action: speed hold, the YAML direct
+  // ramp fallback, and temporary gain changes.
   bool enabled{false};
   // Invalid/missing gain tuning disables only the parameter assist, not a
   // separately valid speed hold while the master switch remains on.
@@ -909,7 +909,12 @@ public:
     if (!has_parameter("return_assist_file")) {
       declare_parameter<std::string>("return_assist_file", "");
     }
-    loadReturnAssist(get_parameter("return_assist_file").as_string());
+    return_assist_path_ = get_parameter("return_assist_file").as_string();
+    std::string assist_error;
+    if (!loadReturnAssist(return_assist_path_, &assist_, &assist_error)) {
+      RCLCPP_ERROR(get_logger(), "%s - all PP hand-back actions disabled", assist_error.c_str());
+      assist_ = ReturnAssist{};
+    }
     if (!has_parameter("topics_file")) {declare_parameter<std::string>("topics_file", "");}
     topics_path_ = get_parameter("topics_file").as_string();
 
@@ -942,22 +947,7 @@ public:
         i, d.name.c_str(), d.topic.c_str(), d.hold * 1e3);
     }
 
-    if (assist_.speed_hold.enabled) {
-      speed_hold_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
-        assist_.speed_hold.topic, rclcpp::QoS(1));
-    }
-    if (!cfg_.ramp_on_return.topic.empty()) {
-      ramp_pub_ = create_publisher<std_msgs::msg::Bool>(
-        cfg_.ramp_on_return.topic, rclcpp::QoS(1));
-      std::string from;
-      for (const auto & f : cfg_.ramp_on_return.from) {
-        from += (from.empty() ? "" : "/") + f;
-      }
-      RCLCPP_INFO(
-        get_logger(), "ramp on return: %s -> %s publishes true on %s",
-        from.empty() ? "(nothing)" : from.c_str(), cfg_.ramp_on_return.to.c_str(),
-        cfg_.ramp_on_return.topic.c_str());
-    }
+    syncHandbackPublishers(true);
     drive_pub_ = create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(
       cfg_.output.drive_topic, rclcpp::QoS(10));
     if (cfg_.output.publish_status) {
@@ -1083,12 +1073,90 @@ private:
     return true;
   }
 
-  // Re-reads coefficient-only changes without a restart (refused if subscriptions must be rebuilt).
+  // Publishers follow the effective hand-back policy, including reloads. The
+  // ramp channel is also kept while speed hold is enabled because Bool(false)
+  // is the receiver's only way to cancel a hold that co_driver already sent.
+  void syncHandbackPublishers(bool announce)
+  {
+    const HandbackActions actions = effectiveHandbackActions(
+      assist_.enabled, cfg_.ramp_on_return.enabled,
+      assist_.speed_hold.enabled, assist_.gain_enabled);
+    const bool need_speed_hold = actions.speed_hold;
+    if (!need_speed_hold) {
+      speed_hold_pub_.reset();
+      speed_hold_pub_topic_.clear();
+    } else if (!speed_hold_pub_ || speed_hold_pub_topic_ != assist_.speed_hold.topic) {
+      speed_hold_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+        assist_.speed_hold.topic, rclcpp::QoS(1));
+      speed_hold_pub_topic_ = assist_.speed_hold.topic;
+    }
+
+    const bool need_ramp_channel = !cfg_.ramp_on_return.topic.empty() &&
+      (actions.ramp || actions.speed_hold);
+    if (!need_ramp_channel) {
+      ramp_pub_.reset();
+      ramp_pub_topic_.clear();
+    } else if (!ramp_pub_ || ramp_pub_topic_ != cfg_.ramp_on_return.topic) {
+      ramp_pub_ = create_publisher<std_msgs::msg::Bool>(
+        cfg_.ramp_on_return.topic, rclcpp::QoS(1));
+      ramp_pub_topic_ = cfg_.ramp_on_return.topic;
+    }
+
+    if (!announce) {return;}
+    if (!assist_.enabled) {
+      RCLCPP_INFO(get_logger(), "PP hand-back actions disabled by return-assist master");
+      return;
+    }
+    if (actions.ramp && ramp_pub_) {
+      std::string from;
+      for (const auto & f : cfg_.ramp_on_return.from) {
+        from += (from.empty() ? "" : "/") + f;
+      }
+      RCLCPP_INFO(
+        get_logger(), "ramp on return: %s -> %s publishes true on %s",
+        from.empty() ? "(nothing)" : from.c_str(), cfg_.ramp_on_return.to.c_str(),
+        cfg_.ramp_on_return.topic.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "direct ramp on return disabled");
+    }
+    if (assist_.speed_hold.enabled && cfg_.ramp_on_return.topic.empty()) {
+      RCLCPP_WARN(
+        get_logger(), "speed hold is enabled without ramp_on_return.topic; a "
+        "published receiver hold cannot be cancelled on config reload");
+    }
+  }
+
+  void cancelOwnedHandbackMotion(const std::string & why)
+  {
+    if (ramp_pub_) {
+      std_msgs::msg::Bool cancel;
+      cancel.data = false;
+      ramp_pub_->publish(cancel);
+      RCLCPP_WARN(
+        get_logger(), "cancelling previously requested PP hold/ramp on %s (%s)",
+        ramp_pub_topic_.c_str(), why.c_str());
+    } else {
+      RCLCPP_WARN(
+        get_logger(), "cannot cancel a previously requested PP hold/ramp (%s): "
+        "no ramp_on_return topic was active", why.c_str());
+    }
+    speed_hold_valid_ = false;
+    speed_hold_last_result_ = "cancelled on reload: " + why;
+  }
+
+  // Re-reads coefficients and hand-back policy without a restart (refused if
+  // drive/scorer subscriptions must be rebuilt).
   bool reload(std::string * message)
   {
     Config fresh;
     std::string err;
     if (!Config::load(this, topics_path_, &fresh, &err)) {
+      *message = "reload failed: " + err;
+      return false;
+    }
+    const std::string fresh_assist_path = get_parameter("return_assist_file").as_string();
+    ReturnAssist fresh_assist;
+    if (!loadReturnAssist(fresh_assist_path, &fresh_assist, &err)) {
       *message = "reload failed: " + err;
       return false;
     }
@@ -1100,6 +1168,44 @@ private:
     }
 
     std::lock_guard<std::mutex> lock(mtx_);
+    const HandbackActions old_actions = effectiveHandbackActions(
+      assist_.enabled, cfg_.ramp_on_return.enabled,
+      assist_.speed_hold.enabled, assist_.gain_enabled);
+    const HandbackActions new_actions = effectiveHandbackActions(
+      fresh_assist.enabled, fresh.ramp_on_return.enabled,
+      fresh_assist.speed_hold.enabled, fresh_assist.gain_enabled);
+    const bool old_ramp_effective = old_actions.ramp && !cfg_.ramp_on_return.topic.empty();
+    const bool new_ramp_effective = new_actions.ramp &&
+      !fresh.ramp_on_return.topic.empty();
+    const bool ramp_policy_changed = old_ramp_effective &&
+      (!new_ramp_effective || cfg_.ramp_on_return.topic != fresh.ramp_on_return.topic ||
+      cfg_.ramp_on_return.from != fresh.ramp_on_return.from ||
+      cfg_.ramp_on_return.to != fresh.ramp_on_return.to);
+
+    // The receiver starts its own ramp after the requested hold duration. We
+    // have no acknowledgement for when that ramp finishes, so policy disable
+    // must cancel any hold co_driver has sent, not only one whose local timer
+    // is still running.
+    const bool old_hold_was_requested = speed_hold_valid_;
+    const bool new_hold_effective = new_actions.speed_hold;
+    const bool hold_policy_changed = old_hold_was_requested &&
+      (!new_hold_effective ||
+      assist_.speed_hold.topic != fresh_assist.speed_hold.topic ||
+      assist_.speed_hold.speed != fresh_assist.speed_hold.speed ||
+      assist_.speed_hold.steady_duration != fresh_assist.speed_hold.steady_duration ||
+      assist_.speed_hold.max_request_duration !=
+      fresh_assist.speed_hold.max_request_duration);
+    if (ramp_policy_changed || hold_policy_changed) {
+      cancelOwnedHandbackMotion(
+        !fresh_assist.enabled ? "master disabled" : "hand-back policy changed");
+    }
+    if (assist_busy_->load()) {
+      assist_abort_->store(true);
+      RCLCPP_WARN(
+        get_logger(), "return-assist config reloaded while gains were raised; "
+        "restoring the old values early");
+    }
+
     // Keep each drive's receive state; swap only the coefficients.
     for (const auto & spec : fresh.drives) {
       for (auto & d : drives_) {
@@ -1111,12 +1217,15 @@ private:
       }
     }
     cfg_ = fresh;   // topics/rates are bound to subscriptions/timers and are not applied
+    assist_ = std::move(fresh_assist);
+    return_assist_path_ = fresh_assist_path;
     selector_.configure(cfg_.selection);
     if (!post_.configure(this, cfg_.pipeline, get_logger())) {
       *message = "reload failed: postprocess pipeline configuration error";
       return false;
     }
     post_.reset();
+    syncHandbackPublishers(true);
     if (speed_hold_valid_ && now() < speed_hold_until_) {
       speed_hold_last_result_ =
         "published request active; reload invalidated request-time steady model";
@@ -1125,7 +1234,9 @@ private:
         "suppression window: the receiver request was not cancelled or resent, "
         "but its conditional steady-time estimate is no longer valid");
     }
-    *message = "reload complete (yaml parameters + " + topics_path_ + ")";
+    *message = "reload complete (yaml/topics + " + topics_path_ +
+      ", return assist + " +
+      (return_assist_path_.empty() ? std::string("disabled") : return_assist_path_) + ")";
     return true;
   }
 
@@ -1265,8 +1376,19 @@ private:
       const bool handed_back = isConfiguredHandback(
         sel.switched, sel.last_resort, handed_from, sel.name,
         cfg_.ramp_on_return.from, cfg_.ramp_on_return.to);
-      if (handed_back) {
+      if (handed_back && !assist_.enabled) {
+        speed_hold_last_result_ = "disabled: return-assist master";
+        RCLCPP_INFO(
+          get_logger(), "%s -> %s: all PP hand-back actions are disabled by "
+          "the return-assist master", handed_from.c_str(), sel.name.c_str());
+      } else if (handed_back) {
         const auto publish_ramp = [&](const std::string & why) {
+            if (!cfg_.ramp_on_return.enabled) {
+              RCLCPP_INFO(
+                get_logger(), "%s -> %s: direct ramp fallback disabled (%s)",
+                handed_from.c_str(), sel.name.c_str(), why.c_str());
+              return;
+            }
             if (!ramp_pub_) {
               RCLCPP_ERROR(
                 get_logger(), "%s -> %s: cannot use speed hold (%s), and no "
@@ -1474,10 +1596,19 @@ private:
     if (speed_hold_valid_) {
       hold_left = std::max(0.0, (speed_hold_until_ - now()).seconds());
     }
+    const HandbackActions actions = effectiveHandbackActions(
+      assist_.enabled, cfg_.ramp_on_return.enabled,
+      assist_.speed_hold.enabled, assist_.gain_enabled);
     os << "{\"active\":" << (active ? "true" : "false")
        << ",\"enabled\":" << (assist_.enabled ? "true" : "false")
+       << ",\"master_enabled\":" << (assist_.enabled ? "true" : "false")
        << ",\"gain_enabled\":" <<
       (assist_.gain_enabled ? "true" : "false")
+       << ",\"ramp_on_return\":{\"enabled\":" <<
+      (cfg_.ramp_on_return.enabled ? "true" : "false")
+       << ",\"effective\":" <<
+      (actions.ramp && ramp_pub_ ? "true" : "false")
+       << ",\"topic\":\"" << esc(cfg_.ramp_on_return.topic) << "\"}"
        << ",\"node\":\"" << esc(assist_.node) << "\""
        << ",\"raised\":\"" << esc(what) << "\""
        << ",\"left_s\":" << num(left)
@@ -1662,83 +1793,88 @@ private:
   bool has_output_{false};
   // Read from its own file, so tuning that belongs to the moment of handover
   // does not live in the arbitration's config.
-  void loadReturnAssist(const std::string & path)
+  bool loadReturnAssist(
+    const std::string & path, ReturnAssist * out, std::string * error)
   {
-    if (path.empty()) {return;}
+    ReturnAssist loaded;
+    if (path.empty()) {
+      *out = std::move(loaded);
+      return true;
+    }
     std::ifstream in(path);
     if (!in) {
-      RCLCPP_WARN(get_logger(), "return_assist_file: cannot open %s", path.c_str());
-      return;
+      *error = "return_assist_file: cannot open " + path;
+      return false;
     }
     Json j;
     try {
       j = Json::parse(in, nullptr, true, /*ignore_comments=*/ true);
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "return_assist_file %s: %s", path.c_str(), e.what());
-      return;
+      *error = "return_assist_file " + path + ": " + e.what();
+      return false;
     }
-    assist_.enabled = jbool(j, "enabled", true);
-    assist_.gain_enabled = assist_.enabled;
-    assist_.node = jstr(j, "node", assist_.node);
-    assist_.steering_above = jnum(j, "steering_above_deg", 15.0) * M_PI / 180.0;
-    assist_.hold = jms(j, "hold_ms", assist_.hold * 1e3);
-    assist_.service_timeout = jms(j, "service_timeout_ms", assist_.service_timeout * 1e3);
+    loaded.enabled = jbool(j, "enabled", true);
+    loaded.gain_enabled = loaded.enabled && jbool(j, "gain_enabled", true);
+    loaded.node = jstr(j, "node", loaded.node);
+    loaded.steering_above = jnum(j, "steering_above_deg", 15.0) * M_PI / 180.0;
+    loaded.hold = jms(j, "hold_ms", loaded.hold * 1e3);
+    loaded.service_timeout = jms(j, "service_timeout_ms", loaded.service_timeout * 1e3);
     const auto sh = j.find("speed_hold");
     if (sh != j.end() && sh->is_object()) {
-      assist_.speed_hold.enabled = jbool(*sh, "enabled", false);
-      assist_.speed_hold.topic = jstr(*sh, "topic", assist_.speed_hold.topic);
-      assist_.speed_hold.speed = jnum(*sh, "speed", assist_.speed_hold.speed);
+      loaded.speed_hold.enabled = jbool(*sh, "enabled", false);
+      loaded.speed_hold.topic = jstr(*sh, "topic", loaded.speed_hold.topic);
+      loaded.speed_hold.speed = jnum(*sh, "speed", loaded.speed_hold.speed);
       // Backward compatibility: configurations without duration_ms keep using
       // the gain-assist hold, which was the hard-wired behaviour before this
       // field existed.
-      assist_.speed_hold.steady_duration =
-        jms(*sh, "duration_ms", assist_.hold * 1e3);
-      assist_.speed_hold.max_request_duration =
+      loaded.speed_hold.steady_duration =
+        jms(*sh, "duration_ms", loaded.hold * 1e3);
+      loaded.speed_hold.max_request_duration =
         jms(*sh, "max_request_duration_ms", 10000.0);
-      if (!std::isfinite(assist_.speed_hold.speed) || assist_.speed_hold.speed < 0.0 ||
-        !std::isfinite(assist_.speed_hold.steady_duration) ||
-        assist_.speed_hold.steady_duration < 0.0 ||
-        !std::isfinite(assist_.speed_hold.max_request_duration) ||
-        assist_.speed_hold.max_request_duration <= 0.0 ||
-        assist_.speed_hold.steady_duration > assist_.speed_hold.max_request_duration ||
-        assist_.speed_hold.topic.empty())
+      if (!std::isfinite(loaded.speed_hold.speed) || loaded.speed_hold.speed < 0.0 ||
+        !std::isfinite(loaded.speed_hold.steady_duration) ||
+        loaded.speed_hold.steady_duration < 0.0 ||
+        !std::isfinite(loaded.speed_hold.max_request_duration) ||
+        loaded.speed_hold.max_request_duration <= 0.0 ||
+        loaded.speed_hold.steady_duration > loaded.speed_hold.max_request_duration ||
+        loaded.speed_hold.topic.empty())
       {
         RCLCPP_WARN(
           get_logger(), "return assist: speed_hold needs a topic, a finite speed "
           "at or above 0, a finite duration_ms at or above 0, and a positive "
           "max_request_duration_ms no shorter than duration_ms - disabled");
-        assist_.speed_hold.enabled = false;
+        loaded.speed_hold.enabled = false;
       }
     }
-    assist_.parameters.clear();
+    loaded.parameters.clear();
     const auto it = j.find("parameters");
     if (it != j.end() && it->is_object()) {
       for (auto p = it->begin(); p != it->end(); ++p) {
         if (!p.value().is_number()) {continue;}
-        assist_.parameters.emplace_back(p.key(), p.value().get<double>());
+        loaded.parameters.emplace_back(p.key(), p.value().get<double>());
       }
     } else if (j.contains("parameter")) {          // the one-parameter shorthand
-      assist_.parameters.emplace_back(
+      loaded.parameters.emplace_back(
         jstr(j, "parameter", "K_d"), jnum(j, "multiply_by", 2.0));
     }
-    bool sane = assist_.hold > 0.0 && !assist_.parameters.empty();
-    for (const auto & kv : assist_.parameters) {
+    bool sane = loaded.hold > 0.0 && !loaded.parameters.empty();
+    for (const auto & kv : loaded.parameters) {
       if (kv.second <= 0.0) {sane = false;}
     }
     if (!sane) {
       RCLCPP_WARN(
         get_logger(), "return gain assist: needs at least one parameter, every "
         "multiplier above 0 and hold above 0 - gain changes disabled");
-      assist_.gain_enabled = false;
+      loaded.gain_enabled = false;
     }
-    if (!assist_.enabled) {
+    if (!loaded.enabled) {
       RCLCPP_INFO(
-        get_logger(), "return assist master switch is off: JSON speed hold and "
-        "gain assist disabled; YAML ramp_on_return remains available");
-      assist_.speed_hold.enabled = false;
-      assist_.gain_enabled = false;
+        get_logger(), "return assist master switch is off: speed hold, direct "
+        "ramp fallback, and gain assist are all disabled");
+      loaded.speed_hold.enabled = false;
+      loaded.gain_enabled = false;
     }
-    if (assist_.speed_hold.enabled) {
+    if (loaded.speed_hold.enabled) {
       RCLCPP_INFO(
         get_logger(),
         "return assist: handback publishes %.2fm/s with a %.2fs conditional "
@@ -1746,16 +1882,17 @@ private:
         "added to %s under a configured %.2fs receiver maximum. Receiver "
         "acceptance/output clock, path or RF speed caps, and later runtime "
         "changes are not observed",
-        assist_.speed_hold.speed, assist_.speed_hold.steady_duration,
-        assist_.speed_hold.topic.c_str(),
-        assist_.speed_hold.max_request_duration);
+        loaded.speed_hold.speed, loaded.speed_hold.steady_duration,
+        loaded.speed_hold.topic.c_str(),
+        loaded.speed_hold.max_request_duration);
     }
-    if (!assist_.gain_enabled) {
+    if (!loaded.gain_enabled) {
       RCLCPP_INFO(get_logger(), "return assist: gains left alone");
-      return;
+      *out = std::move(loaded);
+      return true;
     }
     std::string what;
-    for (const auto & kv : assist_.parameters) {
+    for (const auto & kv : loaded.parameters) {
       char buf[64];
       std::snprintf(buf, sizeof(buf), "%s x%.2f", kv.first.c_str(), kv.second);
       what += (what.empty() ? "" : ", ") + std::string(buf);
@@ -1764,8 +1901,10 @@ private:
       get_logger(),
       "return assist: handing back above %.0f degrees of steering sets %s %s "
       "for %.1fs",
-      assist_.steering_above * 180.0 / M_PI, assist_.node.c_str(),
-      what.c_str(), assist_.hold);
+      loaded.steering_above * 180.0 / M_PI, loaded.node.c_str(),
+      what.c_str(), loaded.hold);
+    *out = std::move(loaded);
+    return true;
   }
 
   // Only when the drive taking the car back is already hard over. One at a
@@ -1794,7 +1933,9 @@ private:
 
   bool have_command_{false};
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ramp_pub_;
+  std::string ramp_pub_topic_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr speed_hold_pub_;
+  std::string speed_hold_pub_topic_;
   rclcpp::Time speed_hold_until_;
   bool speed_hold_valid_{false};
   // Last speed-hold decision. These are written while mtx_ is held and exposed
@@ -1803,6 +1944,7 @@ private:
   double speed_hold_requested_duration_{0.0};
   double speed_hold_sent_duration_{0.0};
   std::string speed_hold_last_result_{"idle"};
+  std::string return_assist_path_;
   ReturnAssist assist_;
   std::shared_ptr<std::atomic<bool>> assist_busy_{
     std::make_shared<std::atomic<bool>>(false)};

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <rclcpp/rclcpp.hpp>
@@ -55,12 +56,26 @@ TEST(ObstacleHandoverConfig, LoadsMatchingCommitVetoForPpAndLocalizationFallback
 
   rclcpp::NodeOptions options;
   options.automatically_declare_parameters_from_overrides(true);
-  options.parameter_overrides({rclcpp::Parameter("tuning_file", tuning)});
+  const std::vector<rclcpp::Parameter> overrides{
+    rclcpp::Parameter("tuning_file", tuning),
+    rclcpp::Parameter("ramp_on_return.enabled", true),
+    rclcpp::Parameter("ramp_on_return.topic", "/test_launch_start_reset"),
+    rclcpp::Parameter(
+      "ramp_on_return.from", std::vector<std::string>{"gap_loc", "gap_obs"}),
+    rclcpp::Parameter("ramp_on_return.to", "pp_main")};
+  options.parameter_overrides(overrides);
   auto node = std::make_shared<rclcpp::Node>("obstacle_handover_config_test", options);
 
   Config config;
   std::string error;
   ASSERT_TRUE(Config::load(node.get(), topics, &config, &error)) << error;
+
+  EXPECT_TRUE(config.ramp_on_return.enabled);
+  EXPECT_EQ(config.ramp_on_return.topic, "/test_launch_start_reset");
+  EXPECT_EQ(
+    config.ramp_on_return.from,
+    (std::vector<std::string>{"gap_loc", "gap_obs"}));
+  EXPECT_EQ(config.ramp_on_return.to, "pp_main");
 
   const auto obstacle_input = std::find_if(
     config.inputs.begin(), config.inputs.end(),

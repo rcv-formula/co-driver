@@ -58,7 +58,7 @@ red_damvi splits its configuration by responsibility:
 | `co_driver_red_damvi_topics.jsonc` | wiring plus the base arbitration layer (weights, bias, curves, vetoes, hold_ms) |
 | `localization_scoring.jsonc` | localization scorer parameters and related drive overrides |
 | `obstacle_scoring.jsonc` | obstacle/clearance scorer parameters plus the obstacle safety-veto overlay, including `gap_loc` |
-| `return_assist.jsonc` | hand-back speed hold, ramp and gain-assist settings |
+| `return_assist.jsonc` | hand-back master switch, speed hold and gain-assist settings |
 
 The tuning files are deep-merged over the topics file in the order listed by the
 `tuning_file` parameter. Most arbitration defaults remain in the topics file;
@@ -69,11 +69,12 @@ Reload coefficients without restarting:
 ros2 service call /co_driver_node/reload std_srvs/srv/Trigger
 ```
 
-This reload covers the YAML/topics tuning layers, not `return_assist.jsonc`,
-which is read only at startup. It also resets post-processing immediately and
-does not recompute an already-published speed-hold request. Reload or change the
-runtime speed scale between hold sessions; doing so during one invalidates its
-conditional steady-time estimate and is reported in status/logs.
+This reload covers the YAML/topics tuning layers and `return_assist.jsonc`.
+Disabling or changing an active hand-back policy sends `/launch_start_reset`
+false before its publishers are rebuilt, and an active gain assist restores the
+old values early. Reload also resets post-processing immediately; changing only
+post-processing during an already-published speed hold cannot recompute the
+receiver request, so its conditional timing estimate is reported invalid.
 
 ## Monitor
 

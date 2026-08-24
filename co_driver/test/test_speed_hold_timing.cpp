@@ -137,6 +137,26 @@ TEST(HandoverState, NoSelectionTickPreservesGapSourceForNextHandback)
     true, false, handed_from, selected, {"gap_loc", "gap_obs"}, "pp_main"));
 }
 
+TEST(HandoverState, MasterFalseDisablesEveryHandbackAction)
+{
+  const HandbackActions actions = effectiveHandbackActions(
+    false, true, true, true);
+
+  EXPECT_FALSE(actions.ramp);
+  EXPECT_FALSE(actions.speed_hold);
+  EXPECT_FALSE(actions.gain);
+}
+
+TEST(HandoverState, FeatureSwitchesRemainIndependentUnderEnabledMaster)
+{
+  const HandbackActions actions = effectiveHandbackActions(
+    true, false, true, false);
+
+  EXPECT_FALSE(actions.ramp);
+  EXPECT_TRUE(actions.speed_hold);
+  EXPECT_FALSE(actions.gain);
+}
+
 TEST(HandoverState, HandbackStillRequiresARealNonLastResortSwitch)
 {
   const std::vector<std::string> gap_drives{"gap_loc", "gap_obs"};

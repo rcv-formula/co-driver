@@ -8,6 +8,25 @@
 namespace co_driver
 {
 
+struct HandbackActions
+{
+  bool ramp{false};
+  bool speed_hold{false};
+  bool gain{false};
+};
+
+// The JSON master is deliberately above every PP hand-back action. Feature
+// switches can turn off one action, but master=false must make all of them inert.
+inline HandbackActions effectiveHandbackActions(
+  bool master_enabled, bool ramp_enabled, bool speed_hold_enabled,
+  bool gain_enabled)
+{
+  return {
+    master_enabled && ramp_enabled,
+    master_enabled && speed_hold_enabled,
+    master_enabled && gain_enabled};
+}
+
 // A tick with no usable command is a gap in validity, not a handover. Keep the
 // last drive that actually had the car so recovery on the next tick can still
 // identify a configured gap -> PP return edge.

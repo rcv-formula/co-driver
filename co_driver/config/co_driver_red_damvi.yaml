@@ -141,17 +141,22 @@
     # car comes off it in the same state either way; which reason took it away
     # does not change what it needs on the way back.
     #
-    # An empty topic disables the flag only - the other two are unaffected.
+    # enabled=false or an empty topic disables this direct flag only. The JSON
+    # master disables all three; nested speed hold/gain switches remain
+    # independent.
     # =====================================================================
     # NOTE: return_assist.jsonc can turn on a speed hold, which does the ramp
     # itself once it releases. This flag is withheld only when a hold request is
     # actually published: the controller takes the most recent of the two as the
-    # winner, so sending both would cancel the hold. It remains the fallback when
-    # the JSON master/nested hold is off, no finite transition bound exists, or
-    # the configured receiver-duration assumption is too short. Startup shows
-    # configuration; /co_driver_node/status and the handback log show the actual
-    # per-edge decision.
+    # winner, so sending both would cancel the hold. Under an enabled JSON master,
+    # it remains the fallback when the nested hold is off, no finite transition
+    # bound exists, or the configured receiver-duration assumption is too short.
+    # Startup shows configuration; /co_driver_node/status and the handback log
+    # show the actual per-edge decision.
     ramp_on_return:
+      # Direct /launch_start_reset fallback only. The master switch for every
+      # PP hand-back action is return_assist.jsonc's top-level enabled value.
+      enabled: true
       topic: "/launch_start_reset"
       from: ["gap_loc", "gap_obs"]
       to: "pp_main"

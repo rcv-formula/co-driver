@@ -164,7 +164,8 @@ struct OutputSpec
 // publishing all along.
 struct RampOnReturnSpec
 {
-  std::string topic;                  // empty disables it entirely
+  bool enabled{false};                 // direct /launch_start_reset fallback
+  std::string topic;                  // empty disables the direct ramp signal
   std::vector<std::string> from;      // handing over FROM one of these
   std::string to;                     // ...TO this drive
 };
