@@ -206,6 +206,46 @@
         "surface_grazing_deg": 10.0,
         "range_noise_m": 0.03,
 
+        // How a surface longer than biggest_thing_m is handled.
+        //
+        //   size      current production rule: discard the complete surface.
+        //   polyline  EXPERIMENTAL: recursively fit locally straight pieces.
+        //             A long wall stays long and is discarded, while a short
+        //             protrusion attached to it can split off and survive.
+        //             A smooth curved wall is represented by several lines.
+        //   swept    EXPERIMENTAL: keep every raw deskewed return that enters
+        //             the existing vehicle-width corridor around the planned
+        //             path. Adaptive surfaces still group points and temporal
+        //             votes, but biggest_thing_m cannot discard an in-path
+        //             return merely because it belongs to a long wall.
+        //
+        // The fitted lines only decide where one oversized surface is split.
+        // They never move the raw scan points and are never joined back by
+        // angle: doing either would discard the foreground/occlusion evidence
+        // for which the direct scan source exists.
+        //
+        // The production default remains size until the bag comparison shows
+        // that polyline recovers attached objects without turning corner walls
+        // into obstacle handovers.
+        "surface_model": "size",
+        // Orthogonal error that causes one long surface to be split. The
+        // optional range term lets a later experiment account for increasing
+        // placement uncertainty without hiding it inside the base tolerance.
+        "surface_fit_error_m": 0.05,
+        "surface_fit_error_per_m": 0.0,
+        // Each side of a split must keep this many beams. This equals the
+        // per-scan evidence floor, so the split cannot manufacture a one-beam
+        // obstacle which could never vote on its own anyway.
+        "surface_fit_min_points": 2,
+        // Tighten only the lateral corridor used by pieces recovered from a
+        // surface which the legacy size rule would discard. Ordinary objects
+        // retain lateral_margin_m, so this can reject a wall-edge split without
+        // reducing the established warning distance for normal scan surfaces.
+        // The 0.08m candidate removed the labelled 638s wall/noise split while
+        // retaining the labelled 81/261/472/739s safety-positive sequences in
+        // the test_16 bag. Keep validating it on other bags before enabling the
+        // polyline model; 0 disables the experimental distinction.
+        "surface_recovered_margin_cut_m": 0.08,
         // 이보다 큰 표면은 피할 물체가 아니라 트랙 자체입니다.
         //
         // 위처럼 자르고 나면 표면의 실제 크기를 끝에서 끝까지 잴 수 있습니다.

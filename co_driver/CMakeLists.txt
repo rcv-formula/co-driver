@@ -109,6 +109,16 @@ if(BUILD_TESTING)
   target_link_libraries(test_obstacle_scan_health nlohmann_json::nlohmann_json)
   ament_target_dependencies(test_obstacle_scan_health ${dependencies})
 
+  ament_add_gtest(test_surface_polyline test/test_surface_polyline.cpp)
+  target_include_directories(test_surface_polyline PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  ament_add_gtest(test_scan_occupancy test/test_scan_occupancy.cpp)
+  target_include_directories(test_scan_occupancy PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
   ament_add_gtest(test_speed_hold_timing test/test_speed_hold_timing.cpp)
   target_include_directories(test_speed_hold_timing PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -165,6 +165,7 @@
 #include "co_driver/arc_geometry.hpp"
 #include "co_driver/path_reference.hpp"
 #include "co_driver/scan_occupancy.hpp"
+#include "co_driver/surface_polyline.hpp"
 #include "co_driver/vesc_speed.hpp"
 
 #include "co_driver/scorer.hpp"
@@ -218,6 +219,8 @@ public:
       s.dense_one_scan = jint(p, "dense_one_scan", 8);
       s.narrow_per_m = jnum(p, "narrow_per_m", 0.0);
       s.never_narrower_than_m = jnum(p, "never_narrower_than_m", 0.05);
+      s.recovered_margin_cut_m = std::max(
+        0.0, jnum(p, "surface_recovered_margin_cut_m", 0.0));
       s.wall_longer_than_m = jnum(p, "wall_longer_than_m", 1.0);
       s.one_scan_within_m = jnum(p, "one_scan_within_m", 2.5);
       s.add_scan_every_m = jnum(p, "add_scan_every_m", 2.0);
@@ -226,6 +229,21 @@ public:
       s.biggest_thing_m = jnum(p, "biggest_thing_m", 1.5);
       grazing_ = jnum(p, "surface_grazing_deg", 10.0) * M_PI / 180.0;
       range_noise_ = jnum(p, "range_noise_m", 0.03);
+      surface_model_ = jstr(p, "surface_model", "size");
+      if (
+        surface_model_ != "size" && surface_model_ != "polyline" &&
+        surface_model_ != "swept")
+      {
+        RCLCPP_ERROR(
+          node->get_logger(), "obstacle avoidance '%s': surface_model '%s' is neither "
+          "\"size\", \"polyline\" nor \"swept\" - keeping the legacy size filter.",
+          name.c_str(), surface_model_.c_str());
+        surface_model_ = "size";
+      }
+      surface_fit_error_ = std::max(0.0, jnum(p, "surface_fit_error_m", 0.05));
+      surface_fit_error_per_m_ = std::max(
+        0.0, jnum(p, "surface_fit_error_per_m", 0.0));
+      surface_fit_min_points_ = std::max(2, jint(p, "surface_fit_min_points", 2));
       s.beam_stride = std::max(1, jint(p, "beam_stride", 3));
       scan_.configure(s);
     }
@@ -480,6 +498,24 @@ public:
         s.add_scan_every_mps, s.dense_one_scan,
         s.wall_longer_than_m > 0.0 ? " Longer than a metre along the line is wall." : "",
         deskew_ ? "on" : "off");
+      if (surface_model_ == "polyline") {
+        RCLCPP_WARN(
+          node->get_logger(),
+          "obstacle avoidance '%s': EXPERIMENTAL %s surface model is on; "
+          "surfaces above %.2fm are recursively split at %.3fm + %.4f*range "
+          "orthogonal error (at least %d beams per side). Fitted lines only split "
+          "surfaces; path occupancy still uses the raw deskewed returns. Rescued "
+          "pieces lose %.2fm of corridor margin.",
+          name.c_str(), surface_model_.c_str(), s.biggest_thing_m, surface_fit_error_,
+          surface_fit_error_per_m_, surface_fit_min_points_, s.recovered_margin_cut_m);
+      } else if (surface_model_ == "swept") {
+        RCLCPP_WARN(
+          node->get_logger(),
+          "obstacle avoidance '%s': EXPERIMENTAL swept guard is on; every raw "
+          "deskewed return inside the planned vehicle corridor bypasses the %.2fm "
+          "surface-size filter. Segments still group evidence but cannot erase it.",
+          name.c_str(), s.biggest_thing_m);
+      }
     } else {
       RCLCPP_INFO(
         node->get_logger(),
@@ -1215,6 +1251,47 @@ private:
       segment_size.push_back(len);
     }
 
+    // Legacy mode assigns every beam the size of its complete adaptive-breakpoint
+    // surface. Experimental polyline mode touches only surfaces that legacy
+    // would discard, recursively splitting them into locally straight pieces.
+    // A wall remains a long piece and is still removed; a protrusion attached
+    // to it gets its own short piece. The fit is only a partition: occupancy is
+    // always measured at the raw deskewed return, because moving a return onto
+    // a fitted wall would recreate the information loss of the cluster source.
+    std::vector<double> judged_size(beams.size(), 0.0);
+    std::vector<bool> recovered_from_large(beams.size(), false);
+    for (std::size_t k = 0; k < beams.size(); ++k) {
+      judged_size[k] = segment_size[segment_of[k]];
+    }
+    if (surface_model_ == "polyline" && scan_.settings().biggest_thing_m > 0.0) {
+      int next_segment = static_cast<int>(segment_size.size());
+      for (std::size_t sgi = 0; sgi < breaks.size(); ++sgi) {
+        if (segment_size[sgi] <= scan_.settings().biggest_thing_m) {continue;}
+        const int from = breaks[sgi];
+        const int to = (sgi + 1 < breaks.size()) ?
+          breaks[sgi + 1] : static_cast<int>(beams.size());
+        for (int k = from; k < to; ++k) {
+          recovered_from_large[static_cast<std::size_t>(k)] = true;
+        }
+        std::vector<SurfaceFitPoint> surface;
+        surface.reserve(static_cast<std::size_t>(to - from));
+        for (int k = from; k < to; ++k) {
+          surface.push_back({beams[k].x, beams[k].y, beams[k].range});
+        }
+        const auto primitives = splitSurfacePolyline(
+          surface, surface_fit_error_, surface_fit_error_per_m_, surface_fit_min_points_);
+        for (std::size_t pi = 0; pi < primitives.size(); ++pi) {
+          const auto & primitive = primitives[pi];
+          const int primitive_id = next_segment++;
+          for (std::size_t local = primitive.begin; local < primitive.end; ++local) {
+            const std::size_t k = static_cast<std::size_t>(from) + local;
+            judged_size[k] = primitive.length;
+            segment_of[k] = primitive_id;
+          }
+        }
+      }
+    }
+
     std::vector<ScanOccupancy::Point> pts;
     pts.reserve(beams.size());
     for (std::size_t k = 0; k < beams.size(); ++k) {
@@ -1228,7 +1305,9 @@ private:
       p.along = path->forwardDistance(e.station, pr.station);
       p.range = beams[k].range;
       p.segment = segment_of[k];
-      p.segment_size = segment_size[segment_of[k]];
+      p.segment_size = judged_size[k];
+      p.recovered_from_large = recovered_from_large[k];
+      p.preserve_if_large = surface_model_ == "swept";
       pts.push_back(p);
     }
     scan_.push(std::move(pts));
@@ -1690,6 +1769,10 @@ private:
   std::map<std::string, bool> have_hit_;
   double grazing_{10.0 * M_PI / 180.0};   // most oblique a surface may be seen at
   double range_noise_{0.03};              // lidar range noise, one sigma
+  std::string surface_model_{"size"};  // size, polyline split, or raw swept-corridor guard
+  double surface_fit_error_{0.05};
+  double surface_fit_error_per_m_{0.0};
+  int surface_fit_min_points_{2};
   std::string source_{"clusters"};
   std::string scan_topic_{"/scan"};
   bool deskew_{true};

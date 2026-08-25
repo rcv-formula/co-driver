@@ -141,6 +141,10 @@ public:
     double car_width_until_m{1.5};       // nearer than this, measure from the car
     double narrow_per_m{0.0};            // closes up this much per metre of range
     double never_narrower_than_m{0.05};  // and stops closing here
+    // Only pieces rescued by splitting a parent surface above biggest_thing_m
+    // lose this much corridor margin. Legacy-sized objects keep the established
+    // corridor, so suppressing a wall-edge split cannot shorten their warning.
+    double recovered_margin_cut_m{0.0};
     int scans_kept{5};              // how many scans are kept
     int points_per_scan{2};         // returns that make one scan a witness
     int dense_one_scan{8};          // this many in one scan is enough on its own
@@ -177,6 +181,12 @@ public:
     double range{0.0};
     int segment{-1};          // which surface it belongs to, in this scan
     double segment_size{0.0}; // how big that whole surface is
+    bool recovered_from_large{false};  // polyline piece split from an oversized parent
+    // A raw return inside the planned swept corridor is collision evidence
+    // even when the complete beam-connected surface is a wall. This is set by
+    // the experimental direct-scan guard; segmentation still groups votes but
+    // is not allowed to erase the return by semantic/size classification.
+    bool preserve_if_large{false};
   };
 
   // How near the line a return this far away has to be before it is believed.
@@ -233,7 +243,12 @@ public:
       std::vector<Point> in;
       for (const auto & p : scan) {
         if (p.along <= 0.05) {continue;}
-        if (p.lateral > nearLineAt(p.range)) {continue;}
+        double lateral_limit = nearLineAt(p.range);
+        if (p.recovered_from_large) {
+          lateral_limit = std::max(
+            s_.never_narrower_than_m, lateral_limit - s_.recovered_margin_cut_m);
+        }
+        if (p.lateral > lateral_limit) {continue;}
         // Close in, it also has to be something the car itself would hit.
         if (s_.car_width_until_m > 0.0 && p.along < s_.car_width_until_m &&
           p.side > s_.near_line_m)
@@ -241,7 +256,12 @@ public:
           continue;
         }
         // A surface this big is the track, not a thing on it.
-        if (s_.biggest_thing_m > 0.0 && p.segment_size > s_.biggest_thing_m) {continue;}
+        if (
+          !p.preserve_if_large && s_.biggest_thing_m > 0.0 &&
+          p.segment_size > s_.biggest_thing_m)
+        {
+          continue;
+        }
         in.push_back(p);
       }
       // One thing per SURFACE, as segmented by the caller.
