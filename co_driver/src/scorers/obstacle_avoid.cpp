@@ -272,6 +272,7 @@ public:
     // Judging against the planned line rather than the instantaneous steering
     // angle. See path_reference.hpp for why the command is the wrong question.
     path_topic_ = jstr(p, "path_topic", "/global_path");
+    const bool path_transient_local = jbool(p, "path_transient_local", true);
     path_csv_ = jstr(p, "path_csv", "");
     path_frame_ = jstr(p, "path_frame", "map");
     base_frame_ = jstr(p, "base_frame", "base_link");
@@ -438,19 +439,27 @@ public:
         rx_ = node_->now();
       }, opts);
 
-    // The path is latched, so a plain subscription would miss the only message
-    // it will ever send.
+    // A fixed global path is commonly latched, while a live local/planned path
+    // is commonly reliable + volatile. Request exactly the configured
+    // durability: a transient-local subscription is incompatible with a
+    // volatile publisher and would silently receive no live path at all.
     if (!path_topic_.empty()) {
       rclcpp::QoS qos(1);
-      qos.reliable().transient_local();
+      qos.reliable();
+      if (path_transient_local) {
+        qos.transient_local();
+      } else {
+        qos.durability_volatile();
+      }
       path_sub_ = node->create_subscription<nav_msgs::msg::Path>(
         path_topic_, qos,
         [this](const nav_msgs::msg::Path::ConstSharedPtr msg) {
           std::lock_guard<std::mutex> lock(mtx_);
           if (msg->poses.size() < 2) {return;}
           path_.fromMessage(*msg);
-          RCLCPP_INFO(
-            node_->get_logger(), "obstacle avoidance: path from %s - %zu points, "
+          RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "obstacle avoidance: path from %s - %zu points, "
             "%.1fm%s, frame %s", path_topic_.c_str(), path_.size(), path_.length(),
             path_.closed() ? " (closed)" : "", path_.frame().c_str());
         }, opts);

@@ -278,10 +278,10 @@
           // actually going. The plan's z coordinate carries the planned speed,
           // which is what decides how much room the manoeuvre needs.
           //
-          // Latched (transient_local), so it arrives on subscribe. The csv is
-          // the standby for a car whose planner is not running - same three
-          // columns, x, y, speed. Losing both falls back to the commanded arc
-          // and says so loudly in the note rather than reporting a clear path.
+          // /Path is updated continuously and is reliable + volatile. The
+          // callback replaces the path on every message; requesting transient
+          // local here would be QoS-incompatible and receive nothing. The csv
+          // remains the standby for a car whose planner is not running.
           // Current speed comes straight from the VESC, so a localization jump
           // cannot stretch or shrink the obstacle horizon. red_damvi's
           // vesc_to_odom conversion is:
@@ -295,7 +295,8 @@
           "wheel_speed_deadband": 0.05,
           "wheel_speed_scale": 2.6,
           "speed_timeout_ms": 300,
-          "path_topic": "/global_path",
+          "path_topic": "/Path",
+          "path_transient_local": false,
           "path_csv": "",
           "path_frame": "map",
           "base_frame": "base_link",
@@ -387,10 +388,9 @@
           // reported 2.6-4.0 m ahead "on the plan" - corner walls the detector
           // had not labelled as wall.
           //
-          // 0.25 puts the corridor at 0.43 m either side of the line. Anything
-          // beyond that would have been cleared by more than 0.25 m of body
-          // width anyway.
-          "lateral_margin_m": 0.10,
+          // With the configured 0.18 m half-width, 0.12 m puts the normal
+          // obstacle corridor at 0.30 m either side of the planned line.
+          "lateral_margin_m": 0.12,
           // an obstacle anywhere on the commanded path within this much travel
           // is reason to go around it (bounded, so it stays sane at any speed)
           //
@@ -633,7 +633,8 @@
 
     "off_path": {
       "params": {
-          "path_topic": "/global_path",
+          "path_topic": "/Path",
+          "path_transient_local": false,
           "base_frame": "base_link",
           // The line runs 0.7-1.0 m from the walls on this track, so 1.5 m off
           // it is outside the drivable corridor rather than a wide entry.
@@ -645,7 +646,8 @@
 
     "corner": {
       "params": {
-          "path_topic": "/global_path",
+          "path_topic": "/Path",
+          "path_transient_local": false,
           "base_frame": "base_link",
 
           // 여기서 계획된 속도가 이보다 느리면 코너로 봅니다.

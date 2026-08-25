@@ -58,6 +58,7 @@ protected:
       {"source", "scan"},
       {"scan_topic", scan_topic_},
       {"path_topic", path_topic_},
+      {"path_transient_local", false},
       {"reference_drive", "pp_main"},
       {"vesc_state_topic", vesc_topic_},
       {"speed_to_erpm_gain", 1.0},
@@ -89,7 +90,7 @@ protected:
     scan_pub_ = node_->create_publisher<sensor_msgs::msg::LaserScan>(
       scan_topic_, rclcpp::SensorDataQoS());
     rclcpp::QoS path_qos(1);
-    path_qos.reliable().transient_local();
+    path_qos.reliable().durability_volatile();
     path_pub_ = node_->create_publisher<nav_msgs::msg::Path>(path_topic_, path_qos);
     vesc_pub_ = node_->create_publisher<vesc_msgs::msg::VescStateStamped>(
       vesc_topic_, rclcpp::QoS(10));
@@ -133,7 +134,7 @@ protected:
     }
   }
 
-  nav_msgs::msg::Path straightPath() const
+  nav_msgs::msg::Path straightPath(double y = 0.0) const
   {
     nav_msgs::msg::Path path;
     path.header.frame_id = "map";
@@ -142,6 +143,7 @@ protected:
       geometry_msgs::msg::PoseStamped pose;
       pose.header = path.header;
       pose.pose.position.x = x;
+      pose.pose.position.y = y;
       pose.pose.orientation.w = 1.0;
       path.poses.push_back(pose);
     }
@@ -228,6 +230,27 @@ TEST_F(ObstacleScanHealthTest, ReportsReceivedScanWhenPathIsUnavailable)
   EXPECT_NE(result.note.find("scan received but no planned path"), std::string::npos);
   EXPECT_EQ(result.note.find("no scan yet"), std::string::npos);
   EXPECT_NE(result.note.find("nothing can be seen"), std::string::npos);
+}
+
+TEST_F(ObstacleScanHealthTest, VolatilePathUpdatesReplaceThePreviousPlan)
+{
+  // The first live plan is well away from the scan return, so the path is
+  // clear. Publishing a second plan on the same volatile topic must replace it
+  // immediately; the same return then sits on the new path and blocks it.
+  path_pub_->publish(straightPath(3.0));
+  spinFor(100ms);
+  scan_pub_->publish(scan("map", {0.5F, 0.5F, 0.5F}));
+  spinFor(100ms);
+  const ScoreResult old_plan = score();
+  ASSERT_DOUBLE_EQ(old_plan.value, 1.0) << old_plan.note;
+
+  path_pub_->publish(straightPath(0.0));
+  spinFor(100ms);
+  scan_pub_->publish(scan("map", {0.5F, 0.5F, 0.5F}));
+  spinFor(100ms);
+  const ScoreResult updated_plan = score();
+  EXPECT_DOUBLE_EQ(updated_plan.value, 0.0) << updated_plan.note;
+  EXPECT_NE(updated_plan.note.find("committed"), std::string::npos) << updated_plan.note;
 }
 
 TEST_F(ObstacleScanHealthTest, FailedLatestScanDropsAccumulatedOccupancy)

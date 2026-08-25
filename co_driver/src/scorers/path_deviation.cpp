@@ -57,6 +57,7 @@ public:
   {
     node_ = node;
     path_topic_ = jstr(p, "path_topic", "/global_path");
+    const bool path_transient_local = jbool(p, "path_transient_local", true);
     path_csv_ = jstr(p, "path_csv", "");
     path_frame_ = jstr(p, "path_frame", "map");
     base_frame_ = jstr(p, "base_frame", "base_link");
@@ -68,7 +69,12 @@ public:
     opts.callback_group = group();
     if (!path_topic_.empty()) {
       rclcpp::QoS qos(1);
-      qos.reliable().transient_local();
+      qos.reliable();
+      if (path_transient_local) {
+        qos.transient_local();
+      } else {
+        qos.durability_volatile();
+      }
       path_sub_ = node->create_subscription<nav_msgs::msg::Path>(
         path_topic_, qos,
         [this](const nav_msgs::msg::Path::ConstSharedPtr msg) {

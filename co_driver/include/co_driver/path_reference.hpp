@@ -16,7 +16,8 @@
 // which one is coming.
 //
 // Two sources, in order of preference:
-//   1. a nav_msgs/Path topic (transient_local, so it is there on subscribe)
+//   1. a nav_msgs/Path topic (either a latched fixed plan or a continuously
+//      updated volatile plan, as selected by the scorer configuration)
 //   2. a CSV of "x,y,speed" rows, for a vehicle where the planner is not
 //      running but the line is known
 //

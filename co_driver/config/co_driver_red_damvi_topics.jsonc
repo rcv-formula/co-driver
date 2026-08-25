@@ -159,7 +159,8 @@
         // model, presence window, holds - lives in obstacle_scoring.jsonc.
         "topic": "/obstacle_clusters",
         "vesc_state_topic": "/sensors/core",
-        "path_topic": "/global_path",
+        "path_topic": "/Path",
+        "path_transient_local": false,
         "path_csv": "",
         "path_frame": "map",
         "base_frame": "base_link"
@@ -180,7 +181,8 @@
       "type": "path_deviation",
       "params": {
         // Thresholds and timings live in obstacle_scoring.jsonc.
-        "path_topic": "/global_path",
+        "path_topic": "/Path",
+        "path_transient_local": false,
         "base_frame": "base_link"
       }
     },
@@ -202,7 +204,8 @@
       "type": "corner_hold",
       "params": {
         // Thresholds and timings live in obstacle_scoring.jsonc.
-        "path_topic": "/global_path",
+        "path_topic": "/Path",
+        "path_transient_local": false,
         "base_frame": "base_link"
       }
     },
