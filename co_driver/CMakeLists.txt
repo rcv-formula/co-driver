@@ -123,6 +123,11 @@ if(BUILD_TESTING)
   target_include_directories(test_speed_hold_timing PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
+
+  ament_add_gtest(test_drive_source_switch test/test_drive_source_switch.cpp)
+  target_include_directories(test_drive_source_switch PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
 endif()
 
 install(TARGETS co_driver_node

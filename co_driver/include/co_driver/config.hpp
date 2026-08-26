@@ -8,6 +8,8 @@
 #ifndef CO_DRIVER__CONFIG_HPP_
 #define CO_DRIVER__CONFIG_HPP_
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -75,6 +77,20 @@ struct InputSpec
   Influence influence;    // this input's default influence, shared across drives
 };
 
+// Optional runtime choice between two command topics for one drive candidate.
+// `channel` is deliberately one-based in the config, matching RC channel names
+// (CH10 means 10), and is converted to an array index only at the callback.
+struct DriveTopicSwitchSpec
+{
+  bool enabled{false};
+  std::string selector_topic;
+  std::size_t channel{1};
+  std::uint16_t primary_value{2000};
+  std::uint16_t alternate_value{1000};
+  std::uint16_t tolerance{100};
+  std::string alternate_topic;
+};
+
 // One drive = one /drive candidate. Element of JSON drives[].
 //
 // hold -- "how long to keep the last received command". This is the only
@@ -88,6 +104,7 @@ struct DriveSpec
 {
   std::string name;
   std::string topic;
+  DriveTopicSwitchSpec topic_switch;
   bool enabled{true};
   double hold{0.3};       // validity window of the last command [s] (JSON: hold_ms)
   // How long this drive keeps the car once it has it, overriding the

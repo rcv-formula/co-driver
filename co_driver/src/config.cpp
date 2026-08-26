@@ -393,6 +393,58 @@ bool loadTopics(
       *error = "drive '" + d.name + "' has no topic.";
       return false;
     }
+    const auto switch_it = e.find("runtime_topic_switch");
+    if (switch_it != e.end()) {
+      if (!switch_it->is_object()) {
+        *error = "drive '" + d.name + "': runtime_topic_switch must be an object.";
+        return false;
+      }
+      auto & sw = d.topic_switch;
+      sw.enabled = jbool(*switch_it, "enabled", true);
+      if (sw.enabled) {
+        sw.selector_topic = jstr(*switch_it, "selector_topic", "/rf");
+        sw.alternate_topic = jstr(*switch_it, "alternate_topic", "");
+        const int channel = jint(*switch_it, "channel", 1);
+        const int primary_value = jint(*switch_it, "primary_value", 2000);
+        const int alternate_value = jint(*switch_it, "alternate_value", 1000);
+        const int tolerance = jint(*switch_it, "tolerance", 100);
+        if (sw.selector_topic.empty() || sw.alternate_topic.empty()) {
+          *error = "drive '" + d.name +
+            "': runtime_topic_switch needs selector_topic and alternate_topic.";
+          return false;
+        }
+        if (sw.alternate_topic == d.topic) {
+          *error = "drive '" + d.name +
+            "': runtime_topic_switch alternate_topic equals the primary topic.";
+          return false;
+        }
+        if (channel < 1) {
+          *error = "drive '" + d.name +
+            "': runtime_topic_switch channel is one-based and must be at least 1.";
+          return false;
+        }
+        constexpr int kUInt16Max = 65535;
+        if (primary_value < 0 || primary_value > kUInt16Max ||
+          alternate_value < 0 || alternate_value > kUInt16Max ||
+          tolerance < 0 || tolerance > kUInt16Max)
+        {
+          *error = "drive '" + d.name +
+            "': runtime_topic_switch values must fit UInt16.";
+          return false;
+        }
+        if (primary_value == alternate_value ||
+          2 * tolerance >= std::abs(primary_value - alternate_value))
+        {
+          *error = "drive '" + d.name +
+            "': runtime_topic_switch endpoint tolerance ranges overlap.";
+          return false;
+        }
+        sw.channel = static_cast<std::size_t>(channel);
+        sw.primary_value = static_cast<std::uint16_t>(primary_value);
+        sw.alternate_value = static_cast<std::uint16_t>(alternate_value);
+        sw.tolerance = static_cast<std::uint16_t>(tolerance);
+      }
+    }
     d.enabled = jbool(e, "enabled", true);
     d.hold = jms(e, "hold_ms", 300.0);
     d.keep = e.contains("keep_ms") ? jms(e, "keep_ms", 0.0) : -1.0;
@@ -464,7 +516,16 @@ bool Config::sameTopology(const Config & other) const
     }
   }
   for (std::size_t i = 0; i < drives.size(); ++i) {
-    if (drives[i].name != other.drives[i].name || drives[i].topic != other.drives[i].topic) {
+    const auto & a = drives[i];
+    const auto & b = other.drives[i];
+    const auto & as = a.topic_switch;
+    const auto & bs = b.topic_switch;
+    if (a.name != b.name || a.topic != b.topic ||
+      as.enabled != bs.enabled || as.selector_topic != bs.selector_topic ||
+      as.channel != bs.channel || as.primary_value != bs.primary_value ||
+      as.alternate_value != bs.alternate_value || as.tolerance != bs.tolerance ||
+      as.alternate_topic != bs.alternate_topic)
+    {
       return false;
     }
   }

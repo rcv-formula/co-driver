@@ -358,6 +358,21 @@
       // when localization is the real problem.
       "name": "gap_obs",
       "topic": "/drive_gf2",
+      // FlySky /rf is std_msgs/UInt16MultiArray. Channel numbers here are
+      // one-based like the transmitter labels: CH10 is data[9]. At the 2000
+      // endpoint gap_obs keeps its obstacle-specific gap follower; at 1000 it
+      // uses the same /drive_gf command as gap_loc. Values around neither
+      // endpoint retain the current source, so a noisy/mid-position sample
+      // cannot flip the controller. A source edge discards the old command and
+      // waits for a fresh message from the newly selected topic.
+      "runtime_topic_switch": {
+        "selector_topic": "/rf",
+        "channel": 10,
+        "primary_value": 2000,
+        "alternate_value": 1000,
+        "tolerance": 100,
+        "alternate_topic": "/drive_gf"
+      },
       "hold_ms": 500,
       "keep_ms": 400,
       // A small positive bias so that once there IS demand this candidate is

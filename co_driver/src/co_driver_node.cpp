@@ -2,8 +2,10 @@
 //
 //   /drive_* subs --> scorers (src/scorers/) --> compute --> select --> postprocess --> /drive
 //
-// This node subscribes to **no sensors.** Judging from scan/map/imu/odom is done
-// by each scorer through its own subscriptions. The node does only four things:
+// Sensor judging from scan/map/imu/odom is done by each scorer through its own
+// subscriptions. The arbitration node itself only accepts candidate commands
+// and an optional UInt16MultiArray switch that chooses a candidate's command
+// source at runtime. It does four things:
 //   1) read config, create the scorers and the /drive subscriptions
 //   2) each evaluation tick: score -> compute -> select
 //   3) each output tick: postprocess -> publish /drive
@@ -17,6 +19,7 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31,10 +34,12 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int16_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include "co_driver/compute.hpp"
 #include "co_driver/config.hpp"
+#include "co_driver/drive_source_switch.hpp"
 #include "co_driver/handover_state.hpp"
 #include "co_driver/scorer.hpp"
 #include "co_driver/speed_hold_timing.hpp"
@@ -929,22 +934,55 @@ public:
     if (!Config::load(this, topics_path_, &cfg_, &err)) {throw std::runtime_error(err);}
     if (!build(&err)) {throw std::runtime_error(err);}
 
-    // --- /drive candidate subscriptions (the node's only subscriptions) ---
+    // --- /drive candidate subscriptions and optional runtime source switches ---
     drive_subs_.resize(drives_.size());
+    alternate_drive_subs_.resize(drives_.size());
+    drive_topic_switch_subs_.resize(drives_.size());
+    drive_source_changed_.assign(drives_.size(), false);
+    drive_source_epochs_.assign(drives_.size(), 0);
+    drive_switch_values_.assign(drives_.size(), -1);
     for (std::size_t i = 0; i < drives_.size(); ++i) {
       const auto & d = drives_[i];
+      const auto & spec = cfg_.drives[i];
       drive_subs_[i] = create_subscription<ackermann_msgs::msg::AckermannDriveStamped>(
         d.topic, rclcpp::QoS(10),
-        [this, i](const ackermann_msgs::msg::AckermannDriveStamped::ConstSharedPtr m) {
-          std::lock_guard<std::mutex> lock(mtx_);
-          drives_[i].cmd = *m;
-          // Some publishers leave the stamp unset, so use the receive time.
-          // noteReceived also updates the receive-rate EMA -- feeds the auto trust window.
-          drives_[i].noteReceived(now());
+        [this, i, topic = d.topic](
+          const ackermann_msgs::msg::AckermannDriveStamped::ConstSharedPtr m) {
+          receiveDriveCommand(i, topic, *m);
         });
       RCLCPP_INFO(
         get_logger(), "drive [%zu] %s <- %s (hold %.0fms)",
         i, d.name.c_str(), d.topic.c_str(), d.hold * 1e3);
+
+      if (!spec.topic_switch.enabled) {continue;}
+      const auto & sw = spec.topic_switch;
+      alternate_drive_subs_[i] =
+        create_subscription<ackermann_msgs::msg::AckermannDriveStamped>(
+        sw.alternate_topic, rclcpp::QoS(10),
+        [this, i, topic = sw.alternate_topic](
+          const ackermann_msgs::msg::AckermannDriveStamped::ConstSharedPtr m) {
+          receiveDriveCommand(i, topic, *m);
+        });
+      rclcpp::QoS selector_qos(10);
+      // BEST_EFFORT requested QoS is compatible with both BEST_EFFORT and
+      // RELIABLE /rf publishers. The referenced receiver package defaults to
+      // reliable but exposes that setting, and the endpoint is repeated at
+      // roughly 30 Hz rather than being a one-shot command.
+      selector_qos.best_effort();
+      drive_topic_switch_subs_[i] =
+        create_subscription<std_msgs::msg::UInt16MultiArray>(
+        sw.selector_topic, selector_qos,
+        [this, i](const std_msgs::msg::UInt16MultiArray::ConstSharedPtr m) {
+          receiveDriveTopicSwitch(i, *m);
+        });
+      RCLCPP_INFO(
+        get_logger(),
+        "drive [%zu] %s runtime source: %s CH%zu=%u -> %s, CH%zu=%u -> %s "
+        "(tolerance %u; starts on primary)",
+        i, d.name.c_str(), sw.selector_topic.c_str(), sw.channel,
+        static_cast<unsigned>(sw.primary_value), d.topic.c_str(), sw.channel,
+        static_cast<unsigned>(sw.alternate_value), sw.alternate_topic.c_str(),
+        static_cast<unsigned>(sw.tolerance));
     }
 
     syncHandbackPublishers(true);
@@ -1073,6 +1111,81 @@ private:
     return true;
   }
 
+  void receiveDriveCommand(
+    const std::size_t index, const std::string & source_topic,
+    const ackermann_msgs::msg::AckermannDriveStamped & msg)
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (index >= drives_.size() || drives_[index].topic != source_topic) {return;}
+    drives_[index].cmd = msg;
+    // Some publishers leave the stamp unset, so use the receive time.
+    // noteReceived also updates the receive-rate EMA -- feeds the auto trust window.
+    drives_[index].noteReceived(now());
+  }
+
+  void receiveDriveTopicSwitch(
+    const std::size_t index, const std_msgs::msg::UInt16MultiArray & msg)
+  {
+    std::string drive_name;
+    std::string old_topic;
+    std::string new_topic;
+    std::string selector_topic;
+    std::size_t channel = 0;
+    unsigned value = 0;
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      if (index >= drives_.size() || index >= cfg_.drives.size()) {return;}
+      const auto & sw = cfg_.drives[index].topic_switch;
+      if (!sw.enabled) {return;}
+      selector_topic = sw.selector_topic;
+      channel = sw.channel;
+      if (msg.data.size() < channel) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "drive %s runtime source: %s has %zu channels, cannot read CH%zu; "
+          "keeping %s", drives_[index].name.c_str(), sw.selector_topic.c_str(),
+          msg.data.size(), channel, drives_[index].topic.c_str());
+        return;
+      }
+
+      const std::uint16_t raw = msg.data[channel - 1];
+      value = static_cast<unsigned>(raw);
+      drive_switch_values_[index] = static_cast<int>(raw);
+      const DriveSourceChoice choice = chooseDriveSource(
+        raw, sw.primary_value, sw.alternate_value, sw.tolerance);
+      if (choice == DriveSourceChoice::keep) {return;}
+      new_topic = choice == DriveSourceChoice::primary ?
+        cfg_.drives[index].topic : sw.alternate_topic;
+      auto & drive = drives_[index];
+      if (drive.topic == new_topic) {return;}
+
+      drive_name = drive.name;
+      old_topic = drive.topic;
+      drive.topic = new_topic;
+      // Never carry a command received from the old source across the RF edge.
+      // The candidate becomes live again only after the selected topic sends a
+      // new command, preventing a delayed callback or a long hold window from
+      // leaking the old controller into the new mode.
+      drive.cmd = ackermann_msgs::msg::AckermannDriveStamped{};
+      drive.has_cmd = false;
+      drive.last_rx = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      drive.period_ema = 0.0;
+      drive.rx_count = 0;
+      drive_source_changed_[index] = true;
+      ++drive_source_epochs_[index];
+      if (selected_ == drive.name) {
+        // outputTick must not reuse the cleared drive before evaluation sees
+        // the new command. timeout_stop owns this short handover gap.
+        have_command_ = false;
+      }
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "drive %s runtime source: %s CH%zu=%u, %s -> %s; "
+      "waiting for a fresh command", drive_name.c_str(), selector_topic.c_str(),
+      channel, value, old_topic.c_str(), new_topic.c_str());
+  }
+
   // Publishers follow the effective hand-back policy, including reloads. The
   // ramp channel is also kept while speed hold is enabled because Bool(false)
   // is the receiver's only way to cancel a hold that co_driver already sent.
@@ -1162,7 +1275,8 @@ private:
     }
     if (!fresh.sameTopology(cfg_)) {
       *message =
-        "reload failed: inputs/drives topology changed (name/type/topic). "
+        "reload failed: inputs/drives topology changed "
+        "(name/type/topics/runtime source switch). "
         "Subscriptions must be rebuilt, so restart the node.";
       return false;
     }
@@ -1285,6 +1399,7 @@ private:
     Selector::Result sel;
 
     std::vector<Drive> snap;
+    std::vector<std::uint64_t> snap_source_epochs;
     Context ctx;
     {
       std::lock_guard<std::mutex> lock(mtx_);
@@ -1296,6 +1411,7 @@ private:
       ctx_.last_output = output_;
       ctx_.last_selected = selector_.incumbent();
       snap = drives_;
+      snap_source_epochs = drive_source_epochs_;
       ctx = ctx_;
     }
     ctx.drives = &snap;
@@ -1325,6 +1441,17 @@ private:
 
     {
       std::lock_guard<std::mutex> lock(mtx_);
+      // RF can switch the command source while scorers work on their unlocked
+      // snapshot. Never merge that pre-switch result into a drive whose old
+      // command was just cleared: it could otherwise become active/valid again
+      // before the selected source has supplied a command. The next evaluation
+      // tick (normally 20 ms later) takes a coherent post-switch snapshot.
+      if (snap_source_epochs != drive_source_epochs_) {
+        RCLCPP_DEBUG(
+          get_logger(),
+          "drive source changed during scoring; discarding the stale evaluation pass");
+        return;
+      }
       // Merge back only what scoring produced. Reception state (cmd, last_rx,
       // has_cmd, the rate EMA) belongs to the subscription callbacks, which were
       // free to run while this pass was unlocked - copying the snapshot wholesale
@@ -1355,12 +1482,24 @@ private:
       // Resolve the source once. It is used both to arm switch_blend and to
       // decide whether that blend time has to be included in a speed hold.
       std::string selected_topic;
-      if (sel.switched) {
-        for (const auto & d : drives_) {
-          if (d.name == sel.name) {selected_topic = d.topic; break;}
+      std::size_t selected_index = drives_.size();
+      if (sel.has_selection) {
+        for (std::size_t i = 0; i < drives_.size(); ++i) {
+          if (drives_[i].name == sel.name) {
+            selected_index = i;
+            selected_topic = drives_[i].topic;
+            break;
+          }
         }
       }
-      const bool source_switched = sel.switched && selected_topic != last_output_topic_;
+      // An RF source change can alter the controller behind a candidate while
+      // the candidate name remains gap_obs. Treat that as a real source edge,
+      // just like selecting a different drive topic, so switch_blend still
+      // protects the command transition.
+      const bool selected_source_changed = selected_index < drive_source_changed_.size() &&
+        drive_source_changed_[selected_index];
+      const bool source_switched = (sel.switched || selected_source_changed) &&
+        selected_topic != last_output_topic_;
       // Handing the car back is invisible from the map controller's side - it
       // was publishing all along - so the moment has to be told to it. Not on
       // a last-resort pick: that is not a return, it is the only command left.
@@ -1493,9 +1632,10 @@ private:
       // reason it can be chosen. Swapping between those is a bookkeeping
       // change, not a change of command, so blending across it would drag a
       // configured ramp through an output that did not move.
-      if (sel.switched) {
+      if (sel.switched || selected_source_changed) {
         if (source_switched) {switch_pending_ = true;}
         last_output_topic_ = selected_topic;
+        if (selected_source_changed) {drive_source_changed_[selected_index] = false;}
       }
     }
 
@@ -1705,6 +1845,18 @@ private:
       if (i) {os << ',';}
       const auto rk = rank_of.find(d.name);
       os << "{\"name\":\"" << esc(d.name) << "\""
+         << ",\"topic\":\"" << esc(d.topic) << "\"";
+      if (i < cfg_.drives.size() && cfg_.drives[i].topic_switch.enabled) {
+        const auto & sw = cfg_.drives[i].topic_switch;
+        os << ",\"runtime_topic_switch\":{\"selector_topic\":\"" <<
+          esc(sw.selector_topic) << "\""
+           << ",\"channel\":" << sw.channel
+           << ",\"value\":" <<
+          (drive_switch_values_[i] < 0 ? "null" : std::to_string(drive_switch_values_[i]))
+           << ",\"primary_topic\":\"" << esc(cfg_.drives[i].topic) << "\""
+           << ",\"alternate_topic\":\"" << esc(sw.alternate_topic) << "\"}";
+      }
+      os
          << ",\"rank\":" << (rk == rank_of.end() ? "null" : std::to_string(rk->second))
          << ",\"score\":" << num(d.score)
          << ",\"logit\":" << num(d.logit)
@@ -1963,6 +2115,17 @@ private:
 
   std::vector<rclcpp::Subscription<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr>
   drive_subs_;
+  std::vector<rclcpp::Subscription<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr>
+  alternate_drive_subs_;
+  std::vector<rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr>
+  drive_topic_switch_subs_;
+  // True from an RF source edge until that source is next selected. This lets
+  // evaluation arm switch_blend even when the candidate name did not change.
+  std::vector<bool> drive_source_changed_;
+  // Incremented at each effective RF source edge. An evaluation snapshot with
+  // an older epoch is discarded instead of reviving pre-switch drive state.
+  std::vector<std::uint64_t> drive_source_epochs_;
+  std::vector<int> drive_switch_values_;
   rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr selected_pub_, runner_up_pub_, status_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr scores_pub_;

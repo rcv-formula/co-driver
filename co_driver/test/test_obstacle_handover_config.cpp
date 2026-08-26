@@ -110,6 +110,13 @@ TEST(ObstacleHandoverConfig, LoadsMatchingCommitVetoForPpAndLocalizationFallback
   EXPECT_DOUBLE_EQ(obs_preference.weight, -2.0);
   EXPECT_EQ(gap_loc->topic, "/drive_gf");
   EXPECT_EQ(gap_obs->topic, "/drive_gf2");
+  ASSERT_TRUE(gap_obs->topic_switch.enabled);
+  EXPECT_EQ(gap_obs->topic_switch.selector_topic, "/rf");
+  EXPECT_EQ(gap_obs->topic_switch.channel, 10U);
+  EXPECT_EQ(gap_obs->topic_switch.primary_value, 2000U);
+  EXPECT_EQ(gap_obs->topic_switch.alternate_value, 1000U);
+  EXPECT_EQ(gap_obs->topic_switch.tolerance, 100U);
+  EXPECT_EQ(gap_obs->topic_switch.alternate_topic, "/drive_gf");
 }
 
 }  // namespace

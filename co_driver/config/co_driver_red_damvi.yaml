@@ -2,7 +2,8 @@
 #
 #   /drive_main  PPcontroller     map / raceline based; only meaningful while localization works
 #   /drive_gf    gap_loc source   external gap_follow package
-#   /drive_gf2   gap_obs source   external gap_follow package, obstacle-specific instance
+#   /drive_gf2   gap_obs primary source   external gap_follow package, obstacle-specific instance
+#   /drive_gf    gap_obs alternate source when /rf CH10 is near 1000
 #
 # One line: **when localization collapses, hand over to gap_follow.**
 # The confidence -> score mapping lives in config/co_driver_red_damvi_topics.jsonc.
@@ -23,7 +24,8 @@
     # gap_follow's own default drive_topic is also /drive, so it **must** be
     # overridden to /drive_gf (this launch can optionally start that external
     # package). The obstacle-specific instance is supplied separately on
-    # /drive_gf2. Otherwise a gap node on its default /drive would interleave
+    # /drive_gf2; /rf CH10 chooses it at 2000 or reuses /drive_gf at 1000.
+    # Otherwise a gap node on its default /drive would interleave
     # commands with co_driver's output.
     # drive_monitor logs an ERROR if it ever sees two publishers here.
     # =====================================================================
