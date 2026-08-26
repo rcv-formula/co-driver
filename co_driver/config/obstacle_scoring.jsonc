@@ -290,7 +290,7 @@
           // 2.6x below the speed domain used by the controller, so the correction
           // is deliberately a separate parameter rather than hidden in the gain.
           "vesc_state_topic": "/sensors/core",
-          "speed_to_erpm_gain": 4000.66,
+          "speed_to_erpm_gain": 3176,
           "speed_to_erpm_offset": 0.0,
           "wheel_speed_deadband": 0.05,
           "wheel_speed_scale": 2.6,
@@ -592,7 +592,7 @@
           "topic": "/scan",
           // Same localization-independent VESC speed as the obstacle scorer.
           "vesc_state_topic": "/sensors/core",
-          "speed_to_erpm_gain": 4000.66,
+          "speed_to_erpm_gain": 3176,
           "speed_to_erpm_offset": 0.0,
           "wheel_speed_deadband": 0.05,
           "wheel_speed_scale": 2.6,
